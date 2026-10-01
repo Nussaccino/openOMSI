@@ -36,7 +36,10 @@ fn version(git: &dyn Fn(&[&str]) -> Option<String>) -> String {
         }
     }
     let base = std::fs::read_to_string("../../VERSION").map(|s| s.trim().to_string()).unwrap_or_else(|_| "0.0".into());
-    let n = git(&["log", "-1", "--format=%H", "--", "VERSION"])
+    // (the build script runs in crates/omsi-app: the path is the repository's VERSION file -
+    // as a bare "VERSION" git looked for crates/omsi-app/VERSION, found no commit, and every
+    // build outside the CI was 0.1.0, which the updater took for out of date)
+    let n = git(&["log", "-1", "--format=%H", "--", "../../VERSION"])
         .filter(|h| !h.is_empty())
         .and_then(|h| git(&["rev-list", "--count", &format!("{h}..HEAD")]))
         .unwrap_or_else(|| "0".into());
