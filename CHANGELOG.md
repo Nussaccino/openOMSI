@@ -15,6 +15,31 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
   asks for no `IDXGIFactoryMedia` (a patched copy in `third_party/wgpu-hal`). With it,
   RenoDX's DLSS addon can add DLSS Neural Rendering (see the user guide).
 
+## 0.1.486 - 2026-10-01
+
+### Launcher
+- The Settings page is split into six tabs - Graphics, Driving, Camera, Sound, Gameplay,
+  General - each fitting the window, instead of about ninety controls in three long
+  columns; on a phone too (#430).
+
+## 0.1.483 - 2026-10-01
+
+### Graphics
+- PBR maps (`_nn`, `_rr`, `_ao`, ...) work on map textures: roads, splines and scenery
+  objects were drawn flat - only the textures loaded on the spot got their maps, not the
+  ones a tile's preparation brought, which are nearly all of a map's. Maps put into the
+  same folder in the openOMSI content folder, beside a texture of the OMSI install, are
+  found too.
+
+## 0.1.481 - 2026-10-01
+
+### Controls
+- Holding both mouse buttons and moving the mouse zooms as in OMSI (its "M_Zoom"): up
+  zooms in on the dashboard, down back out to the seat's view; outside, the camera moves
+  further away or closer. It did nothing - the right button only looked round.
+- Pressing the right button while a switch or lever is held with the left one no longer
+  turns the view and stops the drag.
+
 ## 0.1.479 - 2026-10-01
 
 ### Maps
