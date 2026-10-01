@@ -72,6 +72,10 @@ pub(crate) fn run_offscreen(
     let spawn_z = player.as_ref().map(|p| p.vehicle.position.z).unwrap_or(0.0);
     if let Some(p) = player.as_mut() {
         p.vehicle.host.auto_clutch = if settings.auto_clutch { 1.0 } else { 0.0 };
+        // OMSI_PAX_CAM=n: `--view pax` from the bus's n-th passenger camera
+        if let Some(k) = omsi_cfg::env::var("OMSI_PAX_CAM").ok().and_then(|v| v.parse().ok()) {
+            p.cam_choice.1 = k;
+        }
     }
     let center = player
         .as_ref()
@@ -867,15 +871,6 @@ pub(crate) fn run_offscreen(
                     p.vehicle.trigger("door_haltewunsch_off");
                 }
             }
-            if std::mem::take(&mut h.door_request) {
-                if let Some(p) = player.as_mut() {
-                    let ok = p.vehicle.trigger("door_aussenoeffner");
-                    p.vehicle.trigger("door_aussenoeffner_off");
-                    if omsi_cfg::env::var_os("OMSI_DEBUG_HUMANS").is_some() {
-                        log::info!("outside door opener at t={t_s:.1}: script has the trigger: {ok}, door_freigabe {:?}", p.vehicle.var("door_freigabe"));
-                    }
-                }
-            }
         }
         if let Some(l) = lan_off.as_mut() {
             let listener = if args.cam.is_some() {
@@ -963,7 +958,7 @@ pub(crate) fn run_offscreen(
                     p.sync_driver(&renderer, &mut scene, 1.0 / 30.0, settings.driver, args.view == "driver");
                     if args.cam.is_none() && args.view != "free" && args.follow.is_none() {
                         // the head turned as --look says, like the final image
-                        cam = p.camera_look(&args.view, &camera, look_of(args), offscreen_orbit(), 0.0, false);
+                        cam = p.camera_look(&args.view, &camera, look_of(args), offscreen_orbit());
                         if args.view == "outside" {
                             cam = p.camera_clipped(cam, &world, offscreen_orbit(), 0.0);
                         }
@@ -1379,7 +1374,7 @@ pub(crate) fn run_offscreen(
                     .unwrap_or((1600, 900));
                 // the same camera the picture is taken with, head turn and all
                 let cam =
-                    player.camera_look(&args.view, &camera, look_of(&args), offscreen_orbit(), 0.0, false);
+                    player.camera_look(&args.view, &camera, look_of(&args), offscreen_orbit());
                 let (o, d) = cursor_ray(&cam, v[0], v[1], w as f32, h as f32);
                 match player.click(o, d, pixel_angle(&cam, h as f32) * 6.0) {
                     Some(i) => log::info!(
@@ -1645,7 +1640,7 @@ pub(crate) fn run_offscreen(
             }
         }
         if args.cam.is_none() && args.view != "free" && args.follow.is_none() {
-            camera = player.camera_look(&args.view, &camera, look_of(&args), offscreen_orbit(), 0.0, false);
+            camera = player.camera_look(&args.view, &camera, look_of(&args), offscreen_orbit());
             if args.view == "outside" {
                 camera = player.camera_clipped(camera, &world, offscreen_orbit(), 0.0);
             }

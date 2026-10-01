@@ -858,6 +858,10 @@ pub struct MaterialExtra {
     /// `[nomaplighting]`: the map's lamps (`[maplight]`) do not light it - a street lamp
     /// is not lit by its own light.
     pub no_map_lights: bool,
+    /// A `[tree]`'s leaf cards: the vanilla picture leaves the map's lamps off them, as
+    /// OMSI 2 shows a tree standing right under a street lamp dark; Vanilla+ and Enhanced
+    /// still light them.
+    pub tree: bool,
     /// 1 when the texture's `.cfg` sidecar carries `[moisture]`/`[puddles]`: the road of a
     /// junction or crossing object gets wet and collects puddles like a spline's.
     pub moisture: f32,
@@ -1279,8 +1283,10 @@ pub struct Renderer {
     dlss: Option<DlssState>,
     dlss_failed: bool,
     dlss_window: bool,
-    ssao_pipeline: wgpu::RenderPipeline,
-    blur_pipeline: wgpu::RenderPipeline,
+    /// Ambient occlusion and its blur; none on OpenGL (GLES), whose shading language cannot
+    /// read a depth texture texel by texel - the pipelines failed there, AO off or not (#422).
+    ssao_pipeline: Option<wgpu::RenderPipeline>,
+    blur_pipeline: Option<wgpu::RenderPipeline>,
     shadow_view: wgpu::TextureView,
     shadow_view_far: wgpu::TextureView,
     shadow_sampler: wgpu::Sampler,
@@ -1782,6 +1788,11 @@ impl Renderer {
                 label: Some("omsi"),
                 required_features,
                 required_limits: limits,
+                // (a card of up to 4 GB gets the allocator's small blocks: the large ones
+                // left hundreds of MB reserved and unused, and 2 GB cards lost the device to
+                // "Out of memory" in the first frames with the textures well under budget,
+                // #332, #295)
+                memory_hints: if weak || modest || vram.is_some_and(|v| v <= 4200) { wgpu::MemoryHints::MemoryUsage } else { wgpu::MemoryHints::Performance },
                 ..Default::default()
             })
             .await
@@ -3068,8 +3079,9 @@ impl Renderer {
                 cache: None,
             })
         };
-        let ssao_pipeline = make_ao("fs_ssao");
-        let blur_pipeline = make_ao("fs_blur");
+        let gl = GL_BACKEND.load(std::sync::atomic::Ordering::Relaxed);
+        let ssao_pipeline = (!gl).then(|| make_ao("fs_ssao"));
+        let blur_pipeline = (!gl).then(|| make_ao("fs_blur"));
         let prepass_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("prepass"),
             bind_group_layouts: &[Some(&camera_layout), Some(&material_layout)],
@@ -5162,8 +5174,9 @@ impl Renderer {
             color,
             params: [
                 mode,
-                // 1 unlit (0.9 a mirror's own picture); 0.25 lit by everything but the map's lamps
-                if mirror { 0.9 } else if unlit { 1.0 } else if lm_mapped { 0.35 } else if extra.no_map_lights { 0.25 } else { 0.0 },
+                // 1 unlit (0.9 a mirror's own picture); 0.25 lit by everything but the map's
+                // lamps; 0.15 a tree, not lit by the map's lamps in the vanilla picture
+                if mirror { 0.9 } else if unlit { 1.0 } else if lm_mapped { 0.35 } else if extra.no_map_lights { 0.25 } else if extra.tree { 0.15 } else { 0.0 },
                 if transmap.is_some() { 1.0 } else { 0.0 },
                 if transmap.map(|t| t.1).unwrap_or(false) {
                     1.0
@@ -7523,7 +7536,7 @@ impl Renderer {
         self.prepare_coronas(scene, lighting.night);
         self.prepare_smoke(scene, camera.position);
         // ambient occlusion only for the real picture, not for the mirrors
-        let ao_on = with_overlays && self.options.ssao && omsi_cfg::env::var_os("OMSI_NO_AO").is_none();
+        let ao_on = with_overlays && self.options.ssao && self.ssao_pipeline.is_some() && omsi_cfg::env::var_os("OMSI_NO_AO").is_none();
         // the enhanced path's shading is costly: the depth prepass keeps it to the visible
         // surface (without multisampling, see `share_depth`)
         // (DLSS reads the prepass's depth, and the prepass writes its motion vectors)
@@ -8789,9 +8802,9 @@ impl Renderer {
                 (&self.ssao_pipeline, &ao.ssao_bg, &ao.ao_view, "ssao"),
                 (&self.blur_pipeline, &ao.blur_bg, &ao.blur_view, "ssao blur"),
             ] {
-                if !ao_on {
+                let Some(pipe) = pipe.as_ref().filter(|_| ao_on) else {
                     break;
-                }
+                };
                 let mut pass = prepass_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("ssao"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {

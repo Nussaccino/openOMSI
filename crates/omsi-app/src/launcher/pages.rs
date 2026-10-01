@@ -634,7 +634,7 @@ fn settings_columns(ui: &mut Ui, s: &mut Value, dirty: &mut f32, body: Rect, upd
     toggle_setting(ui, s, dirty, row(&mut y), "Steering linearity (keys at OMSI's steady pace)", "steering_linear");
     toggle_setting(ui, s, dirty, row(&mut y), "Old Steering (the wheel stays, turn it back yourself)", "old_steering");
     let mut ms = get(s, "mouse_sens").as_f64().unwrap_or(1.0) as f32;
-    if ui.slider("s-mouse", row(&mut y), &mut ms, 0.25, 2.0, 0.05, "Mouse steering (O)", &|v| if (v - 1.0).abs() < 0.01 { "OMSI".to_string() } else { format!("{:.0}%", v * 100.0) }) {
+    if ui.slider("s-mouse", row(&mut y), &mut ms, 0.1, 3.0, 0.05, "Mouse steering sensitivity (O)", &|v| if (v - 1.0).abs() < 0.01 { "OMSI".to_string() } else { format!("{:.0}%", v * 100.0) }) {
         s["mouse_sens"] = json!((ms * 100.0).round() / 100.0);
         *dirty = 0.3;
     }
@@ -711,6 +711,7 @@ fn settings_columns(ui: &mut Ui, s: &mut Value, dirty: &mut f32, body: Rect, upd
     toggle_setting(ui, s, dirty, row(&mut y), "Collisions with people", "collision_pedestrians");
     toggle_setting(ui, s, dirty, row(&mut y), "Head moves with the bus", "head_movement");
     toggle_setting(ui, s, dirty, row(&mut y), "Camera glides between viewpoints", "driverview_smooth");
+    toggle_setting(ui, s, dirty, row(&mut y), "Driver's hands in the cab view", "hands_in_cab");
     // (in multiplayer the host's or the server's speed counts)
     sel_setting(ui, s, dirty, "s-timespeed", row(&mut y), "Time speed (not in multiplayer)", "time_speed", &[("1", "Real time"), ("2", "x2"), ("4", "x4"), ("8", "x8"), ("15", "x15"), ("30", "x30")]);
     // (the keys are on the Controls page)

@@ -15,6 +15,116 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
   asks for no `IDXGIFactoryMedia` (a patched copy in `third_party/wgpu-hal`). With it,
   RenoDX's DLSS addon can add DLSS Neural Rendering (see the user guide).
 
+## 0.1.479 - 2026-10-01
+
+### Maps
+- Objects placed along a spline that follow its slope and cant (railings, posts, signs,
+  lights) turn within the spline's inclined surface: one turned sideways to the road no
+  longer leans across it and off the ground on a sloped or canted street, and one on a
+  chain running backwards no longer tips downhill (from #409).
+
+### Android
+- No "fs_blur" shader error on OpenGL devices: the ambient occlusion pipelines, which
+  OpenGL ES cannot compile, are left out there - AO stays available on Vulkan (#422).
+
+## 0.1.476 - 2026-10-01
+
+### Controls
+- Mouse steering sensitivity can be set in the pause menu's Options (Mouse steering
+  sensitivity + / -, 10% to 300%; 100% is OMSI's), and the launcher's slider goes as far.
+- The log says how each game controller came in (its layout, DirectInput or the system's)
+  and, the first time a stick or axis moves, whether it steers - for reports of sticks
+  that do nothing.
+
+### Windows
+- The game and the dedicated server start on a PC without the Visual C++ Redistributable:
+  its runtime DLLs ship beside `openomsi.exe` ("The code execution cannot proceed because
+  VCRUNTIME140_1.dll was not found").
+
+## 0.1.471 - 2026-10-01
+
+### Physics
+- Buses no longer fall through the road at junctions over a buried embankment slope
+  (Cotterell, the junction by the park): a road face lying more than a metre under the
+  drawn ground beneath the wheel is no road there, and the bus stands on the ground, as
+  with Omsi.exe's highest-face query (#424, #423).
+- The wheels roll on the road where it is drawn: splines and `[surface]` objects are drawn
+  8 cm over their authored height and the bus now stands on them there, not 8 cm into
+  the asphalt (#421).
+
+### Maps
+- An object stored in a neighbouring tile's file, past its own tile's edge, stands on the
+  ground under it instead of the height at its tile's border (#421).
+
+## 0.1.463 - 2026-10-01
+
+### Passengers
+- With the door release on, the SD200's automatic rear door no longer opens on its own
+  while riders board at the front: riders no longer press the outside door opener, which
+  Omsi.exe never does - they only ask for a door through `PAX_Entry<n>_Req` (#416, #415).
+
+### Project
+- Pull requests get a template, and ones opened from a `main` branch or an organisation
+  account are closed with a note (#418).
+
+## 0.1.455 - 2026-10-01
+
+### Traffic
+- Emergency vehicles have right of way at crossings: a vehicle whose script sets
+  `TrafficPriority` goes before the others and they give way to it, as Omsi.exe does for
+  any vehicle, not only the player's bus (#356).
+- Timetable buses stop at the stop on their own side of the road: on a route back along
+  the same street, they stopped at the stop across the road on the way out. Stops are
+  matched in the trip's order, on the lane they stand beside.
+
+### Graphics
+- Enhanced: the far road and ground no longer go dark at grazing angles - what reflects
+  nothing keeps its light, and a wet road reflects the sky (#374).
+
+### Graphics cards
+- Cards of up to 4 GB use the allocator's small memory blocks, and a texture budget larger
+  than the card holds is taken down to its size: 2 GB cards lost their device to "out of
+  memory" in the first frames (#332, #295, #323).
+
+## 0.1.451 - 2026-10-01
+
+### Vehicles
+- Wheels stay under their hub caps: the drawn tyres are seated on the physical hub at the
+  point they turn about (the rotation's `origin_trans`), not at the .o3d's own pivot. A tyre
+  without a pivot (the NEOMAN's right front) was measured at a point circling the hub and
+  moved up and down by centimetres as it turned, so its cap seemed to roll off it.
+
+### View
+- Smooth camera transitions when changing and entering views, a setting in the pause menu
+  as well (#408, by shloooo).
+
+### Graphics (Vanilla, at night)
+- The map's lamps leave `[tree]`s dark, as in OMSI 2 (#407, by Sulamufor).
+- The terrain's light map lights the ground instead of glowing over it (#406, by Sulamufor).
+
+## 0.1.438 - 2026-10-01
+
+### View
+- The driver's hands in the cab view are a setting now (Settings and the pause Options,
+  "Driver's hands in the cab view"), off by default.
+
+### Graphics
+- Vanilla: reflections blend in gamma like the rest of the classic picture; at night the
+  MAN NL/NG instrument glass no longer lies milky white over the unlit gauges (#401, by
+  Sulamufor).
+
+## 0.1.434 - 2026-10-01
+
+### Driving
+- An automatic gearbox is no longer taken for a manual one. A bus counted as manual when
+  its scripts answered to the gate keys (`kw_s_1`, `kw_s_2`) and read a `Clutch` anywhere -
+  many automatics do both (gear hold keys, a torque converter's own clutch) - and the
+  automatic clutch of the settings then worked their clutch at every stop and pull-away,
+  and the phone showed a manual's gate. Now a gearbox is manual when it has the gates and
+  no automatic's `automatic_D`, or when its first gate itself asks for the clutch, or when
+  it works a clutch of its own through `AutoClutch` (checked on the LiAZ MKPP/GMP, the
+  Sprinter G32/G-tronic, the SD202 and the NEOMAN A23).
+
 ## 0.1.433 - 2026-10-01
 
 ### Graphics

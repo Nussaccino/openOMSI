@@ -1420,7 +1420,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // (a light-mapped road or plate takes the map's lamps only in Vanilla+: as OMSI 2 shows
     // it, the vanilla picture lights it from the tile light map alone)
     let lm_only = light_map_mapped(material.params) && camera.sky_color.w > 0.5;
-    let map_lamps = select(1.0, 0.0, (material.params.y > 0.2 && material.params.y < 0.3) || lm_only);
+    // (and a [tree]'s leaf cards, params.y 0.15: OMSI 2 leaves a tree dark even right under
+    // a street lamp, where the lamp's 40 m core lit the crown up yellow-green)
+    let tree_unlamped = camera.sky_color.w > 0.5 && material.params.y > 0.1 && material.params.y < 0.2;
+    let map_lamps = select(1.0, 0.0, (material.params.y > 0.2 && material.params.y < 0.3) || lm_only || tree_unlamped);
     let lamp_light = point_lights(in.world, n, map_lamps);
     var light = diffuse + lamp_light;
     let light_mapped = material.params2.x > 0.5 && material.extra.x < 0.5;
@@ -1434,11 +1437,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // night wall at a quarter of OMSI 2's - a texture of 0.66 under a light of 0.05 came out
     // at 2 of 255 instead of 8.)
     let classic = camera.sky_color.w > 0.5;
+    // (the terrain's night map is its tile light map: light, not a glow - see below)
+    let terrain_night = classic
+        && material.params.y < 0.5
+        && material.extra.x > 0.5
+        && material.extra.w > 0.5
+        && material.extra.w < 1.5;
     if (classic && material.params.y < 0.5) {
         var v = clamp(material.emissive.rgb + material.color.rgb * (light + interior_lamps(in.world, n, in.params2.z)), vec3<f32>(0.0), vec3<f32>(1.0));
         if (light_mapped) {
             let lm = srgb_encode(textureSample(t_light, s_diffuse, buv).rgb) * clamp(in.params2.x, 0.0, 1.0);
             v = v + lm * (vec3<f32>(1.0) - v);
+        }
+        if (terrain_night) {
+            // the terrain's tile light map lights the ground as the lamps' own light: added
+            // to the vertex light before the texture is multiplied in. Laid over the lit
+            // ground instead, as a night map glows, its faint fringe (0.01, linear) put
+            // one beige veil over cobbles and grass alike, a whole car park the colour of
+            // sand where OMSI 2 shows it dark grey.
+            let nm = srgb_encode(textureSample(t_night, s_diffuse, vec2<f32>(in.uv.x, 1.0 - in.uv.y)).rgb);
+            v = min(v + nm * camera.sun_color.w * clamp(in.params2.y, 0.0, 1.0), vec3<f32>(1.0));
         }
         lit = srgb_decode(srgb_encode(albedo) * v);
     } else if (light_mapped) {
@@ -1476,7 +1494,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (!light_mapped && !classic) {
         lit = lit + tex.rgb * interior_lamps(in.world, n, in.params2.z);
     }
-    if (material.extra.w > 0.5) {
+    if (material.extra.w > 0.5 && !terrain_night) {
         // [matl_nightmap]: self-illumination that fades in with the night
         // terrain: the tile light map in tile space (north at the top row)
         let nuv = select(buv, vec2<f32>(in.uv.x, 1.0 - in.uv.y), material.extra.x > 0.5);
@@ -1542,7 +1560,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         } else {
             kk = omsi_texture_factor(material.params2.y, camera.ambient.rgb + vec3<f32>(g));
         }
-        lit = mix(lit, env.rgb, kk);
+        // In the vanilla picture the lerp is made on the encoded values, as the stage makes
+        // it, like the texture x light product above: made on linear ones it showed the
+        // reflection about twice as bright over a dark surface - since the nights got dark
+        // (#300) the instrument glass of the MAN NL/NG (Fenster.tga, factor 0.5, the sky
+        // at the sphere map's bottom) lay milky white over the unlit gauges.
+        if (classic) {
+            lit = srgb_decode(mix(srgb_encode(lit), srgb_encode(env.rgb), kk));
+        } else {
+            lit = mix(lit, env.rgb, kk);
+        }
     }
     // wet road: a surface whose texture carries [moisture] darkens under rain and starts
     // to mirror the sky, strongest where you look along it (the Fresnel sheen that makes a
