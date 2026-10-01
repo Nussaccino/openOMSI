@@ -11,6 +11,9 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
   Anti-aliasing → DLSS / DLAA, with its quality (DLAA, Quality, Balanced, Performance,
   Ultra performance) in the row below. NVIDIA's Streamline DLLs go beside the game (see the
   user guide); without them, or on another card, the game draws as before.
+- ReShade (6.8) no longer takes the game down at the start: wgpu's DirectX 12 instance
+  asks for no `IDXGIFactoryMedia` (a patched copy in `third_party/wgpu-hal`). With it,
+  RenoDX's DLSS addon can add DLSS Neural Rendering (see the user guide).
 
 ## 0.1.433 - 2026-10-01
 

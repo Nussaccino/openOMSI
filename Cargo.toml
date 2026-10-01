@@ -23,7 +23,7 @@ members = [
     "crates/omsi-app",
     "tools/omsi-check",
 ]
-exclude = ["launcher/src-tauri"]
+exclude = ["launcher/src-tauri", "third_party/wgpu-hal"]
 
 [workspace.package]
 version = "0.1.0"
@@ -66,3 +66,7 @@ opt-level = 1
 inherits = "release"
 debug = 0
 strip = "debuginfo"
+
+# wgpu-hal 29.0.4 with one change: no IDXGIFactoryMedia (see third_party/README.md)
+[patch.crates-io]
+wgpu-hal = { path = "third_party/wgpu-hal" }

@@ -225,6 +225,15 @@ gets is the tone-mapped one; each frame the projection moves by a sub-pixel offs
 depth prepass writes every pixel's motion (the camera's and each object's, from last
 frame's model matrices).
 
+DLSS Neural Rendering (DLSS 5) is not built into openOMSI - NVIDIA has not published its
+interface - but it can be put in from outside, as in other games that use DLSS: switch DLSS
+on in the launcher, install [ReShade](https://reshade.me) for `openomsi.exe` (DirectX 12, as
+`dxgi.dll` beside it) and put RenoDX's DLSS addon (`renodx-dlss.addon64`) beside it too. The
+neural rendering DLLs (NVIDIA's `nvngx_dlssnr.dll`, or one built with
+[OpenNR](https://github.com/clshortfuse/openNR)) come from the player, as Streamline's do;
+openOMSI ships none of them. (ReShade 6.8 used to take openOMSI down at the start, in
+`dxgi.dll`: see `third_party/README.md`.)
+
 `drive_keys` is a control preset: `simple` (W/S/A/D and the arrow keys drive; the default),
 `wasd`, `arrows`, or `omsi` ("Custom controls") - only the layout of `Inputs/keyboard.cfg`
 (OMSI's Shift + numpad, or what the Controls page made of it), nothing added. **T** sells the ticket a passenger asks for on a bus without a
