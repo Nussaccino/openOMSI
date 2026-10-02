@@ -96,6 +96,7 @@ effect. On Android, `openOMSI/env.txt` holds `NAME=value` lines that are set bef
 | `OMSI_DEBUG_WALLS` | bool | off | use | sim | Log the walls a walking player slides along. |
 | `OMSI_DEBUG_WARP` | bool | off | use | app | Log crossings whose ground was moved by more than a metre. |
 | `OMSI_DEBUG_WHEELS` | bool | off | use | app | Log where the wheel meshes of every vehicle type turn. |
+| `OMSI_DLSS_VERBOSE` | bool | off | once | render | All of NVIDIA Streamline's log. |
 | `OMSI_DUMP_CUT` | text | - | use | app | Directory: write each tile's road-cut alpha masks as images. |
 | `OMSI_DUMP_GROUND` | text | - | use | app | File: every loaded tile's final terrain and road cut as text. |
 | `OMSI_DUMP_SCENERY_TEXT` | text | - | use | app | Directory: write the scenery objects' text textures as drawn. |
@@ -153,6 +154,7 @@ effect. On Android, `openOMSI/env.txt` holds `NAME=value` lines that are set bef
 | `OMSI_CLOUDFLARED_OWN` | bool | off | use | net | LAN tunnel: only the game's own downloaded cloudflared, to test the download. |
 | `OMSI_CONDENSATION` | text | - | use | app | Offscreen: minutes,people[,engine] - the cabin air and condensation on the glass after that long. |
 | `OMSI_DAY_AIR` | text | - | once | render | haze,angstrom[,height,strat]: fix the day's air (twilight colours) instead of the varying one. |
+| `OMSI_DLSS_JITTER_SIGN` | num | 1 | frame | render | -1 tells DLSS the sub-pixel offset the other way round (a picture that shimmers or smears on every edge with DLSS). |
 | `OMSI_DRIVER_HANDS` | text | - | use | app | left,right: both driver hands held at these angles (grip close-ups). |
 | `OMSI_DRIVER_SHIFTER` | text | - | use | app | Part of a variable or file name: force the shifter the driver's hand uses; off: both hands on the wheel. |
 | `OMSI_DRIVE_PROFILE` | text | - | use | app | Offscreen: "t throttle brake [steer]/..." piecewise constant pedals (crash/kerb tests). |
@@ -295,6 +297,7 @@ effect. On Android, `openOMSI/env.txt` holds `NAME=value` lines that are set bef
 
 | Name | Type | Default | Read | Crates | Description |
 |---|---|---|---|---|---|
+| `OMSI_DLSS` | text | settings | use | app | off, dlaa, quality, balanced, performance or ultra_performance: NVIDIA DLSS whatever the settings say (Windows, DirectX 12, GeForce RTX). |
 | `OMSI_ENHANCED` | bool | settings | use | app | Enhanced graphics for this run. |
 | `OMSI_ENHANCED_PLUS` | bool | settings | use | app | Enhanced+ (ray traced) graphics for this run. |
 | `OMSI_GRAPHICS` | text | settings | use | app | vanilla, vanilla_plus or enhanced: another renderer for one run. |
@@ -324,6 +327,7 @@ effect. On Android, `openOMSI/env.txt` holds `NAME=value` lines that are set bef
 | `OMSI_CLOUDFLARED` | text | - | use | net | Path of the cloudflared binary for the LAN tunnel (searched after the game's folder, before the PATH). |
 | `OMSI_CONTENT` | text | beside the game | use | app, launcher-core, sim | The content folder (mods, archives, screenshots). Set at runtime on Android. |
 | `OMSI_CONTENT_ZIP` | text | - | use | cfg | Extra content archives, separated like PATH (as --content-zip). |
+| `OMSI_DLSS_PROJECT_ID` | text | - | once | render | The project id handed to NVIDIA Streamline (a GUID; openOMSI's own by default). |
 | `OMSI_INSTANCE` | text | - | use | app, launcher-core | The id of a game instance started by the launcher (set for the child process). |
 | `OMSI_LAN_IP` | text | - | use | net | a.b.c.d[,e.f.g.h]: LAN addresses to offer first (when the detection gets them wrong). |
 | `OMSI_LAUNCHER` | text | - | use | app | Program to open as the launcher instead of the built-in one. |
@@ -332,6 +336,7 @@ effect. On Android, `openOMSI/env.txt` holds `NAME=value` lines that are set bef
 | `OMSI_PRESENCE_URL` | text | built-in | use | app | Base URL of the presence ("playing now") service. |
 | `OMSI_ROOT` | text | found | use | app, launcher-core, o3d, sim | The OMSI 2 installation folder (also the content root for tests that need real content). |
 | `OMSI_SAFE_GPU` | num | 0 | use | app | Restarts after a lost graphics device: lighter on the card each time. Set at runtime on Android and by the restart. |
+| `OMSI_STREAMLINE_DIR` | text | - | once | render | The folder NVIDIA Streamline's DLLs are in (the game's folder by default). |
 | `OMSI_UPDATE_URL` | text | built-in | use | app | Another release description (URL or file:///...json) for the update check. |
 | `OMSI_WINE` | text | PATH | use | plugin | The Wine binary for Windows plugins. |
 

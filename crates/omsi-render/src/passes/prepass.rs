@@ -5,7 +5,7 @@ use super::*;
 
 impl Renderer {
     // --- depth prepass + ambient occlusion (single-sampled, camera projection)
-    pub(crate) fn encode_depth_prepass(&self, prepass_encoder: &mut wgpu::CommandEncoder, scene: &Scene, f: &FrameCtx, prepass_batches: &[Batch], timers: &mut PassTimers) {
+    pub(crate) fn encode_depth_prepass(&self, prepass_encoder: &mut wgpu::CommandEncoder, scene: &Scene, f: &FrameCtx, prepass_batches: &[Batch], rain_batches: &[Batch], timers: &mut PassTimers) {
         let (camera, aspect, width, height, ao_on) = (f.camera, f.aspect, f.width, f.height, f.ao_on);
         if f.prepass_on {
             let proj = f.projection.unwrap_or_else(|| {
@@ -24,10 +24,19 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.ao_buf, 0, bytemuck::bytes_of(&u));
             let ao = self.ao.as_ref().unwrap();
+            // DLSS: the prepass writes each pixel's motion beside its depth
+            let dlss_prepass = self.dlss_prepass(f);
+            let cleared = |view| wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+            };
+            let motion_colors = [dlss_prepass.map(|(_, t, _)| cleared(&t.motion_view)), dlss_prepass.map(|(_, t, _)| cleared(&t.bias_view))];
             {
                 let mut pass = prepass_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("depth prepass"),
-                    color_attachments: &[],
+                    color_attachments: if motion_colors[0].is_some() { &motion_colors[..] } else { &[] },
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &ao.depth_view,
                         depth_ops: Some(wgpu::Operations {
@@ -40,10 +49,21 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
+                if let Some((p, _, bg)) = dlss_prepass {
+                    // the sky's motion under everything, then the scene's over it
+                    pass.set_bind_group(3, bg, &[]);
+                    pass.set_pipeline(&p.sky);
+                    pass.draw(0..3, 0..1);
+                }
                 pass.set_bind_group(0, scene.camera_bind_group.as_ref().unwrap(), &[]);
-                encode_batches(&mut pass, scene, prepass_batches, |pipe| {
-                    &self.prepass_pipelines[pipe as usize]
+                encode_batches(&mut pass, scene, prepass_batches, |pipe| match dlss_prepass {
+                    Some((p, _, _)) => &p.prepass[pipe as usize],
+                    None => &self.prepass_pipelines[pipe as usize],
                 });
+                if let Some((p, _, _)) = dlss_prepass.filter(|_| !rain_batches.is_empty()) {
+                    encode_batches(&mut pass, scene, rain_batches, |_| &p.rain);
+                    encode_batches(&mut pass, scene, rain_batches, |_| &p.rain_bias);
+                }
             }
             for (pipe, bg, target, pass_label) in [
                 (&self.ssao_pipeline, &ao.ssao_bg, &ao.ao_view, "ssao"),

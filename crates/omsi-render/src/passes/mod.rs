@@ -6,6 +6,7 @@ use super::*;
 
 mod batch;
 mod cull;
+mod dlss;
 mod effects;
 mod main_pass;
 mod post;
@@ -16,6 +17,9 @@ mod shadow_plan;
 mod submit;
 
 pub(crate) use batch::DrawPlan;
+pub(crate) use dlss::{DlssFrame, DlssState};
+#[cfg(test)]
+pub(crate) use dlss::MotionUniform;
 pub(crate) use shadow_plan::ShadowPlan;
 
 /// The frame's switches from the environment: read once at the start of every frame
@@ -121,12 +125,15 @@ pub(crate) struct FrameCtx<'a> {
     pub second_eye: bool,
     /// the render origin
     pub ro: DVec3,
-    /// the window's width (the HUD is drawn at the window's size)
+    /// the window's size (the HUD is drawn at it)
     pub full_w: u32,
+    pub full_h: u32,
     /// the 3D picture's size (smaller than the window's with a render scale)
     pub width: u32,
     pub height: u32,
     pub vanilla_fxaa: bool,
+    /// DLSS draws this frame (the window's own picture, see `Renderer::dlss_frame_size`)
+    pub dlss_frame: bool,
     pub glass_on: bool,
     pub scaled: bool,
     pub scene_target: Option<(wgpu::TextureView, wgpu::BindGroup)>,

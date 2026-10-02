@@ -69,8 +69,14 @@ impl Renderer {
         // from here on `width` and `height` are the size of the picture, `full_*` the
         // window's (the HUD is drawn at that size). Mirrors keep their own size.
         let (full_w, full_h) = (width, height);
-        let (width, height) = if with_overlays {
-            self.scene_size(full_w, full_h)
+        // DLSS: the window's own picture, at the size DLSS brings up to the window; it takes
+        // the place of FXAA and the render scale, and draws the HUD over its result
+        let dlss_size = self.dlss_frame_size(with_overlays, projection, (full_w, full_h));
+        let dlss_frame = dlss_size.is_some();
+        let (width, height) = if let Some(size) = dlss_size {
+            size
+        } else if with_overlays {
+            self.render_scale_size(full_w, full_h)
         } else {
             (full_w, full_h)
         };
@@ -78,6 +84,7 @@ impl Renderer {
         // edges (the Enhanced path has it in its post passes): the picture is drawn into a
         // texture of the window's size and smoothed on its way to the window, the HUD after
         let vanilla_fxaa = with_overlays
+            && !dlss_frame
             && (width, height) == (full_w, full_h)
             && self.options.fxaa
             && self.options.msaa <= 1
@@ -90,8 +97,10 @@ impl Renderer {
             && scene.glass_slot.is_some()
             && (lighting.rain > 0.001 || lighting.wetness > 0.02)
             && !env.no_glass_picture;
-        let scaled = (width, height) != (full_w, full_h) || vanilla_fxaa || (glass_on && !enhanced_view);
-        let scene_target: Option<(wgpu::TextureView, wgpu::BindGroup)> = if scaled {
+        let scaled = (width, height) != (full_w, full_h) || vanilla_fxaa || (glass_on && !enhanced_view) || dlss_frame;
+        let scene_target: Option<(wgpu::TextureView, wgpu::BindGroup)> = if dlss_frame {
+            self.dlss_scene_target()
+        } else if scaled {
             Some(self.scale_target(width, height))
         } else {
             None
@@ -133,7 +142,8 @@ impl Renderer {
         let ao_on = with_overlays && self.rt.is_none() && self.options.ssao && self.ssao_pipeline.is_some() && !env.no_ao;
         // the enhanced path's shading is costly: the depth prepass keeps it to the visible
         // surface (without multisampling, see `share_depth`)
-        let prepass_on = ao_on || puddles_wanted || glass_on || (enhanced && (with_overlays || xr_view));
+        // (DLSS reads the prepass's depth, and the prepass writes its motion vectors)
+        let prepass_on = ao_on || puddles_wanted || glass_on || (enhanced && (with_overlays || xr_view)) || dlss_frame;
         if prepass_on && self.ensure_ao(width, height) {
             // a new AO texture: the camera bind group must point at it
             scene.dirty = true;
@@ -185,9 +195,11 @@ impl Renderer {
             second_eye,
             ro,
             full_w,
+            full_h,
             width,
             height,
             vanilla_fxaa,
+            dlss_frame,
             glass_on,
             scaled,
             scene_target,
@@ -212,8 +224,9 @@ impl Renderer {
 
     /// The camera's uniforms (and the light maps' place), the ray tracing's preparation,
     /// the lamps' light on the view and the sky. Returns the view-projection matrix, the
-    /// uniform and whether the reflection probe is redrawn this frame.
-    pub(crate) fn frame_uniforms(&mut self, scene: &Scene, f: &FrameCtx, sh: &ShadowPlan, clock: &mut StageClock) -> (Mat4, CameraUniform, bool) {
+    /// uniform, whether the reflection probe is redrawn this frame and what DLSS is handed
+    /// after the scene's submit.
+    pub(crate) fn frame_uniforms(&mut self, scene: &Scene, f: &FrameCtx, sh: &ShadowPlan, clock: &mut StageClock) -> (Mat4, CameraUniform, bool, Option<DlssFrame>) {
         let (camera, lighting, ro, cam_rel, aspect) = (f.camera, f.lighting, f.ro, f.cam_rel, f.aspect);
         let (enhanced, lead_view, rt_frame, ao_on, glass_on, shadows) = (f.enhanced, f.lead_view, f.rt_frame, f.ao_on, f.glass_on, sh.shadows);
         let lamp_shadows = &f.lamp_shadows;
@@ -221,6 +234,8 @@ impl Renderer {
             .projection
             .map(|p| p * Mat4::look_to_rh((camera.position - ro).as_vec3(), camera.forward(), camera.up()))
             .unwrap_or_else(|| camera.view_proj(aspect, ro));
+        // (DLSS: the projection moved by this frame's sub-pixel offset)
+        let (vp_mat, dlss_frame) = self.dlss_jitter(scene, f, vp_mat);
         // where the tile light maps lie, relative to the render origin
         {
             let (lx, ly, side) = self.lm_place.get();
@@ -372,6 +387,6 @@ impl Renderer {
         let probe_redraw = enhanced
             && (lead_view || self.sky_state.is_none())
             && self.prepare_enhanced(lighting, cam_rel, ro, f.dt);
-        (vp_mat, cu, probe_redraw)
+        (vp_mat, cu, probe_redraw, dlss_frame)
     }
 }

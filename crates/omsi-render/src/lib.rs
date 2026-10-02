@@ -2,9 +2,11 @@
 
 pub mod atmosphere;
 pub mod clouds;
+pub mod dlss;
 mod passes;
-use passes::{Encoders, FrameArgs, FrameEnv, PassTimers, StageClock};
+use passes::{DlssState, Encoders, FrameArgs, FrameEnv, PassTimers, StageClock};
 mod pipelines;
+use pipelines::dlss::DlssPipelines;
 mod puddles;
 mod rt;
 mod triple;
@@ -246,6 +248,8 @@ const MOON_RADIUS: f32 = 0.0062;
 /// The textures of the ambient-occlusion pass for one target size.
 struct AoTargets {
     size: (u32, u32),
+    /// (the texture too: DLSS reads it as the picture's depth)
+    depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
     ao_view: wgpu::TextureView,
     blur_view: wgpu::TextureView,
@@ -1311,6 +1315,9 @@ pub struct Scene {
     /// are appended to the buffers instead of rebuilding them, as long as they fit.
     uploaded_instances: usize,
     uploaded_entries: u32,
+    /// Counts the times every entry was laid out anew (`prepare`): last frame's matrices of
+    /// an entry are only its own while this stays (DLSS's motion vectors).
+    model_epoch: u64,
     /// Instances whose transform or parameters changed since the last `prepare`: only
     /// their entries are rewritten. Rebuilding the whole per-draw buffer for 17 000 objects
     /// because one bus moved was the biggest single CPU cost of a frame.
@@ -1528,7 +1535,8 @@ impl GpuArray {
             return GpuArray::Buffer(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: size.max(16).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                // (copied from: DLSS's motion vectors keep last frame's model matrices)
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }));
         }
@@ -2101,6 +2109,13 @@ pub struct Renderer {
     /// The same, multisampled: the enhanced main pass's own depth laid first (see
     /// `render_inner`), so that its costly shading runs once per visible surface.
     prepass_msaa_pipelines: Option<[wgpu::RenderPipeline; 6]>,
+    /// DLSS: the depth prepass with motion vectors (made when DLSS is asked for), Streamline
+    /// and its targets once the first frame started it, whether it could not, and whether the
+    /// picture being drawn is the window's own (`render`: the one DLSS is for).
+    dlss_pipes: Option<DlssPipelines>,
+    dlss: Option<DlssState>,
+    dlss_failed: bool,
+    dlss_window: bool,
     /// Ambient occlusion and its blur; none on OpenGL (GLES), whose shading language cannot
     /// read a depth texture texel by texel - the pipelines failed there, AO off or not (#422).
     ssao_pipeline: Option<wgpu::RenderPipeline>,
@@ -2344,7 +2359,13 @@ pub struct RenderOptions {
     /// reflections, where the device can trace rays (hardware ray queries); elsewhere the
     /// enhanced picture as it is.
     pub ray_tracing: bool,
+    /// NVIDIA DLSS (or DLAA) instead of multisampling, FXAA and the render scale: DirectX 12
+    /// on a GeForce RTX with Streamline's DLLs beside the game (see `dlss`). Elsewhere, or
+    /// when it cannot start, the picture is drawn as without it.
+    pub dlss: DlssMode,
 }
+
+pub use dlss::DlssMode;
 
 impl Default for RenderOptions {
     fn default() -> Self {
@@ -2365,6 +2386,7 @@ impl Default for RenderOptions {
             no_enhanced: false,
             preview_only: false,
             ray_tracing: false,
+            dlss: DlssMode::Off,
         }
     }
 }
@@ -2636,6 +2658,17 @@ impl Renderer {
         } else {
             options
         };
+        // DLSS takes the place of multisampling. It needs DirectX 12 on an NVIDIA card
+        // (whether this one is an RTX with a driver new enough, Streamline says at the
+        // first frame, see `DlssState`).
+        let options = if options.dlss.is_on() && !(cfg!(windows) && info.backend == wgpu::Backend::Dx12 && info.vendor == 0x10de) {
+            log::warn!("DLSS ({:?}) was asked for, but {} on {:?} cannot do it (a GeForce RTX card on DirectX 12 is needed); drawing without it", options.dlss, info.name, info.backend);
+            RenderOptions { dlss: DlssMode::Off, ..options }
+        } else if options.dlss.is_on() {
+            RenderOptions { msaa: 1, ..options }
+        } else {
+            options
+        };
         let shadow_size = options
             .shadow_size
             .clamp(512, if intel_vulkan_safe { 2048 } else { 8192 });
@@ -2822,7 +2855,7 @@ impl Renderer {
         let compress =
             bc && options.compress_textures && !omsi_cfg::flags::OMSI_NO_TEXCOMPRESS.is_set();
         omsi_texture::set_gpu_options(omsi_texture::GpuOptions { bc, compress });
-        log::info!("renderer: {} ({:?}), {:?}, {}x MSAA{}, anisotropy {}, shadow map {}, SSAO {}, render scale {}, textures {}", info.name, info.backend, format, options.msaa, if adapter_table { " (adapter format table)" } else { "" }, options.anisotropy, options.shadow_size, options.ssao, if options.render_scale > 0.0 { format!("{:.2}", options.render_scale.clamp(0.5, 1.0)) } else { "auto".to_string() }, match (bc, compress) { (false, _) => "RGBA (no BC on this device)", (true, false) => "DXT as blocks, others RGBA", (true, true) => "DXT as blocks, others compressed where close" });
+        log::info!("renderer: {} ({:?}), {:?}, {}x MSAA{}, DLSS {}, anisotropy {}, shadow map {}, SSAO {}, render scale {}, textures {}", info.name, info.backend, format, options.msaa, if adapter_table { " (adapter format table)" } else { "" }, options.dlss.as_str(), options.anisotropy, options.shadow_size, options.ssao, if options.render_scale > 0.0 { format!("{:.2}", options.render_scale.clamp(0.5, 1.0)) } else { "auto".to_string() }, match (bc, compress) { (false, _) => "RGBA (no BC on this device)", (true, false) => "DXT as blocks, others RGBA", (true, true) => "DXT as blocks, others compressed where close" });
         // Every pipeline is built under an error scope of every kind and the renderer built
         // again with less where one fails: without multisampling (a driver whose table
         // promises more than it takes), then without the pipelines a picture can do without
@@ -2936,7 +2969,7 @@ impl Renderer {
         format: wgpu::TextureFormat,
         options: RenderOptions,
     ) -> Renderer {
-        use pipelines::{coronas, defaults, enhanced, errors, mip, overlays, passes, post, scene, shadows, sky, ssao, upscale};
+        use pipelines::{coronas, defaults, dlss, enhanced, errors, mip, overlays, passes, post, scene, shadows, sky, ssao, upscale};
         let (msaa, shadow_size) = (options.msaa, options.shadow_size);
         RT_GBUF.store(options.ray_tracing, std::sync::atomic::Ordering::Relaxed);
         let errors = errors::install(&device, format, &options);
@@ -2956,6 +2989,8 @@ impl Renderer {
         let ssao = ssao::ssao(&device, gl);
         let fog_lamps = ssao::fog_lamps(&device, &scene.camera_layout, hdr_format, gl);
         let prepass = scene::prepass(&device, &scene, msaa);
+        // (the motion passes are in the scene module only with the arrays in storage buffers)
+        let dlss_pipes = (options.dlss.is_on() && array_path() == ArrayPath::Storage).then(|| dlss::build(&device, &scene));
         let mip = mip::build(&device);
         let post = post::build(&device, format, hdr_format, &defaults.white_texture);
         let enhanced = enhanced::build(&device, &queue, hdr_format, &defaults.camera_buf, &sky, !options.preview_only);
@@ -3037,6 +3072,10 @@ impl Renderer {
             ao_buf: ssao.buf,
             prepass_pipelines: prepass.pipelines,
             prepass_msaa_pipelines: prepass.msaa_pipelines,
+            dlss_pipes,
+            dlss: None,
+            dlss_failed: false,
+            dlss_window: false,
             ssao_pipeline: ssao.ssao_pipeline,
             blur_pipeline: ssao.blur_pipeline,
             fog_lamps_pipeline: fog_lamps.pipeline,
@@ -3147,7 +3186,16 @@ impl Renderer {
     }
 
     /// The size the 3D scene is drawn at for a window of this size.
+    /// (With DLSS: the size its quality mode draws at, by NVIDIA's ratios.)
     pub fn scene_size(&self, width: u32, height: u32) -> (u32, u32) {
+        if self.options.dlss.is_on() && self.dlss_pipes.is_some() && !self.dlss_failed {
+            return dlss::fallback_render_size(self.options.dlss, (width, height));
+        }
+        self.render_scale_size(width, height)
+    }
+
+    /// The size the render scale draws a window of this size at.
+    fn render_scale_size(&self, width: u32, height: u32) -> (u32, u32) {
         let s = self.scene_scale(width, height);
         if s >= 0.999 {
             return (width, height);
@@ -3245,6 +3293,7 @@ impl Renderer {
             block_cursor: 0,
             uploaded_instances: 0,
             uploaded_entries: 0,
+            model_epoch: 0,
             cpu_models: Vec::new(),
             cpu_params: Vec::new(),
             last_grid: Vec::new(),
@@ -5310,6 +5359,7 @@ impl Renderer {
         });
         self.ao = Some(AoTargets {
             size: (w, h),
+            depth,
             depth_view,
             ao_view,
             blur_view,
@@ -5960,6 +6010,7 @@ impl Renderer {
         }
         scene.changed.clear();
         scene.changed_mark.clear();
+        scene.model_epoch += 1;
         // one entry per (instance, material slot) so every draw call has its own parameters
         let mut mats: Vec<[[f32; 4]; 4]> = Vec::new();
         let mut params: Vec<[f32; 4]> = Vec::new();
@@ -6543,7 +6594,8 @@ impl Renderer {
         RT_BUFFERS.store(false, std::sync::atomic::Ordering::Relaxed);
         // (the meshes' shared pages stay on, as after the multisampling fallback below)
         let mesh_pages = self.mesh_pages;
-        *self = Renderer { mesh_pages, ..Self::build(self.device.clone(), self.queue.clone(), self.adapter_name.clone(), self.format, options) };
+        let (dlss, dlss_failed) = (self.dlss.take().map(DlssState::rebuilt), self.dlss_failed);
+        *self = Renderer { mesh_pages, dlss, dlss_failed, ..Self::build(self.device.clone(), self.queue.clone(), self.adapter_name.clone(), self.format, options) };
         scene.dirty = true;
         scene.model_buf = None;
         scene.params_buf = None;
@@ -6577,7 +6629,8 @@ impl Renderer {
             ..self.options
         };
         let mesh_pages = self.mesh_pages;
-        *self = Renderer { mesh_pages, ..Self::build(
+        let (dlss, dlss_failed) = (self.dlss.take().map(DlssState::rebuilt), self.dlss_failed);
+        *self = Renderer { mesh_pages, dlss, dlss_failed, ..Self::build(
             self.device.clone(),
             self.queue.clone(),
             self.adapter_name.clone(),
@@ -6605,7 +6658,11 @@ impl Renderer {
         if self.triple_targets.take().is_some() {
             self.triple_culling = Default::default();
         }
+        // (DLSS is for the window's own picture: not for the mirrors, the headset's eyes or
+        // a picture drawn into a texture)
+        self.dlss_window = true;
         self.render_inner(scene, target, width, height, camera, lighting, true, None, None, false);
+        self.dlss_window = false;
     }
 
     /// Three independently culled and shaded physical panels, composited into a
@@ -6982,7 +7039,7 @@ impl Renderer {
         let args = FrameArgs { target, width, height, camera, lighting, with_overlays, exclude_texture, projection, second_eye };
         let f = self.begin_frame(scene, env, args, &mut clock);
         let sh = self.plan_shadow_cache(scene, &f);
-        let (vp_mat, cu, probe_redraw) = self.frame_uniforms(scene, &f, &sh, &mut clock);
+        let (vp_mat, cu, probe_redraw, dlss_frame) = self.frame_uniforms(scene, &f, &sh, &mut clock);
         // --- what every pass draws, as batches over one draw list (see `Batch`): the shadow
         // casters of each cascade, the depth prepass and the main pass. The list is built
         // and uploaded before any pass is encoded.
@@ -7022,7 +7079,7 @@ impl Renderer {
         };
         self.encode_shadow_maps(&mut enc.shadow, scene, &sh, &shadow_batches, &mut timers);
         self.encode_lamp_shadows(&mut enc.shadow, scene, &f, &shadow_batches, &mut timers);
-        self.encode_depth_prepass(&mut enc.prepass, scene, &f, &plan.prepass_batches, &mut timers);
+        self.encode_depth_prepass(&mut enc.prepass, scene, &f, &plan.prepass_batches, &plan.rain_batches, &mut timers);
         if f.rt_frame {
             self.encode_ray_tracing(&mut enc.prepass, scene, timers.set.as_ref(), &mut timers.timed);
         }
@@ -7036,7 +7093,13 @@ impl Renderer {
         if f.enhanced {
             self.encode_post(&mut enc.picture, scene, &f, puddles_on, &mut timers);
         }
-        self.encode_upscale(&mut enc.picture, scene, &f, &mut timers);
+        if f.dlss_frame {
+            // DLSS reads the picture after this submit, and the HUD is drawn over its result
+            // after DLSS (see `dlss_present`)
+            self.dlss_end_of_scene(&mut enc.picture, scene);
+        } else {
+            self.encode_upscale(&mut enc.picture, scene, &f, &mut timers);
+        }
         clock.stage(self, "encode", "mirror.encode");
         // Turning the recorded passes into Metal commands is the costliest CPU step of a
         // frame (wgpu checks every draw): the shadow maps and the prepass are finished on
@@ -7044,6 +7107,9 @@ impl Renderer {
         let big =
             shadow_batches.iter().map(|b| b.len()).sum::<usize>() + plan.prepass_batches.len() > 64 || !main_parts.is_empty();
         self.finish_and_submit(enc, main_parts, big, with_overlays, &mut clock, timers);
+        if let Some(frame) = dlss_frame {
+            self.dlss_present(scene, &f, frame);
+        }
     }
 
     /// Render off-screen and return RGBA8 pixels.
@@ -8132,7 +8198,13 @@ fn sky_input_differs(a: &atmosphere::SkyInput, b: &atmosphere::SkyInput) -> bool
 /// is what `s_tile`'s clamp to edge gives; reading `t_trans`/`t_night` through both
 /// samplers fails the whole module ("Conflicting samplers").
 fn scene_shader_source(gl: bool) -> String {
-    arrays_as_textures(&scene_shader_text(gl), array_path())
+    let mut src = scene_shader_text(gl);
+    // (DLSS's motion passes: DirectX 12 only, with the arrays in storage buffers)
+    if !gl && array_path() == ArrayPath::Storage {
+        src.push_str("\n");
+        src.push_str(include_str!("dlss_motion.wgsl"));
+    }
+    arrays_as_textures(&src, array_path())
 }
 
 /// The scene module with its arrays read as `path` has them (see `ArrayPath`): each
@@ -11324,6 +11396,7 @@ mod tests {
             ("PointLight", std::mem::size_of::<GpuPointLight>()),
             ("Camera", std::mem::size_of::<CameraUniform>()),
             ("MaterialParams", std::mem::size_of::<MaterialUniform>()),
+            ("Motion", std::mem::size_of::<passes::MotionUniform>()),
             ("RtParams", rt::PARAMS_SIZE),
         ];
         let mut checked = std::collections::HashSet::new();

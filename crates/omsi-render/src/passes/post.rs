@@ -56,8 +56,10 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.post_buf, 0, bytemuck::bytes_of(&pu));
-        // (a mirror's small picture goes without FXAA)
+        // (a mirror's small picture goes without FXAA, nor a picture for DLSS: it smooths the
+        // edges itself, from the jittered frames)
         let fxaa = with_overlays
+            && !f.dlss_frame
             && self.options.fxaa
             && self.options.msaa <= 1
             && !f.env.no_fxaa;
