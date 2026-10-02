@@ -41,6 +41,7 @@ mod lights;
 mod launcher;
 mod menu;
 mod navigator;
+mod vr_navigator;
 mod money;
 mod radio;
 
@@ -49,6 +50,8 @@ mod quit;
 mod rain;
 mod scene;
 mod schedule;
+mod schedule_paper;
+mod real_time;
 mod settings;
 mod threads;
 mod tiles;
@@ -62,6 +65,7 @@ mod app_events;
 mod bus_service;
 mod camera_util;
 mod controllers;
+mod ffb_calibration;
 #[cfg(windows)]
 mod dinput;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -323,6 +327,11 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
     // a duty starts at its trip, as in OMSI (not at the map's entry point); a joining
     // player's once the host's world is known (below): it was never placed at all, and
     // "Automatic" put it at the map's first entry point, the depot
+    // real-time sync: the game starts at this device's date and time (a joining player's
+    // clock is the host's, a server's is its server.cfg's); a duty does not move it
+    if settings::Settings::load().time_sync && args.lan_join.is_none() && args.server.is_none() && args.offscreen.is_none() {
+        real_time::start_at_now(&mut args);
+    }
     if args.export_glb.is_none() && args.lan_join.is_none() {
         place_on_duty(&mut args);
     }
@@ -380,7 +389,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
     // a host's clock runs at its time speed (a server's: its server.cfg)
     if let (Some(l), None) = (lan.as_mut(), server_cfg.as_ref()) {
         if l.role == omsi_net::Role::Host {
-            l.clock_speed = settings.time_speed.clamp(1.0, 30.0);
+            l.clock_speed = if settings.time_sync { 1.0 } else { settings.time_speed.clamp(1.0, 30.0) };
         }
     }
     let mut lan_game = lan::LanGame::default();
@@ -419,6 +428,8 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         chooser: None,
         editor: None,
         vehicle_list: Vec::new(),
+        dropdown: None,
+        vehicle_meta: std::collections::HashMap::new(),
         world: None,
         streamer: None,
         starting: None,
@@ -429,6 +440,8 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         duty_places: false,
         hud: None,
         navigator: None,
+        vr_nav_profiles: crate::vr_navigator::Profiles::load(),
+        vr_nav_edit: None,
         ui: ui::Ui::new(),
         fps: 0.0,
         rain: rain::Rain::new(),
@@ -467,13 +480,14 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         vr_zoom_active: false,
         hover: None,
         hover_part: None,
+        hover_hand: false,
         input_script: parse_input_script(),
         shot: None,
         paused: false,
         game_menu: None,
         menu_top: None,
         menu_scroll_drag: false,
-        menu_more: false,
+        pane_scroll: None,
         plugin_keys: Vec::new(),
         clock_hold: 0.0,
         pad_look: [false; 4],
@@ -482,10 +496,15 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         discord: None,
         discord_t: 0.0,
         headtrack: None,
+        headtrack_failed: None,
         controllers: None,
         mouse_drive: false,
         mouse_steer: (0.0, 0.0),
         mouse_edge: 0.0,
+        steer_cursor: None,
+        center_cursor: false,
+        cursor_hidden: None,
+        last_ctl_steer: None,
         mouse_pedals: (0.0, 0.0),
         mouse_kmh: 0.0,
         tutorial: None,
@@ -505,7 +524,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         admin_list: None,
         list_kind: None,
         route_arrows: Default::default(),
-        game_keys: omsi_content::KeyboardCfg::load(&crate::startup::keyboard_cfg(&args_root_for_keys)).map(|k| k.with_vr_defaults().game).unwrap_or_default(),
+        game_keys: omsi_content::KeyboardCfg::load(&crate::startup::keyboard_cfg(&args_root_for_keys)).unwrap_or_default().with_game_defaults().with_vr_defaults().game,
         own_keys: crate::startup::own_keys(&args_root_for_keys),
         own_shift: crate::startup::own_bindings(&args_root_for_keys, omsi_content::input::KEY_SHIFT),
         menu_prev_pause: false,
@@ -531,8 +550,14 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         plugins: None,
         career: Default::default(),
         wetness: 0.0,
+        cloud_drift: [0.0; 2],
+        menu_edit: None,
+        menu_drag: None,
+        menu_kbd: true,
         weather_blend: None,
         weather_cycle: None,
+        metar_rx: None,
+        metar_next: 0.0,
         cursor_kind: 0,
         settings,
         lan: None,
@@ -550,6 +575,12 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
     };
     app.lan = lan;
     app.remotes = lan_game;
+    // mouse steering as the player left it (the wheel eases to the cursor for a second)
+    if app.settings.mouse_steering {
+        app.mouse_drive = true;
+        app.mouse_steer = (0.0, 1.0);
+        app.center_cursor = true;
+    }
     // (the LAN status file stays while the game runs; `exiting` removes it)
     std::mem::forget(_lan_status);
     Ok(Some(app))

@@ -277,18 +277,21 @@ impl Vehicle {
                 "number" => v.number_file = Some(r.str().to_string()),
                 // Omsi.exe (TRoadVehicle.LoadFromFile 0x7cddf5, 0x7cde6e) reads these lines
                 // as they come, whatever they say: the automatic mode's prefix and postfix
-                // (the stock "B-V " with its space), the list mode's file, prefix and postfix
+                // (the stock "B-V " with its space), the list mode's file, prefix and postfix.
+                // The lines end where the next block starts, so a file that leaves them out
+                // (the Urumqi AI cars' `[registration_automatic]` straight before `[model]`)
+                // reads them as empty instead of taking the keyword for one of them.
                 "registration_automatic" => {
-                    let pre = r.line().to_string();
-                    let post = r.line().to_string();
+                    let pre = r.param_line().to_string();
+                    let post = r.param_line().to_string();
                     v.registration_automatic = Some((pre.clone(), post.clone()));
                     v.registration_mode = 3;
                     v.registration_affix = (pre, post);
                 }
                 "registration_list" => {
-                    let file = r.word().to_string();
-                    let pre = r.line().to_string();
-                    let post = r.line().to_string();
+                    let file = r.param_line().trim().to_string();
+                    let pre = r.param_line().to_string();
+                    let post = r.param_line().to_string();
                     v.registration_list = Some((file, pre.clone(), post.clone()));
                     v.registration_mode = 2;
                     v.registration_affix = (pre, post);
@@ -517,12 +520,26 @@ impl Vehicle {
             .collect()
     }
 
-    /// The plate of fleet number `number`, as Omsi.exe gives it to a vehicle not in the
-    /// `[registration_free]` mode (Tform_selectVeh.Edit1Change, AI buses at 0x70aff0): the
-    /// `[registration_list]` file's plate of that number when it has one, else prefix,
-    /// number and postfix of the list or automatic mode - the number alone without a mode.
+    /// The plate of fleet number `number`, as Omsi.exe gives it to an AI bus not in the
+    /// `[registration_free]` mode (0x7e7a80, from the depot buses' 0x70a174): the
+    /// `[registration_list]` file's plate of that number when it has one, whatever the mode,
+    /// else prefix, number and postfix of the list or automatic mode - the number alone
+    /// without a mode.
     pub fn plate_of_number(&self, number: &str) -> String {
-        if self.registration_mode == 2 {
+        self.plate_from(number, self.registration_list.is_some())
+    }
+
+    /// The plate the vehicle dialog gives the player's bus for fleet number `number`
+    /// (Tform_selectVeh.Edit1Change, which Button1Click writes over the AI's): the list
+    /// file's plate only in the list mode, the last plate keyword's - a repaint's
+    /// `[registration_list]` followed by the template's `[registration_automatic]` gives
+    /// the player prefix and number, its AI copies the list's plate.
+    pub fn chosen_plate_of_number(&self, number: &str) -> String {
+        self.plate_from(number, self.registration_mode == 2)
+    }
+
+    fn plate_from(&self, number: &str, list: bool) -> String {
+        if list {
             if let Some((_, p)) = self.numbers_with_plates().into_iter().find(|(n, p)| n == number.trim() && !p.is_empty()) {
                 return p;
             }
@@ -576,6 +593,40 @@ mod tests {
         let offered: Vec<String> = offered_vehicles(&files).iter().map(|(f, _)| f.file_name().unwrap().to_string_lossy().to_string()).collect();
         assert_eq!(offered, vec!["G Main.bus", "L Main.bus", "Solo.bus"]);
         assert_eq!(front_sections_of(&dir.join("L Trail.bus")).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An `.ovh` that leaves the registration affixes out (`[registration_automatic]` with
+    /// nothing but a blank line before `[model]`, as the Urumqi AI cars write it): the
+    /// `[model]` is a keyword, not the postfix, so the vehicle keeps its model.
+    #[test]
+    fn an_empty_registration_affix_keeps_the_next_keyword() {
+        let v = Vehicle::parse(&CfgFile::from_str("x.ovh", "[registration_free]\n\n[registration_automatic]\n\n[model]\nmodel\\model.cfg\n\n[sound]\ns.cfg\n"));
+        assert_eq!(v.registration_mode, 3);
+        assert_eq!(v.registration_affix, (String::new(), String::new()));
+        assert_eq!(v.model.as_deref(), Some("model\\model.cfg"));
+        // the stock shape (prefix "B-V ", blank postfix) is unchanged
+        let s = Vehicle::parse(&CfgFile::from_str("y.bus", "[registration_automatic]\nB-V \n\n[model]\nm.cfg\n"));
+        assert_eq!(s.registration_affix, ("B-V ".to_string(), String::new()));
+        assert_eq!(s.model.as_deref(), Some("m.cfg"));
+    }
+
+    /// A repaint's own `[registration_list]` followed by the template's
+    /// `[registration_automatic]`: the list's plate still wins (Omsi.exe 0x7e7a80 reads the
+    /// list file whatever the mode), prefix + number only where the list has none.
+    #[test]
+    fn list_plate_wins_over_a_later_automatic_mode() {
+        let dir = std::env::temp_dir().join(format!("omsi_vehicle_regs_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Nos.org"), "E1\nE2\n").unwrap();
+        std::fs::write(dir.join("Regs.org"), "AB12 CDE\n").unwrap();
+        std::fs::write(dir.join("x.bus"), "[number]\nNos.org\n\n[registration_list]\nRegs.org\n\n\n\n[registration_automatic]\nB-V \n\n").unwrap();
+        let v = Vehicle::load(&dir.join("x.bus")).unwrap();
+        assert_eq!(v.registration_mode, 3);
+        assert_eq!(v.plate_of_number("E1"), "AB12 CDE");
+        assert_eq!(v.plate_of_number("E2"), "B-V E2");
+        // (the player's bus from the dialog: the automatic mode's plate, Edit1Change)
+        assert_eq!(v.chosen_plate_of_number("E1"), "B-V E1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

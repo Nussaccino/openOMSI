@@ -51,13 +51,16 @@ gives, so a mod bus is driven by them as by the keyboard.
    cable, from a PC or a USB stick). openOMSI finds it by itself in `openOMSI/`,
    `Download/` or the top of the storage; anywhere else choose it in the launcher under
    **Setup → Browse → Use this folder → Save**.
-4. **Mods**: copy mod folders or .zip files into `openOMSI/Mods` (installed when the launcher
-   opens), or install them from the launcher's **Mods** page (Choose a folder / Choose a
-   .zip); archives can also lie in `openOMSI/Archives` and are used in place. Maps and buses
+4. **Mods**: copy mod folders or .zip, .7z and .rar files into `openOMSI/Mods` (installed when the launcher
+   opens), or install them from the launcher's **Mods** page (Choose a folder / Choose an
+   archive); .zip archives can also lie in `openOMSI/Archives` and are used in place. Maps and buses
    work exactly as on the computer.
 
-Settings, profiles and sessions are in the app's private folder; screenshots go to the OMSI 2
-folder's `Screenshots`. The first start on a phone uses lighter graphics defaults (2x MSAA, no
+Settings, profiles and sessions are in the app's private folder; screenshots go to
+`openOMSI/Screenshots`. Every other folder in `openOMSI/` (and the OMSI 2 installation, wherever
+it lies) gets an empty `.nomedia` file, so that the gallery apps do not list the thousands of
+textures as photos - they are the game's content, deleting them leaves buses white. A gallery
+that listed them before may need a moment (or a restart of the phone) to forget them. The first start on a phone uses lighter graphics defaults (2x MSAA, no
 ambient occlusion, a 1024 shadow map, 60 fps, a 900 m object distance); everything can be
 changed on the launcher's Settings page. When the frame rate drops below 45 the 3D picture is
 drawn smaller, down to 0.6 of the screen, as on the computer.

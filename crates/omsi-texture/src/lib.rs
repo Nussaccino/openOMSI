@@ -1,7 +1,7 @@
 //! Textures.
 //!
 //! OMSI looks a texture up by *file name* in a search order: the object's `texture` folder,
-//! then the global `Texture` folder, trying the exact name first and then the other supported
+//! then the global `Texture` folder, trying a same-stem DDS first, the exact name, then other supported
 //! extensions (`.dds`, `.bmp`, `.tga`, `.jpg`, `.png`), plus seasonal (`Texture\Spring` …) and
 //! `_LOW` variants. A `<texture>.cfg` sidecar carries per-texture flags.
 
@@ -113,6 +113,9 @@ pub fn decode_bytes(bytes: &[u8], path: &Path) -> Result<Image, TextureError> {
         image::ImageFormat::Jpeg
     } else if bytes.starts_with(b"\x89PNG") {
         image::ImageFormat::Png
+    } else if looks_tga {
+        // a TGA under another name (NEOMAN's `W_Bader_KR498_disp.png`): D3DX reads it by content
+        return tga::decode(bytes).map_err(|e| TextureError::Decode(path.to_path_buf(), e));
     } else {
         match ext.as_str() {
             "dds" => image::ImageFormat::Dds,
@@ -127,8 +130,9 @@ pub fn decode_bytes(bytes: &[u8], path: &Path) -> Result<Image, TextureError> {
         Ok(img) => img,
         // D3DX reads what GDI would: a palette bitmap that counts more colours than its bit
         // depth holds (the A21's and the Urbino's 4-bit `LCD-Innenanzeige.bmp` says 17) is
-        // read with the colours it can use
-        Err(e) if format == image::ImageFormat::Bmp => match bmp_clamped_palette(bytes) {
+        // read with the colours it can use, and a 24-bit one that says BI_BITFIELDS (sky
+        // packs' `Texture\skybox\night01.bmp`) as the plain 24-bit bitmap it is
+        Err(e) if format == image::ImageFormat::Bmp => match bmp_clamped_palette(bytes).or_else(|| bmp24_bitfields(bytes)) {
             Some(fixed) => image::load_from_memory_with_format(&fixed, format).map_err(|e| TextureError::Decode(path.to_path_buf(), e.to_string()))?,
             None => return Err(TextureError::Decode(path.to_path_buf(), e.to_string())),
         },
@@ -161,6 +165,21 @@ fn bmp_clamped_palette(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut out = bytes.to_vec();
     out[46..50].copy_from_slice(&used.min(max).to_le_bytes());
     out[50..54].copy_from_slice(&important.min(max).to_le_bytes());
+    Some(out)
+}
+
+/// A copy of a 24-bit bitmap that says `BI_BITFIELDS` (3) with its compression set to
+/// `BI_RGB`: bit fields mean nothing at 24 bits, and D3DX reads the pixels as B8G8R8 where
+/// the `image` crate refuses the file. The masks after a 40-byte header stay where they are
+/// (the pixel offset already points past them). None when the bitmap is not one of those.
+fn bmp24_bitfields(bytes: &[u8]) -> Option<Vec<u8>> {
+    let bits = bytes.get(28..30).map(|b| u16::from_le_bytes([b[0], b[1]]))?;
+    let compression = bytes.get(30..34).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))?;
+    if bits != 24 || compression != 3 {
+        return None;
+    }
+    let mut out = bytes.to_vec();
+    out[30..34].copy_from_slice(&0u32.to_le_bytes());
     Some(out)
 }
 
@@ -242,24 +261,30 @@ pub fn find_texture(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
 }
 
 fn find_texture_uncached(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
+    find_texture_in_season(name, dirs, season_folder().as_deref())
+}
+
+fn find_texture_in_season(name: &str, dirs: &[&Path], season: Option<&str>) -> Option<PathBuf> {
     // a file named in full (a paint scheme's picture, resolved in its scheme's folder)
     let full = Path::new(name.trim());
-    if full.is_absolute() && omsi_cfg::vfs::is_file(full) {
-        return Some(full.to_path_buf());
+    if full.is_absolute() {
+        if let (Some(parent), Some(file)) = (full.parent(), full.file_name().and_then(|f| f.to_str())) {
+            if let Some(found) = find_texture_in_dir(parent, file) {
+                return Some(found);
+            }
+        }
     }
     let name = name.trim().replace('\\', "/");
     if name.is_empty() {
         return None;
     }
     let stem_path = Path::new(&name);
-    let stem = stem_path.with_extension("");
-    let season = season_folder();
     // A seasonal texture lives in a subfolder of the folder the texture itself is in:
     // `Texture\WinterSnow\gras.bmp` for `Texture\gras.bmp`. The name often carries that
     // folder with it, so the season goes in front of the file name, not in front of the
     // whole path; both spellings are tried.
     let mut names: Vec<String> = Vec::new();
-    if let Some(f) = &season {
+    if let Some(f) = season {
         match (stem_path.parent(), stem_path.file_name()) {
             (Some(par), Some(file)) if !par.as_os_str().is_empty() => names.push(format!("{}/{}/{}", par.display(), f, file.to_string_lossy())),
             (_, Some(file)) => names.push(format!("{}/{}", f, file.to_string_lossy())),
@@ -272,23 +297,14 @@ fn find_texture_uncached(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
     // BS_Gehweg_Allgemein1.bmp` in a spline of another folder of that add-on).
     let from_root: Vec<PathBuf> = if name.contains('/') { omsi_cfg::content_roots().into_iter().take(1).collect() } else { Vec::new() };
     let dirs: Vec<&Path> = dirs.iter().copied().chain(from_root.iter().map(|p| p.as_path())).collect();
-    for cand_name in &names {
-        let cand_stem = Path::new(cand_name).with_extension("");
-        for dir in &dirs {
-            let p = omsi_cfg::resolve_path(dir, cand_name);
-            if omsi_cfg::vfs::is_file(&p) {
-                return Some(p);
-            }
-            for ext in EXTENSIONS {
-                let c = format!("{}.{}", cand_stem.display(), ext);
-                let p = omsi_cfg::resolve_path(dir, &c);
-                if omsi_cfg::vfs::is_file(&p) {
-                    return Some(p);
-                }
+    // Keep the pack's directory priority, then prefer its seasonal variant.
+    for dir in &dirs {
+        for cand_name in &names {
+            if let Some(found) = find_texture_in_dir(dir, cand_name) {
+                return Some(found);
             }
         }
     }
-    let _ = stem;
     // A path of the author's machine (`D:\OMSI 2\Vehicles\Sprinter_work\Texture\extras.jpg`
     // in the Sprinter 412D): the same file under the installation's content folders, else
     // the bare file name in the texture folders.
@@ -298,16 +314,37 @@ fn find_texture_uncached(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
         if let Some(i) = parts.iter().position(|p| omsi_cfg::CONTENT_FOLDERS.iter().any(|f| f.eq_ignore_ascii_case(p))) {
             let rel = parts[i..].join("/");
             for root in omsi_cfg::content_roots() {
-                let p = omsi_cfg::resolve_path(&root, &rel);
-                if omsi_cfg::vfs::is_file(&p) {
-                    return Some(p);
+                if let Some(found) = find_texture_in_dir(&root, &rel) {
+                    return Some(found);
                 }
             }
         }
         if let Some(file) = parts.last() {
-            if let Some(p) = find_texture_uncached(file, &dirs) {
+            if let Some(p) = find_texture_in_season(file, &dirs, season) {
                 return Some(p);
             }
+        }
+    }
+    None
+}
+
+/// Prefer the authored DDS replacement within one search location. Folder/season
+/// precedence stays outside this function so a global DDS cannot override a local PNG.
+fn find_texture_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    let stem = Path::new(name).with_extension("");
+    let dds = format!("{}.dds", stem.display());
+    let p = omsi_cfg::resolve_path(dir, &dds);
+    if omsi_cfg::vfs::is_file(&p) {
+        return Some(p);
+    }
+    let p = omsi_cfg::resolve_path(dir, name);
+    if omsi_cfg::vfs::is_file(&p) {
+        return Some(p);
+    }
+    for ext in EXTENSIONS.into_iter().filter(|e| *e != "dds") {
+        let p = omsi_cfg::resolve_path(dir, &format!("{}.{}", stem.display(), ext));
+        if omsi_cfg::vfs::is_file(&p) {
+            return Some(p);
         }
     }
     None
@@ -506,6 +543,79 @@ impl TextureCache {
 mod tests {
     use super::*;
 
+    #[test]
+    fn seasonal_textures_keep_pack_priority_and_terrain_mapping() {
+        let dir = std::env::temp_dir().join(format!(
+            "omsi-texture-season-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let local = dir.join("pack/texture");
+        let global = dir.join("Texture");
+        for folder in [&local, &global] {
+            std::fs::create_dir_all(folder.join("Fall")).unwrap();
+        }
+        for path in [
+            local.join("mapped.dds"),
+            global.join("Fall/mapped.bmp"),
+            local.join("seasonal.bmp"),
+            local.join("Fall/seasonal.dds"),
+            global.join("Fall/seasonal.bmp"),
+            global.join("fallback.bmp"),
+            global.join("Fall/fallback.dds"),
+        ] {
+            std::fs::write(path, b"lookup-only fixture").unwrap();
+        }
+        for name in ["mapped.bmp.cfg", "seasonal.bmp.cfg"] {
+            std::fs::write(local.join(name), "[terrainmapping]\n").unwrap();
+        }
+        let dirs = [local.as_path(), global.as_path()];
+        // A local placeholder may use a different extension from the authored name.
+        // The map's unrelated autumn grass must not hide its terrain-mapping flag.
+        let mapped = find_texture_in_season("mapped.bmp", &dirs, Some("Fall")).unwrap();
+        assert_eq!(mapped, local.join("mapped.dds"));
+        assert!(TextureCfg::load(&cfg_path("mapped.bmp", &mapped).unwrap()).terrain_mapping);
+        // The pack's own seasonal variant still wins and inherits its base sidecar.
+        let seasonal = find_texture_in_season("seasonal.bmp", &dirs, Some("Fall")).unwrap();
+        assert_eq!(seasonal, local.join("Fall/seasonal.dds"));
+        assert!(TextureCfg::load(&cfg_path("seasonal.bmp", &seasonal).unwrap()).terrain_mapping);
+        // A texture absent from the pack keeps the global seasonal fallback.
+        assert_eq!(
+            find_texture_in_season("fallback.bmp", &dirs, Some("Fall")),
+            Some(global.join("Fall/fallback.dds")),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dds_precedes_exact_names_but_preserves_folder_priority() {
+        let dir = std::env::temp_dir().join(format!("omsi-dds-priority-{}", std::process::id()));
+        let local = dir.join("local");
+        let global = dir.join("global");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        for ext in ["png", "jpg", "tga", "bmp"] {
+            let stem = format!("sign_{ext}");
+            std::fs::write(local.join(format!("{stem}.{ext}")), b"x").unwrap();
+            std::fs::write(local.join(format!("{stem}.DDS")), b"x").unwrap();
+            let name = format!("{stem}.{ext}");
+            let found = find_texture_uncached(&name, &[&local]).unwrap();
+            assert_eq!(found.extension().unwrap().to_string_lossy().to_ascii_lowercase(), "dds");
+            assert_eq!(find_texture_uncached(local.join(&name).to_str().unwrap(), &[]), Some(found));
+        }
+        std::fs::write(local.join("local_only.png"), b"x").unwrap();
+        std::fs::write(global.join("local_only.dds"), b"x").unwrap();
+        assert_eq!(find_texture_uncached("local_only.png", &[&local, &global]), Some(local.join("local_only.png")));
+        // Without DDS, the requested format wins over the other fallback formats.
+        std::fs::write(local.join("local_only.bmp"), b"x").unwrap();
+        assert_eq!(find_texture_uncached("local_only.png", &[&local]), Some(local.join("local_only.png")));
+        assert_eq!(find_texture_uncached("missing.png", &[&local]), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A mesh's texture name with Windows' quirks (Ahlheim's `anz-oben.jpg.`) finds the file.
     #[test]
     fn texture_names_as_windows_reads_them() {
@@ -551,6 +661,42 @@ mod tests {
         let img = decode_bytes(&bmp32([[1, 2, 3, 0]; 4]), Path::new("x.bmp")).unwrap();
         assert!(!img.has_alpha);
         assert!(img.rgba.chunks_exact(4).all(|p| p[3] == 255));
+    }
+
+    /// A 24-bit bitmap that says BI_BITFIELDS, with its three masks after the header, reads
+    /// as a plain 24-bit one (a sky pack's `night01.bmp`).
+    #[test]
+    fn bmp24_with_bitfields() {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"BM");
+        b.extend_from_slice(&(66u32 + 16).to_le_bytes());
+        b.extend_from_slice(&[0; 4]);
+        b.extend_from_slice(&66u32.to_le_bytes());
+        b.extend_from_slice(&40u32.to_le_bytes());
+        b.extend_from_slice(&2i32.to_le_bytes());
+        b.extend_from_slice(&2i32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&24u16.to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&[0; 20]);
+        for m in [0x00ff_0000u32, 0x0000_ff00, 0x0000_00ff] {
+            b.extend_from_slice(&m.to_le_bytes());
+        }
+        // two rows of two BGR pixels, each padded to four bytes, bottom-up
+        b.extend_from_slice(&[1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10, 11, 12, 0, 0]);
+        let img = decode_bytes(&b, Path::new("night01.bmp")).unwrap();
+        assert_eq!((img.width, img.height), (2, 2));
+        assert_eq!(&img.rgba[..8], &[9, 8, 7, 255, 12, 11, 10, 255]);
+    }
+
+    /// A TGA named `.png` (NEOMAN's `W_Bader_KR498_disp.png`, a 24-bit RLE TGA) decodes as TGA.
+    #[test]
+    fn misnamed_tga_by_content() {
+        let mut b = vec![0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 24, 0];
+        b.extend_from_slice(&[0x83, 0x30, 0x20, 0x10]);
+        let img = decode_bytes(&b, Path::new("x.png")).unwrap();
+        assert_eq!((img.width, img.height), (2, 2));
+        assert_eq!(&img.rgba[..4], &[0x10, 0x20, 0x30, 255]);
     }
 
     #[test]

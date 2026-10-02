@@ -65,7 +65,7 @@ whole start-up by itself (main switch, ignition, starter, gearbox to neutral); `
 is the same thing for an offscreen run.
 
 **Updates.** When the launcher starts it asks
-[github.com/turbo-devv/openOMSI](https://github.com/turbo-devv/openOMSI) for the latest release
+[github.com/openOMSI-Project/openOMSI](https://github.com/openOMSI-Project/openOMSI) for the latest release
 and, when there is a newer one, offers it: **Update now** downloads it (checked against the
 SHA-256 GitHub lists), puts the new program in place of the old one and starts the launcher
 again - on Windows `openomsi.exe` and `openomsi-launcher.exe`, on macOS the `openOMSI.app`
@@ -96,10 +96,15 @@ and comes up slowly (0.7 per second) when the key is released.
 Left-click a cockpit switch to operate it, hold the button and move the mouse to turn a knob,
 or roll the mouse wheel over it (that is the `<event>_drag` OMSI fires); the name of the switch
 under the cursor is shown in the HUD.
-Right-drag the mouse (or drag with the wheel pressed, OMSI's pan) to look around in any view (the head turns inside, the camera swings
-around the bus outside), I/J/K/L does the same from the keyboard; each view keeps its own
+Right-drag the mouse (or drag with the wheel pressed, OMSI's pan) to look around in any view
+(the head turns inside, the camera swings around the bus outside), I/J/K/L does the same from
+the keyboard, and Shift+right-drag zooms - this is OMSI's `[altView]` mode, the Camera setting
+"Right mouse button turns the view". Switched off, the right button zooms as in OMSI's default
+(up: the outside camera backs away, the view inside widens up to the seat's own) and only the
+wheel button turns the view; each view keeps its own
 direction (turning the outside camera leaves the driver's head where it was), **Space** looks
-ahead again in every view (OMSI's `view_reset_all_directions`), Home recentres the view shown.
+ahead again in every view (OMSI's `view_reset_all_directions`), Home recentres the view shown
+where keyboard.cfg does not make it the ticket desk camera.
 The mouse wheel (and **=** / **-**, a pinch on a phone) zooms: outside the camera comes closer,
 inside the bus the view narrows, as in OMSI; **Ctrl**+wheel outside narrows the view instead
 (a telephoto, the camera stays where it is). F1-F4 driver / passenger / outside / map (free) camera, F5-F8 the destination
@@ -109,7 +114,10 @@ LAN session. Esc opens the game menu: drive the next placed vehicle, place any v
 the installation in front of the camera (or beside the bus), couple what stands close behind
 the bus and uncouple it again, save the situation or load the quicksave, the next weather, the clock an hour on or back, refuel and wash (only at a
 petrol station, as in OMSI), repair (the team needs the map's travel time when the bus stands
-in no depot yard), screenshot, timetable, the object editor (below), quit. Home is the ticket desk camera and Insert the timetable view (as OMSI's keyboard.cfg binds them), and the
+in no depot yard), screenshot, timetable, the object editor (below), quit. Its *Options* hold
+one line a setting under the launcher's headings (Simulation, Display & sound, Driving,
+Camera): **Left** and **Right** (or a click on the arrows round the value) step it down and
+up, Enter as before; they are kept for the next game. Home is the ticket desk camera and Insert the timetable view (as OMSI's keyboard.cfg binds them), and the
 change keys of keyboard.cfg hand out or take back the change. The HUD
 shows time, speed, line, next stop, delay and what the workshop just did (and why the bus
 stands: the parking brake, low air pressure, a line the date's chrono takes off), and the
@@ -138,7 +146,14 @@ again only when something changes; drag on it to turn the bus, scroll to zoom. I
   *Graphics* (the quality preset first, the screen, distances and memory), *Driving* (keys,
   mouse, wheel and pedals, with the way to the Controls page), *Camera* (the seat, the views,
   head tracking, VR), *Sound*, *Gameplay* (passengers, traffic, collisions, the clock) and
-  *General* (language, navigator, updates, and resetting every setting).
+  *General* (language, the game's interface size, navigator, Discord Rich Presence,
+  updates, and resetting every setting).
+  **Discord Rich Presence** shows the launcher while preparing a drive, then the map and
+  line above the vehicle type and tour while playing. The full vehicle name is in the logo's
+  tooltip. The launcher status returns when the game ends.
+  It is enabled by default and can be turned off under Settings → General; the switch
+  affects the launcher immediately and the game on its next start. Discord must be running
+  on the same computer.
 * **Controls** - `Inputs/keyboard.cfg`: click a key, press the new one; clashes are red. The
   keys are the game's with *Driving keys: Custom controls* (Settings → Driving); with a ready-made
   layout (W A S D, arrows) those keys drive and win over the list - the page says so, and
@@ -161,7 +176,7 @@ again only when something changes; drag on it to turn the bus, scroll to zoom. I
   it save its run (SIGTERM, up to 8 s, and only a stuck game is killed) and, for a LAN
   session, the code to copy, who is playing and the chat.
 * **Mods** - installing mods and archives (see *Mods and the content folder*); a folder or
-  .zip dropped on the window is installed.
+  .zip, .7z or .rar dropped on the window is installed.
 * **Timetable** - a map's lines, their tours and trips. Changes stay while you move between
   lines and are saved together (*Save all*); **New line** makes a line, **Repeat** turns a tour
   into a whole day of them (every *n* minutes up to a last departure).
@@ -189,9 +204,14 @@ lines, as in the game, whose default date is 1989-05-30.
 ## Settings, enhanced graphics, the navigator
 
 `~/.openomsi/settings.cfg` (written by the launcher's settings page, or by hand) holds
-`msaa` (1/2/4; a count the GPU cannot do falls back to the next lower one), `anisotropy`
-(1..16), `ssao`, `shadows`, `shadow_size`, `navigator`, `navigator_opacity`,
+`msaa` (1/2/4/8; a count the GPU cannot do falls back to the next lower one), `anisotropy`
+(1..16), `ssao`, `shadows`, `shadow_size`, `shadow_blobs` (the models' `[isshadow]` shadow
+meshes, OMSI's flat blob under a vehicle, laid on the road its wheels stand on; off, only the
+sun shadow map shades under a vehicle), `navigator`, `ui_opacity` (how much of the interface's backgrounds shows - the navigator's, the
+menu's, the timetable's, the plates under the notes - 0.2 to 1, the texts staying solid; 0.85
+as designed; `navigator_opacity` in older files),
 `navigator_corner` (`bottom-left` default, `bottom-right`, `top-left`, `top-right`),
+`nav_ai` (the other AI vehicles as dots on the navigator and the city map; on by default),
 `boarding`, `detail_textures`, `exact_fare`, `enhanced`, `fullscreen`, `vsync`, `volume`
 and `drive_keys`, plus `render_scale` (`auto` or a fraction: the picture is drawn smaller
 and upscaled), `post_aa` (`fxaa`, the enhanced renderer's, or `off`), `view_distance` (m,
@@ -200,10 +220,18 @@ under that name too; an eighth of the machine's memory when unset), `texture_com
 (BC1-BC3 on the GPU, on by default), `reflections` (the materials' reflection maps,
 `[matl_envmap]` - off, paint, chrome and glass mirror nothing), `led_glow` (0..15: how
 bright an LED destination matrix's dots burn in the enhanced picture, 0 = off - they are
-the panel's own light, and the glow draws a halo around them), `led_mips` (the LED
-matrices' masks keep the mip chain `STFilter` asks for; off, they are sampled at full
-resolution and stay dots at a distance, which shimmers a little), `mouse_sens` (mouse steering,
-1 = OMSI's), `steering_linear` and `old_steering` (the two steering switches above),
+the panel's own light, and the glow draws a halo around them), `led_mips` (0..4, 0.05 steps,
+1.3 by default: how much of the mip chain an LED matrix is held at - its picture and its
+`\S:n` mask are sampled at the level their screen footprint asks for, never coarser than
+this. 0 point-samples them, the sharpest dots and the worst shimmer; 1.3 keeps a matrix's
+dots a couple of pixels across where the full chain has run them together; 4 is near the
+calm of the full chain), `mouse_sens` (mouse steering,
+1 = OMSI's), `ui_scale` (the size of the game's interface over the picture - its texts,
+the menu, the timetable, the navigator and the city map - from 0.5 to 2, 1 by default, on
+top of the screen's own scaling; on a window taller than 1080 lines the interface grows with
+it as well, up to twice, unless `ui_scale_window` is off; `notes` off hides the notes in the
+top left corner; *Options* in the game menu changes it in quarters while driving, Left
+and Right), `steering_linear` and `old_steering` (the two steering switches above),
 `ff_invert` (force feedback the other way round), `wheel_range` (the wheel's own rotation,
 lock to lock, 900° by default) and `wheel_lock` (how far it is turned for the bus's full
 lock; 0 = the whole wheel, as OMSI), `fov` (degrees for the views from the bus; 0 = the bus's
@@ -259,8 +287,22 @@ physically based renderer: high-range lighting with energy-conserving diffuse an
 reflections (roughness from `[matl_envmap]`), a computed sky (Rayleigh/Mie scattering,
 lit cumulus) that also lights the scene, contact-hardening sun shadows, aerial perspective
 and height fog, automatic exposure, a glow only real highlights produce and the PBR
-Neutral tone curve with FXAA (`post_aa`); no light shafts, vignette or grading. The
-vanilla look stays the default. The navigator (`crates/omsi-app/src/navigator.rs`) sits in a corner of the screen (lower
+Neutral tone curve with FXAA (`post_aa`); no light shafts, vignette or grading.
+
+The enhanced renderer also reflects buses, buildings and scenery in wet road puddles
+when `reflections=1`. Shallow rain ripples and depth-aware filtering soften the image.
+The player's nearby bus and up to three coupled sections use one local geometry capture,
+mirrored around the actual road face's height and slope. Its windows are shaded from the
+reflected eye, and an open legacy chassis gets a dark underside in that same depth-tested
+view. This avoids mixing offset screen-space and geometry projections on the bus.
+Other objects use the current frame's colour and a private hit-depth texture that includes
+reflective windows. Rays run at half resolution, capped at 518400 pixels and 48 steps;
+the local bus capture has the same pixel cap and a 60 m distance limit. Dry roads,
+snow-covered roads and mirror views skip these passes. Reflections beyond the local road
+plane use screen-space rays; objects unavailable to those rays keep the sky reflection.
+OpenGL uses the sky reflection too.
+
+The vanilla look stays the default. The navigator (`crates/omsi-app/src/navigator.rs`) sits in a corner of the screen (lower
 left by default), after the Route Advisor of Euro Truck Simulator 2: small, dark and half
 transparent, a tilted 3D map that turns with the bus and zooms out with speed - the roads
 of the lane network, the trip's route with arrows along it, coloured stretch by stretch by
@@ -282,12 +324,23 @@ the bus and the traffic; drag to move, the wheel zooms, the buttons centre on th
 zoom, Escape or a click outside closes it. **Shift+N** cycles
 map → map with the schedule of the next stops → off (N alone is the gearbox's neutral);
 `OMSI_DEBUG_NAV=1` logs it.
-**Z / X / C** are the indicators. **Shift + 1**, **Shift + 2**, … open or close a door, front
+**Z / X / C** are the indicators. Controls also offers **Indicator left (toggle)** and
+**Indicator right (toggle)** for keyboard keys or wheel buttons such as shift paddles.
+They start unbound: one press turns that side on, another turns it off, and pressing the
+other side switches direction. A script's automatic cancellation is respected.
+**Shift + 1**, **Shift + 2**, … open or close a door, front
 to back: a bus like the SD200/SD202/EN92 with one two-leaf front door and a combined
 aft/stop-brake-release door answers to Shift+1/2/3, a low-floor mod with three or four
 independent doors (the O530 Facelift) to Shift+1 through Shift+4/5 - whatever
 `bus_doorfront<n>` triggers the bus's own script defines, `bus_dooraft` last (the HUD's
 control reminder says how many).
+
+In Settings → Camera, **Driver's view turns with the steering** smoothly turns the driver's
+view into the steering direction, independently of the bus's head-motion simulation.
+**Steering view angle** sets the full-lock rotation (0–60°, default 30°), and **Steering
+view response** sets the smoothing time (50–1000 ms, default 250 ms; larger values follow
+more slowly). Manual looking remains available. The automatic turn is suppressed while
+VR or an active head tracker controls the view. It is off by default.
 
 ## Mods and the content folder
 
@@ -299,11 +352,11 @@ been copied into OMSI 2, and a file of the same name replaces the stock one. The
 installation is never written to. `OMSI_CONTENT=/some/dir` moves the content folder.
 
 Installing a mod: the launcher's **Mods** page opens the system's folder / file picker
-(Finder, Explorer, GTK) for a mod folder or a `.zip` and sorts it
+(Finder, Explorer, GTK) for a mod folder or a `.zip`, `.7z` or `.rar` archive and sorts it
 into place (OMSI-style folders anywhere inside are merged; a lone bus, map, object or
 spline folder is recognised by its `.bus` / `global.cfg` / `.sco` / `.sli` files and put
 under the right folder), or drop it into `Mods/` next to the binary and open the page.
-`openomsi-launcher --cli install '{"path":"/path/to/mod.zip"}'` and `--cli mods` do the same
+`openomsi-launcher --cli install '{"path":"/path/to/mod.7z"}'` and `--cli mods` do the same
 from a shell. An installation is a background job: the archive's table of contents becomes
 a plan, the disk is checked for room, everything is unpacked into a staging folder on the
 content volume and moved into place in one step, and it can be cancelled and cleaned up at
@@ -316,6 +369,7 @@ content folder's `Archives/` (hard-linked when it is on the same disk, moved fro
 unpacking (`omsi_cfg::vfs` mounts every archive there, as well as `--content-zip` and
 `OMSI_CONTENT_ZIP`). The Mods page offers it ("use the archive in place"), and its default
 unpacks what fits on the disk and uses an archive in place when its unpacked size does not;
+`.7z` and `.rar` archives are always unpacked.
 `--cli install '{"path":…,"mode":"inplace"}'` (or `extract` / `auto`) and
 `--cli modinfo '{"path":…}'` do the same from a shell. The launcher's lists see the maps
 and buses inside the archives.
@@ -377,6 +431,7 @@ Environment variables, all off unless set. The useful ones:
 | `OMSI_FLEET_IDLE=s`, `OMSI_FLEET_AHEAD=min` | how long an unused vehicle set is kept, how far ahead the fleet is read |
 | `OMSI_NO_BC=1`, `OMSI_NO_TEXCOMPRESS=1`, `OMSI_KEEP_ALLOCATOR=1` | textures as RGBA, no compression of loose pictures, no allocator restart |
 | `OMSI_NO_SHADOWS`, `OMSI_NO_CORONAS`, `OMSI_NO_ENVMAP`, `OMSI_NO_BUMP`, `OMSI_NO_CULL`, `OMSI_ENV_PHOTO=0` | leave one part of the picture out for an A/B |
+| `OMSI_NO_PUDDLE_REFLECTIONS=1` | leave wet-road scene reflections out for a screenshot or performance comparison |
 | `OMSI_DEBUG_ENHANCED`, `OMSI_DEBUG_SKY`, `OMSI_DEBUG_EXPOSURE`, `OMSI_METER=…` | the enhanced renderer's lamps, sky, adaptation and metering |
 | `OMSI_DEBUG_TRAFFIC`, `OMSI_DEBUG_PAX`, `OMSI_DEBUG_PHYSICS`, `OMSI_DEBUG_LAN`, `OMSI_DEBUG_IBIS`, `OMSI_DEBUG_VARS=a,b` | why a car, a passenger, a wheel, a peer, an IBIS or a script variable does what it does |
 | `OMSI_CHECK_ROADS=1`, `OMSI_ROAD_PHOTO=1`, `OMSI_CHECK_ENTRIES=1` | walk the lanes as a bus wheel, photograph the carriageway from above, check every entry point |

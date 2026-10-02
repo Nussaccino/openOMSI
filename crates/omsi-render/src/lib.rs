@@ -3,6 +3,7 @@
 pub mod atmosphere;
 pub mod clouds;
 pub mod dlss;
+mod puddles;
 
 use anyhow::{anyhow, Context, Result};
 use glam::{DVec3, Mat4, Vec3, Vec4};
@@ -89,8 +90,8 @@ struct EnhancedUniform {
     /// xyz where the sky cube was drawn from, relative to the camera (the dome looks the
     /// clouds up through it with the parallax taken out)
     eye: [f32; 4],
-    /// x how bright an LED panel's dots burn (`Lighting::led_glow`), y whether the LED
-    /// panels' masks keep their mip chain (`Lighting::led_mips`)
+    /// x how bright an LED panel's dots burn (`Lighting::led_glow`), y how much of the
+    /// mip chain an LED panel is held at (`Lighting::led_mips`)
     led: [f32; 4],
 }
 
@@ -115,6 +116,8 @@ struct HdrTargets {
     /// Tone mapping with the adapted exposure in `adapt[k]`.
     tonemap_bg: [wgpu::BindGroup; 2],
     fxaa_bg: wgpu::BindGroup,
+    /// Allocated only when wet roads need scene reflections in the main view.
+    puddles: Option<puddles::Targets>,
 }
 
 /// The enhanced path's reflection probe: a cube map of the sky around the camera with a
@@ -477,9 +480,11 @@ struct MaterialUniform {
     /// The PBR maps beside the diffuse texture (`Scene::pbr_maps`): x has a normal map,
     /// y an occlusion, z a roughness, w a metalness channel.
     pbr: [f32; 4],
-    /// x: a screen (`MaterialExtra::screen`); y: `[matl_texadress_border]`, z its colour's
-    /// rgb packed as r * 65536 + g * 256 + b (bytes), w its alpha.
+    /// x: a screen (`MaterialExtra::screen`); y: 1 `[matl_texadress_border]`, 2
+    /// `[matl_texadress_mirroronce]`; z the border colour's rgb packed as r * 65536 + g * 256 + b (bytes), w its alpha.
     flags: [f32; 4],
+    /// rgb: the D3D material's ambient colour, which takes the ambient light (C)
+    ambient: [f32; 4],
 }
 
 /// The maps of a PBR set found beside a diffuse texture (`foo_n.png` and the rest, see
@@ -498,6 +503,23 @@ pub enum AlphaMode {
     Opaque,
     Test,
     Blend,
+}
+
+/// How a material's textures read outside [0, 1]: Omsi.exe sets the material's
+/// `[matl_texadress_*]` mode as ADDRESSU/ADDRESSV of all eight sampler stages (0x7fff70).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TexAddressing {
+    /// Repeating, Direct3D's default.
+    #[default]
+    Wrap,
+    /// `[matl_texadress_mirror]`: every other repeat mirrored.
+    Mirror,
+    /// `[matl_texadress_clamp]`, and `[matl_texadress_border]` (whose colour the shader
+    /// puts outside, `MaterialExtra::border`).
+    Clamp,
+    /// `[matl_texadress_mirroronce]`: mirrored once about 0, then clamped (the shader takes
+    /// the coordinates' absolute value under the clamping sampler).
+    MirrorOnce,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -613,6 +635,14 @@ pub struct Lighting {
     /// The player's vehicle (origin, heading in degrees, `[boundingbox]` w l h cx cy cz):
     /// no rain sheen or snow cover is shaded inside it.
     pub inside: Option<(DVec3, f64, [f32; 6])>,
+    /// Actual road height beneath the player's vehicle; independent of suspension motion.
+    /// The local puddle capture is skipped when no road height is known.
+    pub puddle_ground: Option<f64>,
+    /// Upward normal of that actual road face (including road grade and camber).
+    pub puddle_normal: Vec3,
+    /// Coupled parts of the player's vehicle (same layout as `inside`). Their own
+    /// origins keep shared AI meshes out of the local puddle capture.
+    pub puddle_parts: Vec<(DVec3, f64, [f32; 6])>,
     /// Procedural (fractal) detail texturing of the ground and roads up close - the
     /// `detail_textures` setting; independent of `enhanced`.
     pub detail: bool,
@@ -628,21 +658,26 @@ pub struct Lighting {
     /// give 0 = off .. 3.75): the enhanced picture draws them this much above their own
     /// colour, bright enough for the glow to bloom a halo around the panel.
     pub led_glow: f32,
-    /// The LED panels' `\S:n` masks keep the mip chain `STFilter` asks for. Off, they are
-    /// sampled at full resolution: the dots stay visible when the panel is small on the
-    /// screen, at the cost of the shimmer the mip chain exists to prevent.
-    pub led_mips: bool,
+    /// How much of the mip chain an LED panel is held at - the `\S:n` mask's (`STFilter`)
+    /// and the panel's own grid picture's: both are sampled at the level their screen
+    /// footprint asks for, never coarser than this. 0 point-samples them (the sharpest
+    /// dots, and the worst shimmer - a regular grid is the worst case for a point sample);
+    /// 1.3 (the default) keeps a matrix's dots a couple of pixels across where the full
+    /// chain has run them together, and what shimmer is left is a fraction of a
+    /// full-resolution sample's; 4 is near the calm of the full chain.
+    pub led_mips: f32,
     /// The player's vehicle's velocity (m/s, world): at speed the airstream drives the drops
     /// on its glass up the windscreen and back along the side windows.
     pub glass_wind: Vec3,
 }
 
 impl Lighting {
-    /// Whether the sun shadow map is drawn with this light (not with the sun this low or
-    /// dim, nor with OMSI_NO_SHADOWS).
+    /// Whether the sun shadow map is drawn with this light (not once the sun is about a
+    /// degree below the horizon - Omsi.exe's cutoff, sun z -0.02 in sub_754c80 - nor with
+    /// the sun dim, nor with OMSI_NO_SHADOWS).
     pub fn casts_sun_shadows(&self) -> bool {
         self.shadows
-            && self.sun_dir.normalize_or_zero().z > 0.08
+            && self.sun_dir.normalize_or_zero().z > -0.02
             && self.sun_intensity > 0.05
             && omsi_cfg::env::var_os("OMSI_NO_SHADOWS").is_none()
     }
@@ -672,13 +707,16 @@ impl Default for Lighting {
             enhanced: false,
             classic: false,
             inside: None,
+            puddle_ground: None,
+            puddle_normal: Vec3::Z,
+            puddle_parts: Vec::new(),
             detail: true,
             overcast: 0.0,
             rain: 0.0,
             fog_base: None,
             envir_tint: [Vec3::ONE; 3],
             led_glow: 1.5,
-            led_mips: true,
+            led_mips: 1.3,
             glass_wind: Vec3::ZERO,
         }
     }
@@ -753,8 +791,8 @@ impl GpuTexture {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct BindKey {
     textures: [(usize, u64); 7],
-    clamp: bool,
-    uniform: [u32; 36],
+    address: TexAddressing,
+    uniform: [u32; 40],
 }
 
 /// Bytes of a texture of `format` with `levels` mip levels.
@@ -792,8 +830,8 @@ pub struct Material {
     pub emissive: [f32; 3],
     /// `[matl_transmap]` (texture, its alpha channel is used).
     pub transmap: Option<(TextureId, bool)>,
-    /// Sampled clamped (`[matl_texadress_clamp]`).
-    clamp: bool,
+    /// Its textures' addressing (`[matl_texadress_*]`).
+    address: TexAddressing,
     /// Keep the exact material parameters so a CTC texture swap can change only the diffuse
     /// map without losing map lighting, moisture, screen, or other renderer flags.
     uniform: MaterialUniform,
@@ -826,6 +864,9 @@ pub struct MaterialExtra {
     pub no_z_check: bool,
     /// `[matl_Zbias]`
     pub z_bias: i32,
+    /// The D3D material's ambient colour, its share of the ambient light (C); None: the
+    /// diffuse colour's.
+    pub ambient: Option<[f32; 3]>,
     /// Specular colour (rgb) and power (w) of the D3D material; black = no highlight.
     pub specular: [f32; 4],
     /// `[matl_bumpmap]`: a height map (in its alpha, `Image::bump_height_map`) whose slope
@@ -834,8 +875,9 @@ pub struct MaterialExtra {
     /// A named transparent window layer. This is separate from envmap/transmap because
     /// stock and add-on buses often use a plain alpha-blended window texture.
     pub glass: bool,
-    /// The night map belongs to a `[matl_item]`: its variable switches it, and it glows by
-    /// day as well (warning lamps, dashboard displays), not only at night.
+    /// The night map is switched by something other than the time of day - a `[matl_item]`'s
+    /// variable, a vehicle mesh's `[visible]`: it glows by day as well (warning lamps,
+    /// dashboard displays), not only at night.
     pub night_switched: bool,
     /// A display's text (`[useTextTexture]`): in the enhanced picture it glows a little
     /// by itself, as a lit matrix does, instead of taking only the light that reaches it
@@ -851,6 +893,8 @@ pub struct MaterialExtra {
     /// panel's own light, so the enhanced picture lets them burn in HDR and blooms them
     /// (the glow's source keeps them, where the other screens are left out of it -
     /// something no Direct3D 9 without shaders of its own could do). `MASK_FORMAT`'s g.
+    /// (Only a panel whose `[matl_lightmap]` is white all over: a flipdot carries the same
+    /// mask, but its light map is a picture of the lamps over it, and it does not glow.)
     pub led: bool,
     /// The film of water on a window (`[alphascale] Rain_Window_…`): drawn as drops that sit,
     /// gather and run down the glass instead of the texture sliding down as a whole.
@@ -1018,6 +1062,10 @@ pub struct Instance {
     pub object_radius: f32,
     pub detail: f32,
     pub any_distance: bool,
+    /// Drawn only while the camera stands in this area of the ground (world x0, y0, x1, y1):
+    /// a stand-in for far tiles, which OMSI has loaded only around its own tile (see
+    /// `set_near_only`).
+    pub near_only: Option<[f64; 4]>,
     /// Seen only in the mirrors and other views drawn into textures, not in the window's
     /// picture: the driver at the wheel while the player looks from the driver's seat (the
     /// figure would fill the view, but the mirrors show him as OMSI does).
@@ -1297,6 +1345,7 @@ pub struct Renderer {
     pub options: RenderOptions,
     /// Enhanced path: the HDR targets per size, the post pipelines and their resources.
     hdr_targets: HashMap<(u32, u32), HdrTargets>,
+    puddles: Option<puddles::Pipelines>,
     post: PostPipelines,
     post_layout: wgpu::BindGroupLayout,
     post_buf: wgpu::Buffer,
@@ -1334,9 +1383,11 @@ pub struct Renderer {
     overlay_pipeline_1x: wgpu::RenderPipeline,
     xr_ui_pipeline: wgpu::RenderPipeline,
     started: std::time::Instant,
-    /// `[matl_texadress_clamp]`: the diffuse of the next material is sampled clamped.
+    /// `[matl_texadress_clamp]` (and border, mirror-once) and `[matl_texadress_mirror]`.
     clamp_sampler: wgpu::Sampler,
-    pub clamp_next: std::cell::Cell<bool>,
+    mirror_sampler: wgpu::Sampler,
+    /// The addressing of the next material's textures (`[matl_texadress_*]`).
+    pub address_next: std::cell::Cell<TexAddressing>,
     /// The next material is lit at night by the tile light maps (`[LightMapMapping]`, the
     /// splines) instead of the map's lamps.
     pub light_map_next: std::cell::Cell<bool>,
@@ -1384,9 +1435,9 @@ pub struct Renderer {
     /// The screen size each object (origin and radius) was judged by in the main view's last
     /// frame: all its meshes and LOD levels take the same one, so exactly one level of an
     /// object is drawn and it does not flip between levels with the view's jitter.
-    object_sizes: std::cell::RefCell<HashMap<[u64; 4], f32>>,
+    object_sizes: std::cell::RefCell<hashbrown::HashMap<[u64; 4], f32>>,
     /// Cleared and reused as the next main view's object-size history.
-    object_sizes_scratch: std::cell::RefCell<HashMap<[u64; 4], f32>>,
+    object_sizes_scratch: std::cell::RefCell<hashbrown::HashMap<[u64; 4], f32>>,
     /// The far shadow cascade as last drawn: its light matrix, frames since, the render
     /// origin and the sun it was drawn for.
     shadow_far_cache: std::cell::Cell<(Mat4, u32, DVec3, Vec3)>,
@@ -1400,6 +1451,9 @@ pub struct Renderer {
     /// Sort the blended draws by origin distance alone, as before the camera-enclosing
     /// objects were drawn last (only for before/after pictures, `OMSI_BLEND_AB`).
     pub blend_by_origin: bool,
+    /// Draw the models' `[isshadow]` shadow blobs (see [`RenderOptions::shadow_blobs`]).
+    /// Settable while the game runs, so the graphics list can switch it off at once.
+    pub shadow_blobs: bool,
     /// GPU time per pass (OMSI_GPU_TIMERS, when the device has timestamp queries): the
     /// mirrors and the window's picture apart, each timed on its own.
     gpu_timers: [Option<GpuTimers>; 2],
@@ -1413,6 +1467,7 @@ pub struct Renderer {
     /// Reuse a small set of encoding workers instead of creating OS threads for each
     /// main/mirror picture. Keep these separate from simulation's worker queue.
     encoding_pool: Option<rayon::ThreadPool>,
+    _device_poller: Option<DevicePoller>,
     /// Vertex data of changed meshes (skinned people, the driver) waiting for the next
     /// picture: (mesh, bytes). Written with one staging buffer and a copy each at the start
     /// of the frame - a `write_buffer` per mesh made wgpu create a staging buffer for every
@@ -1469,6 +1524,11 @@ pub struct RenderOptions {
     /// Only the meshes the models mark `[shadow]` cast sun shadows, as in OMSI 2 (else every
     /// solid mesh does).
     pub omsi_shadow_casters: bool,
+    /// Draw the models' `[isshadow]` shadow meshes - OMSI's flat blob under a vehicle,
+    /// standing in for the sky light the body keeps off the road (see [`Instance::blob`]).
+    /// Off, the sun shadow map is all the shading under a vehicle, and the blob (which
+    /// OMSI draws whatever the depth) cannot be seen at all.
+    pub shadow_blobs: bool,
     /// The materials' reflection maps (`[matl_envmap]`: the shine of paint, chrome and
     /// glass). Off, nothing mirrors the sky photo - some players find it too strong.
     pub reflections: bool,
@@ -1498,6 +1558,7 @@ impl Default for RenderOptions {
             min_obj_size: 0.013,
             max_obj_dist: 0.0,
             omsi_shadow_casters: false,
+            shadow_blobs: true,
             reflections: true,
             no_enhanced: false,
             dlss: DlssMode::Off,
@@ -1524,9 +1585,10 @@ pub const LAMP_CODE_STRIDE: u32 = 64;
 /// The enhanced pass's second target: r is 1 where the bus's own screens are
 /// (`MaterialExtra::screen`), 0 elsewhere - the glow takes no light from them and FXAA
 /// passes them through; g is 1 on an LED panel's own dots (`MaterialExtra::led`), which the
-/// glow's source keeps and multiplies up (see `post.wgsl`). (Two channels, not one: an
-/// R8Unorm target drops what a shader writes into its g.)
-const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
+/// glow's source keeps and multiplies up (see `post.wgsl`). b carries the puddle's
+/// reflected-light weight; a is blend coverage. Sharing this attachment avoids another
+/// geometry pass or a full normal/material buffer just for water.
+const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// The colour targets of a pipeline drawing into `format`: in the enhanced pass (the only
@@ -1739,18 +1801,19 @@ impl Renderer {
             })
             .unwrap_or(wgpu::TextureFormat::Rgba8UnormSrgb);
         // Every target the scene is drawn into with multisampling (the swap chain or mirror
-        // format, the HDR target of the enhanced path, the depth buffer) must take the
-        // sample count, and the colour targets must resolve. A device judges that by the
-        // WebGPU table, which promises only 1x and 4x, unless it was asked for the
-        // adapter's own table: the launcher's "2x MSAA" (which Apple GPUs do support) was
-        // a fatal validation error before the first frame because the adapter's table said
-        // yes and the device's said no. So the adapter's table is asked for when the wanted
-        // count needs it, and the count is checked against the table the device will use.
+        // format, the HDR target of the enhanced path and its screen mask, the depth buffer)
+        // must take the sample count, and the colour targets must resolve. A device judges
+        // that by the WebGPU table, which promises only 1x and 4x, unless it was asked for
+        // the adapter's own table: the launcher's "2x MSAA" (which Apple GPUs do support)
+        // was a fatal validation error before the first frame because the adapter's table
+        // said yes and the device's said no. So the adapter's table is asked for when the
+        // wanted count needs it (2x, 8x), and the count is checked against the table the
+        // device will use.
         let wanted = match options.msaa {
             1 | 2 | 4 | 8 => options.msaa,
             _ => MSAA,
         };
-        let targets = [format, wgpu::TextureFormat::Rgba16Float, DEPTH_FORMAT];
+        let targets = [format, wgpu::TextureFormat::Rgba16Float, DEPTH_FORMAT, MASK_FORMAT];
         let takes = |flags: wgpu::TextureFormatFeatureFlags, f: wgpu::TextureFormat, n: u32| {
             flags.sample_count_supported(n)
                 && (n == 1
@@ -1825,10 +1888,11 @@ impl Renderer {
         let options = RenderOptions {
             msaa,
             shadow_size,
-            // (at most 8x: at 16x the sharper mip the filter picks far down a road let the
-            // dashes of a lane line alias into two blurred streaks running apart like an
-            // arrow - one line near, two further off, seen on every long straight)
-            anisotropy: options.anisotropy.clamp(1, 8),
+            // (16x was held at 8x once, for lane-line dashes far down a road seen to alias
+            // into two streaks running apart like an arrow; Spandau's Heerstrasse at 8x and
+            // 16x showed none of it - 16x kept the far dashes narrow where 8x smeared them
+            // sideways - so 16x is the player's choice again, 8x the default)
+            anisotropy: options.anisotropy.clamp(1, 16),
             ..options
         };
         let bc = device
@@ -1938,7 +2002,9 @@ impl Renderer {
         log::info!("renderer: compiling the scene shaders");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("omsi"),
-            source: wgpu::ShaderSource::Wgsl(scene_shader_source().into()),
+            source: wgpu::ShaderSource::Wgsl(
+                scene_shader_source(GL_BACKEND.load(std::sync::atomic::Ordering::Relaxed)).into(),
+            ),
         });
         let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadow camera"),
@@ -2286,6 +2352,13 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Tile masks/light maps clamp independently of repeating ground textures.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         // coronas: camera group + a corona texture group
@@ -2574,6 +2647,16 @@ impl Renderer {
             anisotropy_clamp: options.anisotropy,
             ..Default::default()
         });
+        let mirror_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::MirrorRepeat,
+            address_mode_v: wgpu::AddressMode::MirrorRepeat,
+            address_mode_w: wgpu::AddressMode::MirrorRepeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: options.anisotropy,
+            ..Default::default()
+        });
         let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera"),
             size: std::mem::size_of::<CameraUniform>() as u64,
@@ -2669,6 +2752,16 @@ impl Renderer {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
                 dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::REPLACE,
+        };
+        // Omsi's lamp sprites: SRCBLEND ONE, DESTBLEND INVSRCCOLOR (src + dst * (1 - src)),
+        // which keeps a coloured sprite's hue over a lit background instead of washing it to white
+        let screen = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc,
                 operation: wgpu::BlendOperation::Add,
             },
             alpha: wgpu::BlendComponent::REPLACE,
@@ -2860,7 +2953,7 @@ impl Renderer {
         };
         let pass = PassPipelines {
             pipelines: scene_pipelines(format, "fs_main"),
-            corona_pipeline: corona_pipeline_for(format, "fs_main", additive),
+            corona_pipeline: corona_pipeline_for(format, "fs_main", screen),
             smoke_pipeline: corona_pipeline_for(format, "fs_smoke", alpha_blend),
             sky_pipeline: sky_pipeline_for(format, "fs_main"),
         };
@@ -3155,7 +3248,8 @@ impl Renderer {
             });
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("dlss prepass"),
-                bind_group_layouts: &[Some(&camera_layout), Some(&material_layout), Some(&motion_layout)],
+                // (group 2 is the vehicle reflection's in shader.wgsl: DLSS's motion is group 3)
+                bind_group_layouts: &[Some(&camera_layout), Some(&material_layout), None, Some(&motion_layout)],
                 immediate_size: 0,
             });
             let motion_target = [Some(wgpu::ColorTargetState { format: DLSS_MOTION_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })];
@@ -3196,7 +3290,7 @@ impl Renderer {
             };
             let sky_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("dlss sky motion"),
-                bind_group_layouts: &[None, None, Some(&motion_layout)],
+                bind_group_layouts: &[None, None, None, Some(&motion_layout)],
                 immediate_size: 0,
             });
             let sky = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -3930,7 +4024,12 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let gpu_timers = [GpuTimers::new(&device), GpuTimers::new(&device)];
+        // GLES cannot reliably read the depth buffer (the same limitation as SSAO).
+        let puddles = (!gl && !leave_out_enhanced).then(|| {
+            puddles::Pipelines::new(&device, &shader, &camera_layout, &material_layout)
+        });
         Renderer {
+            _device_poller: DevicePoller::start(&device),
             upscale_pipeline,
             upscale_layout,
             upscale_buf,
@@ -3941,8 +4040,8 @@ impl Renderer {
             dynamic_scale: std::cell::Cell::new(1.0),
             flicker: std::cell::RefCell::new(HashMap::new()),
             cull_drawn: std::cell::RefCell::new(Vec::new()),
-            object_sizes: std::cell::RefCell::new(HashMap::new()),
-            object_sizes_scratch: std::cell::RefCell::new(HashMap::new()),
+            object_sizes: Default::default(),
+            object_sizes_scratch: Default::default(),
             shadow_far_cache: std::cell::Cell::new((Mat4::IDENTITY, 0, DVec3::ZERO, Vec3::ZERO)),
             shadow_near_cache: std::cell::Cell::new((Mat4::IDENTITY, 0, DVec3::ZERO, Vec3::ZERO)),
             xr_shadow_cache: std::cell::Cell::new(None),
@@ -3951,13 +4050,15 @@ impl Renderer {
             mip_layout,
             mip_sampler,
             clamp_sampler,
-            clamp_next: std::cell::Cell::new(false),
+            mirror_sampler,
+            address_next: std::cell::Cell::new(TexAddressing::Wrap),
             light_map_next: std::cell::Cell::new(false),
             lm_atlas_view: lm_atlas.create_view(&wgpu::TextureViewDescriptor::default()),
             lm_atlas,
             lm_uniform,
             lm_place: std::cell::Cell::new((0.0, 0.0, 0.0)),
             hdr_targets: HashMap::new(),
+            puddles,
             post,
             post_layout,
             post_buf,
@@ -4026,6 +4127,7 @@ impl Renderer {
             shadow_sampler,
             shadow_layout,
             shadow_pipelines,
+            shadow_blobs: options.shadow_blobs,
             options,
             gpu_error,
             env_heading: Default::default(),
@@ -4382,6 +4484,22 @@ impl Renderer {
             upload_texture(&self.device, &self.queue, img, false)
         };
         scene.textures.push(t);
+        scene.textures.len() - 1
+    }
+
+    pub fn add_blank_texture(&self, scene: &mut Scene, width: u32, height: u32) -> TextureId {
+        let (width, height) = (width.max(1), height.max(1));
+        // A newly allocated GPU texture has undefined contents. Script displays may be
+        // sampled before their first `STUnlock`, so initialise them as transparent rather
+        // than briefly showing arbitrary solid pixels on new or AI vehicles.
+        let image = omsi_texture::Image {
+            width,
+            height,
+            rgba: vec![0; (width * height * 4) as usize],
+            has_alpha: true,
+        };
+        let texture = upload_texture(&self.device, &self.queue, &image, false);
+        scene.textures.push(texture);
         scene.textures.len() - 1
     }
 
@@ -4905,7 +5023,7 @@ impl Renderer {
             bump,
             emissive,
             transmap,
-            clamp,
+            address,
             mut uniform,
         ) = {
             let src = scene.materials.get(base)?;
@@ -4923,7 +5041,7 @@ impl Renderer {
                 src.bump,
                 src.emissive,
                 src.transmap,
-                src.clamp,
+                src.address,
                 src.uniform,
             )
         };
@@ -4945,7 +5063,7 @@ impl Renderer {
                 slot(env_mask),
                 slot(bump.map(|b| b.0)),
             ],
-            clamp,
+            address,
             uniform: bytemuck::cast(uniform),
         };
         let (bind_group, buf) = match scene.bind_groups.get(&key) {
@@ -4970,7 +5088,7 @@ impl Renderer {
                         bump,
                         pbr: texture.and_then(|id| scene.pbr_maps.get(&id)).copied(),
                     },
-                    clamp,
+                    address,
                     &buf,
                 );
                 scene
@@ -4994,7 +5112,7 @@ impl Renderer {
             bump,
             emissive,
             transmap,
-            clamp,
+            address,
             uniform,
             buf,
             bind_group,
@@ -5157,7 +5275,7 @@ impl Renderer {
         // a rain film's reflection slot holds the picture behind the glass: its drops show
         // the street through themselves, bent and upside down, as real drops do
         let envmap = if extra.rain_film { Some((self.glass_slot(scene), 0.0)) } else { envmap };
-        let clamp = self.clamp_next.replace(false);
+        let address = self.address_next.replace(TexAddressing::Wrap);
         let lm_mapped = self.light_map_next.replace(false);
         let mode = match alpha {
             AlphaMode::Opaque => 0.0,
@@ -5217,10 +5335,20 @@ impl Renderer {
                 let b = extra.border.unwrap_or([0.0; 4]).map(|c| (c.clamp(0.0, 1.0) * 255.0).round());
                 [
                     if extra.screen { 1.0 } else { 0.0 },
-                    if extra.border.is_some() { 1.0 } else { 0.0 },
+                    if extra.border.is_some() {
+                        1.0
+                    } else if address == TexAddressing::MirrorOnce {
+                        2.0
+                    } else {
+                        0.0
+                    },
                     b[0] * 65536.0 + b[1] * 256.0 + b[2],
                     b[3] / 255.0,
                 ]
+            },
+            ambient: {
+                let a = extra.ambient.unwrap_or([color[0], color[1], color[2]]);
+                [a[0], a[1], a[2], 0.0]
             },
         };
         let slot = |t: Option<TextureId>| {
@@ -5237,7 +5365,7 @@ impl Renderer {
                 slot(env_mask),
                 slot(bump.map(|b| b.0)),
             ],
-            clamp,
+            address,
             uniform: bytemuck::cast(uniform),
         };
         let (bind_group, buf) = match scene.bind_groups.get(&key) {
@@ -5256,7 +5384,7 @@ impl Renderer {
                         bump,
                         pbr: texture.and_then(|t| scene.pbr_maps.get(&t)).copied(),
                     },
-                    clamp,
+                    address,
                     &buf,
                 );
                 scene
@@ -5280,7 +5408,7 @@ impl Renderer {
             bump,
             emissive,
             transmap,
-            clamp,
+            address,
             uniform,
             buf,
             bind_group,
@@ -5323,7 +5451,7 @@ impl Renderer {
         &self,
         textures: &[GpuTexture],
         maps: MaterialMaps,
-        clamp: bool,
+        address: TexAddressing,
         buf: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         let view = |t: Option<TextureId>, or: &'_ GpuTexture| -> wgpu::TextureView {
@@ -5343,10 +5471,10 @@ impl Renderer {
         // shader leaves unread by its flags)
         let normal_view = view(maps.pbr.and_then(|p| p.normal), &self.flat_normal_texture);
         let orm_view = view(maps.pbr.and_then(|p| p.orm), &self.white_texture);
-        let sampler = if clamp {
-            &self.clamp_sampler
-        } else {
-            &self.sampler
+        let sampler = match address {
+            TexAddressing::Wrap => &self.sampler,
+            TexAddressing::Mirror => &self.mirror_sampler,
+            TexAddressing::Clamp | TexAddressing::MirrorOnce => &self.clamp_sampler,
         };
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -5395,6 +5523,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 10,
                     resource: wgpu::BindingResource::TextureView(&orm_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::Sampler(&self.clamp_sampler),
                 },
             ],
         })
@@ -5529,7 +5661,7 @@ impl Renderer {
                     bump: m.bump,
                     pbr: m.texture.and_then(|t| pbr_maps.get(&t)).copied(),
                 },
-                m.clamp,
+                m.address,
                 &m.buf,
             );
             n += 1;
@@ -5640,6 +5772,7 @@ impl Renderer {
             object_radius: 0.0,
             detail: 1.0,
             any_distance: false,
+            near_only: None,
             mirror_only: false,
             omsi_caster: false,
             ordered: false,
@@ -5690,6 +5823,7 @@ impl Renderer {
             object_radius: 0.0,
             detail: 1.0,
             any_distance: false,
+            near_only: None,
             mirror_only: false,
             omsi_caster: false,
             ordered: false,
@@ -5877,6 +6011,12 @@ impl Renderer {
         i.any_distance = any_distance;
     }
 
+    /// Draw an instance only while the camera stands in `area` (world x0, y0, x1, y1 on the
+    /// ground; None: wherever it is loaded).
+    pub fn set_near_only(&self, scene: &mut Scene, instance: usize, area: Option<[f64; 4]>) {
+        scene.instances[instance].near_only = area;
+    }
+
     /// Change an instance transform (re-uploaded on the next `prepare`).
     pub fn set_transform(
         &self,
@@ -6013,7 +6153,8 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+                | if self.puddles.is_some() { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() },
             view_formats: &[],
         });
         // the AO itself at half size: four times fewer pixels, and the blur hides the rest
@@ -6252,6 +6393,7 @@ impl Renderer {
                 meter_bg,
                 tonemap_bg,
                 fxaa_bg,
+                puddles: None,
             },
         );
         true
@@ -6443,7 +6585,9 @@ impl Renderer {
             sun_disc: st.sun_disc.extend(dt).to_array(),
             debug: [
                 debug_view(),
-                0.0,
+                omsi_cfg::env::var("OMSI_PUDDLE_F0")
+                    .ok().and_then(|v| v.parse::<f32>().ok())
+                    .filter(|v| v.is_finite()).unwrap_or(0.08).clamp(0.02, 0.2),
                 omsi_cfg::env::var("OMSI_ENV_PHOTO")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -6454,7 +6598,7 @@ impl Renderer {
             // x how bright an LED panel's dots burn (see `MaterialExtra::led`; the settings'
             // 16 levels give 0 = off .. 3.75), y whether the LED panels' `\S:n` masks keep
             // their mip chain (0: at full resolution, the dots stay visible when small)
-            led: [lighting.led_glow, if lighting.led_mips { 1.0 } else { 0.0 }, 0.0, 0.0],
+            led: [lighting.led_glow, lighting.led_mips, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.enh_buf, 0, bytemuck::bytes_of(&u));
@@ -7298,9 +7442,10 @@ impl Renderer {
         cursor_overlay: Option<usize>,
         tooltip_overlay: Option<usize>,
         cursor_transforms: [Option<Mat4>; 2],
+        navigator: Option<(TextureId, [Mat4; 2])>,
     ) {
         let Some(menu) = scene.overlays.get(menu_range) else { return };
-        if menu.is_empty() && cursor_transforms.iter().all(Option::is_none) {
+        if menu.is_empty() && cursor_transforms.iter().all(Option::is_none) && navigator.is_none() {
             return;
         }
         let (w, h) = (desktop_size.0.max(1) as f32, desktop_size.1.max(1) as f32);
@@ -7326,6 +7471,12 @@ impl Renderer {
         };
         let mut prepared = [Vec::new(), Vec::new()];
         for eye in 0..2 {
+            if let Some((id, transforms)) = navigator.as_ref() {
+                let quad = [Vec4::new(-1.0, 1.0, 0.0, 1.0), Vec4::new(1.0, 1.0, 0.0, 1.0),
+                            Vec4::new(1.0, -1.0, 0.0, 1.0), Vec4::new(-1.0, -1.0, 0.0, 1.0)]
+                    .map(|p| transforms[eye] * p);
+                if let Some(item) = prepare(id, quad) { prepared[eye].push(item); }
+            }
             for (index, (id, rect)) in menu.iter().enumerate() {
                 // The first rectangle dims the view. Every other rectangle is
                 // projected from the same menu plane in world space.
@@ -7528,7 +7679,12 @@ impl Renderer {
         // shader, 12.7 ms of GPU time for one 256-pixel mirror against 5.8 ms for the whole
         // window; plainly shaded it is 0.6 ms, and a mirror's small picture shows no
         // difference worth that. `OMSI_MIRROR_ENHANCED=1` draws them enhanced again.
-        let enhanced_frame = lighting.enhanced && self.hdr_pass.is_some() && omsi_cfg::env::var_os("OMSI_NO_ENHANCED").is_none() && (with_overlays || omsi_cfg::env::var_os("OMSI_MIRROR_ENHANCED").is_some());
+        // The headset's eyes are the real picture as much as the window is (#784: VR showed
+        // the plain graphics with Enhanced on); the first eye is the one that moves the
+        // exposure, the sky cube and the frame clock on, as the window does without VR.
+        let xr_view = projection.is_some();
+        let lead_view = with_overlays || (xr_view && !second_eye);
+        let enhanced_frame = lighting.enhanced && self.hdr_pass.is_some() && omsi_cfg::env::var_os("OMSI_NO_ENHANCED").is_none() && (with_overlays || xr_view || omsi_cfg::env::var_os("OMSI_MIRROR_ENHANCED").is_some());
         // the mirrors are drawn by the same path as the window (their picture graded with
         // the window's exposure, see the post passes)
         let enhanced = enhanced_frame;
@@ -7540,7 +7696,7 @@ impl Renderer {
         // the enhanced path's shading is costly: the depth prepass keeps it to the visible
         // surface (without multisampling, see `share_depth`)
         // (DLSS reads the prepass's depth, and the prepass writes its motion vectors)
-        let prepass_on = ao_on || (enhanced && with_overlays) || dlss_frame;
+        let prepass_on = ao_on || (enhanced && (with_overlays || xr_view)) || dlss_frame;
         if prepass_on && self.ensure_ao(width, height) {
             // a new AO texture: the camera bind group must point at it
             scene.dirty = true;
@@ -7556,7 +7712,7 @@ impl Renderer {
                 .last_frame
                 .map(|t| (now - t).as_secs_f32())
                 .unwrap_or(0.0);
-            if with_overlays {
+            if lead_view {
                 self.last_frame = Some(now);
             }
             dt
@@ -7575,6 +7731,7 @@ impl Renderer {
             // anew for every overlay of every frame was a steady stream of GPU allocations
             scene.overlay_res.truncate(overlays.len());
             for (k, (tex, r)) in overlays.iter().copied().enumerate() {
+                let r = snap_rect(r);
                 let ndc = [
                     r[0] / full_w as f32 * 2.0 - 1.0,
                     1.0 - r[1] / full_h as f32 * 2.0,
@@ -7902,8 +8059,14 @@ impl Renderer {
         // (a mirror takes the window's light - its own call would move the exposure on -
         // unless it comes before the window's first frame)
         let probe_redraw = enhanced
-            && (with_overlays || self.sky_state.is_none())
+            && (lead_view || self.sky_state.is_none())
             && self.prepare_enhanced(lighting, cam_rel, ro, dt);
+        let puddles_wanted = enhanced
+            && with_overlays
+            && self.options.reflections
+            && lighting.wetness * (1.0 - lighting.snow.clamp(0.0, 1.0)) > 0.05
+            && debug_view() == 0.0
+            && omsi_cfg::env::var_os("OMSI_NO_PUDDLE_REFLECTIONS").is_none();
         // --- what every pass draws, as batches over one draw list (see `Batch`): the shadow
         // casters of each cascade, the depth prepass and the main pass. The list is built
         // and uploaded before any pass is encoded.
@@ -8108,7 +8271,7 @@ impl Renderer {
         // (the main view's last picture, for the hysteresis; the headset's eyes are main
         // views too: without their previous draw list small meshes and LODs blinked at
         // their thresholds while the head turned)
-        let main_view = with_overlays || projection.is_some();
+        let main_view = with_overlays || xr_view;
         let mut drawn_before = if main_view {
             std::mem::take(&mut *self.cull_drawn.borrow_mut())
         } else {
@@ -8121,12 +8284,22 @@ impl Renderer {
             sizes_now.clear();
             (sizes_before, sizes_now)
         } else {
-            (HashMap::new(), HashMap::new())
+            Default::default()
         };
         let cull_one = |i: usize, sizes: &mut Vec<([u64; 4], f32)>| -> Option<(usize, f32, bool)> {
             let inst = &scene.instances[i];
             let m = &scene.meshes[inst.mesh];
             if m.ranges.is_empty() || !inst.visible || (inst.mirror_only && main_view) {
+                return None;
+            }
+            if let Some([x0, y0, x1, y1]) = inst.near_only {
+                let c = camera.position;
+                if c.x < x0 || c.x > x1 || c.y < y0 || c.y > y1 {
+                    return None;
+                }
+            }
+            // OMSI's `[isshadow]` shadow blobs, switched off (see `RenderOptions::shadow_blobs`)
+            if inst.blob && !self.shadow_blobs {
                 return None;
             }
             let (c, r) = Self::bounding_sphere(scene, inst);
@@ -8567,7 +8740,7 @@ impl Renderer {
                         let kind = if mat.alpha != AlphaMode::Blend && !mat.no_z_check {
                             // (a model drawn in order: its opaque and cut-out slots too)
                             kind_of(mat.alpha)
-                        } else if mat.no_z_write || mat.no_z_check || world_surface_phase(inst.render_phase) {
+                        } else if mat.no_z_write || mat.no_z_check || (world_surface_phase(inst.render_phase) && !inst.presurface) {
                             PIPE_BLEND_NO_WRITE
                         } else {
                             PIPE_BLEND
@@ -8596,6 +8769,13 @@ impl Renderer {
             }
             list.extend(pre_list);
             prepass_batches = pre_batches;
+        }
+        // OMSI_SKIP_PIPE=3,1: leave pipeline kinds out of the main pass (0 opaque, 1 alpha
+        // tested, 2 blended, 3 blended without depth writes, 4 surface depth) - with
+        // OMSI_GPU_TIMERS_RAW, what each kind costs the GPU
+        if let Ok(skip) = omsi_cfg::env::var("OMSI_SKIP_PIPE") {
+            let skip: Vec<u8> = skip.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            main_batches.retain(|b| !skip.contains(&(b.pipe / 4)));
         }
         if debug_draws {
             log::info!("  main pass: {} opaque/alpha-tested and {} blended draws in {} batches; prepass {} batches; draw list {} entries", main_draws[0], main_draws[1], main_batches.len(), prepass_batches.len(), list.len());
@@ -8626,17 +8806,24 @@ impl Renderer {
         }
         if self.profiling && with_overlays && self.draw_audit_at.elapsed().as_secs() >= 10 {
             self.draw_audit_at = std::time::Instant::now();
-            let mut assets: HashMap<&str, (usize, usize)> = HashMap::new();
+            // (batches, draws, triangles) per asset: what the CPU encodes and what the GPU
+            // goes through
+            let mut assets: HashMap<&str, (usize, usize, u64)> = HashMap::new();
             for b in &main_batches {
                 let source = scene.meshes[b.mesh as usize].source.as_deref().unwrap_or("procedural / vehicle");
                 let cost = assets.entry(source).or_default();
                 cost.0 += 1;
                 cost.1 += b.instances.len();
+                cost.2 += b.count as u64 / 3 * b.instances.len() as u64;
             }
             let mut assets: Vec<_> = assets.into_iter().collect();
             assets.sort_unstable_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(b.0)));
-            for (source, (batches, draws)) in assets.into_iter().take(12) {
-                log::info!("draw audit: {batches} batches, {draws} draws: {source}");
+            for (source, (batches, draws, tris)) in assets.iter().take(12) {
+                log::info!("draw audit: {batches} batches, {draws} draws, {tris} triangles: {source}");
+            }
+            assets.sort_unstable_by(|a, b| b.1.2.cmp(&a.1.2).then(a.0.cmp(b.0)));
+            for (source, (batches, draws, tris)) in assets.iter().take(12) {
+                log::info!("triangle audit: {tris} triangles in {draws} draws ({batches} batches): {source}");
             }
         }
         stage(self, "items", "mirror.items");
@@ -8788,7 +8975,7 @@ impl Renderer {
                 });
                 if let Some((p, _, bg)) = dlss_prepass {
                     // the sky's motion under everything, then the scene's over it
-                    pass.set_bind_group(2, bg, &[]);
+                    pass.set_bind_group(3, bg, &[]);
                     pass.set_pipeline(&p.sky);
                     pass.draw(0..3, 0..1);
                 }
@@ -8828,7 +9015,7 @@ impl Renderer {
         }
         // --- the enhanced sky cube: a face a frame (all six the first time and for a new
         // sky), drawn in the window's frame only
-        if enhanced && (with_overlays || probe_redraw) {
+        if enhanced && (lead_view || probe_redraw) {
             if let (Some(probe), Some(sky_bg)) = (self.probe.as_mut(), scene.sky_bind_group.as_ref()) {
                 // (face, round, the old picture's share): a whole new cube is every round
                 // of every face averaged; afterwards one face a frame, blended in
@@ -8844,7 +9031,7 @@ impl Renderer {
                     // old place
                     let round = (probe.cube_round / 6) % SKY_CUBE_ROUNDS;
                     (0..6).map(|f| (f, round, 0.0)).collect()
-                } else if (probe.cube_wait >= SKY_CUBE_EVERY && !redraw_near) || probe.cube_wait >= SKY_CUBE_EVERY * 2 || !with_overlays {
+                } else if (probe.cube_wait >= SKY_CUBE_EVERY && !redraw_near) || probe.cube_wait >= SKY_CUBE_EVERY * 2 || !lead_view {
                     // (on a frame that keeps the near shadow map: the two costliest
                     // occasional passes never fall on the same frame)
                     vec![(probe.cube_next, (probe.cube_round / 6) % SKY_CUBE_ROUNDS, SKY_CUBE_HISTORY)]
@@ -8952,13 +9139,19 @@ impl Renderer {
         // central Spandau with 4x MSAA).
         let msaa_prepass = enhanced
             && !has_presurface
-            && with_overlays
+            && (with_overlays || xr_view)
             && !single
             && prepass_on
             && omsi_cfg::env::var_os("OMSI_NO_MSAA_PREPASS").is_none();
+        let parts = if !cfg!(any(target_os = "macos", target_os = "ios")) && main_bundles.len() >= 2 && omsi_cfg::env::var_os("OMSI_NO_MAIN_SPLIT").is_none() {
+            main_bundles.len().min(2)
+        } else {
+            1
+        };
+        let mut lead = (parts > 1).then(|| self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("main part") }));
         if msaa_prepass {
             if let (Some(pipes), Some(t)) = (self.prepass_msaa_pipelines.as_ref(), targets.as_ref()) {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                let mut pass = lead.as_mut().unwrap_or(&mut encoder).begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("msaa depth prepass"),
                     color_attachments: &[],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -9032,30 +9225,34 @@ impl Renderer {
                 depth_slice: None,
                 resolve_target: h.mask_msaa.as_ref().map(|_| &h.mask),
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    load: if parts > 1 { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) },
                     store: if h.mask_msaa.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
                 },
             });
-            let parts = if hdr.is_none() && !msaa_prepass && !cfg!(any(target_os = "macos", target_os = "ios")) && main_bundles.len() >= 2 && omsi_cfg::env::var_os("OMSI_NO_MAIN_SPLIT").is_none() {
-                main_bundles.len().min(2)
-            } else {
-                1
-            };
             let per_part = main_bundles.len().div_ceil(parts.max(1));
             let sky_clear = wgpu::LoadOp::Clear(wgpu::Color { r: sky.x as f64, g: sky.y as f64, b: sky.z as f64, a: 1.0 });
             let depth_first = if share_depth || msaa_prepass { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(0.0) };
             for g in 0..parts.saturating_sub(1) {
                 let first = g == 0;
-                let mut part = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("main part") });
+                let mut part = lead.take().unwrap_or_else(|| self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("main part") }));
                 {
-                    let mut pass = part.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("main part"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    let part_colors = [
+                        Some(wgpu::RenderPassColorAttachment {
                             view: draw_view,
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations { load: if first { sky_clear } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store },
-                        })],
+                        }),
+                        hdr.map(|h| wgpu::RenderPassColorAttachment {
+                            view: h.mask_msaa.as_ref().unwrap_or(&h.mask),
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: if first { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store },
+                        }),
+                    ];
+                    let mut pass = part.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("main part"),
+                        color_attachments: if part_colors[1].is_some() { &part_colors[..] } else { &part_colors[..1] },
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                             view: depth_view,
                             depth_ops: Some(wgpu::Operations { load: if first { depth_first } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store }),
@@ -9177,6 +9374,14 @@ impl Renderer {
                 }
             }
         }
+        // Weather alone is insufficient: leave the allocation and reflection passes out when
+        // the visible batches contain no moisture-tagged surface (a showroom, bare terrain).
+        let puddles_on = puddles_wanted
+            && main_batches.iter().any(|b| scene.materials[b.material as usize].uniform.params2[2] > 0.0)
+            && self.prepare_puddle_reflections(width, height, camera, aspect, projection, &cu, lighting);
+        if puddles_on {
+            self.encode_puddle_reflections(&mut encoder, width, height, scene, &main_batches, &list, lighting, camera, tset.as_ref(), &mut timed);
+        }
         if enhanced {
             // --- the post passes: glow, metering and adaptation, tone curve, FXAA
             let secs = |tau: f32| {
@@ -9215,6 +9420,7 @@ impl Renderer {
             // (nor a picture for DLSS: it smooths the edges itself, from the jittered frames)
             let fxaa = with_overlays && !dlss_frame && self.options.fxaa && omsi_cfg::env::var_os("OMSI_NO_FXAA").is_none();
             if let Some(h) = self.hdr_targets.get(&(width, height)) {
+                let puddles = h.puddles.as_ref().filter(|_| puddles_on);
                 let levels = h.down.len();
                 for i in 0..levels {
                     post_pass(
@@ -9226,13 +9432,13 @@ impl Renderer {
                         } else {
                             &self.post.down
                         },
-                        &h.down_bg[i],
+                        if i == 0 { puddles.map(|p| &p.down_bg).unwrap_or(&h.down_bg[i]) } else { &h.down_bg[i] },
                     );
                 }
                 // the exposure: meter the smallest level, move the adapted value towards it
                 // (the window's picture only: a mirror is graded with the window's exposure,
                 // as the eye that looks into it is adapted to the street)
-                if with_overlays {
+                if lead_view {
                     post_pass(
                         &mut encoder,
                         &self.meter_view,
@@ -9266,7 +9472,7 @@ impl Renderer {
                     post_pass(&mut encoder, &h.up[i], timer, &self.post.up, &h.up_bg[i]);
                 }
                 let final_view = if fxaa { &h.ldr } else { scene_view };
-                let tonemap_bg = &h.tonemap_bg[self.adapt_front];
+                let tonemap_bg = &puddles.map(|p| &p.tonemap_bg).unwrap_or(&h.tonemap_bg)[self.adapt_front];
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("tone map"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -10076,13 +10282,33 @@ fn sky_input_differs(a: &atmosphere::SkyInput, b: &atmosphere::SkyInput) -> bool
 }
 
 /// The scene shader: the vanilla path and the enhanced fragment shader in one module.
-fn scene_shader_source() -> String {
-    [
+///
+/// On OpenGL a texture has one sampler (GLSL's combined sampler2D), so there the tile
+/// masks are read through `s_diffuse` at a UV clamped half a texel inside the tile, which
+/// is what `s_tile`'s clamp to edge gives; reading `t_trans`/`t_night` through both
+/// samplers fails the whole module ("Conflicting samplers").
+fn scene_shader_source(gl: bool) -> String {
+    let src = [
         include_str!("shader.wgsl"),
         include_str!("enhanced_common.wgsl"),
+        include_str!("puddle_common.wgsl"),
         include_str!("enhanced.wgsl"),
     ]
-    .join("\n")
+    .join("\n");
+    if !gl {
+        return src;
+    }
+    let clamped = |t: &str| {
+        format!(
+            "textureSample({t}, s_diffuse, clamp(uv, 0.5 / vec2<f32>(textureDimensions({t})), \
+             vec2<f32>(1.0) - 0.5 / vec2<f32>(textureDimensions({t}))))"
+        )
+    };
+    let out = src
+        .replace("textureSample(t_trans, s_tile, uv)", &clamped("t_trans"))
+        .replace("textureSample(t_night, s_tile, uv)", &clamped("t_night"));
+    debug_assert!(!out.contains("s_tile, uv)"));
+    out
 }
 
 /// The enhanced clouds' noise textures (clouds.rs), made once: the shape map (2-D RGBA8)
@@ -10426,7 +10652,7 @@ fn batch_items(
     out: &mut Vec<Batch>,
 ) {
     if sort {
-        items.sort_unstable_by_key(|d| (d.pipe, d.mesh, d.range, d.material));
+        items.sort_unstable_by_key(|d| (d.pipe, d.material, d.mesh, d.range));
     }
     let mut k = 0;
     while k < items.len() {
@@ -10630,6 +10856,40 @@ fn culls_back_faces(scene: &Scene, inst: &Instance) -> bool {
     scene.meshes[inst.mesh].one_sided
         && !*NO_CULL.get_or_init(|| omsi_cfg::env::var_os("OMSI_NO_CULL").is_some())
         && glam::Mat3::from_mat4(inst.transform).determinant() > 0.0
+}
+
+struct DevicePoller {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DevicePoller {
+    fn start(device: &wgpu::Device) -> Option<Self> {
+        if cfg!(target_arch = "wasm32") || omsi_cfg::env::var_os("OMSI_NO_POLL_THREAD").is_some() {
+            return None;
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (device, flag) = (device.clone(), stop.clone());
+        let thread = std::thread::Builder::new()
+            .name("omsi-gpu-poll".into())
+            .spawn(move || {
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = device.poll(wgpu::PollType::Poll);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+            .ok()?;
+        Some(Self { stop, thread: Some(thread) })
+    }
+}
+
+impl Drop for DevicePoller {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 fn in_scope<'s, R>(pool: Option<&rayon::ThreadPool>, op: impl FnOnce(&rayon::Scope<'s>) -> R) -> R {
@@ -10893,10 +11153,10 @@ impl Renderer {
     fn freed(&self, scene: &mut Scene) -> &Freed {
         if self.freed.get().is_none() {
             // a plain material, built as any other and taken out of the scene again (without
-            // using up a clamp request meant for the next real material)
-            let clamp = self.clamp_next.replace(false);
+            // using up an addressing request meant for the next real material)
+            let address = self.address_next.replace(TexAddressing::Wrap);
             let plain = self.add_material(scene, None, AlphaMode::Opaque, [1.0; 4], false);
-            self.clamp_next.set(clamp);
+            self.address_next.set(address);
             let m = scene.materials.swap_remove(plain);
             let (bind_group, buf) = (m.bind_group, m.buf);
             let vertex_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -10982,7 +11242,7 @@ impl Renderer {
             bump: None,
             emissive: [0.0; 3],
             transmap: None,
-            clamp: false,
+            address: TexAddressing::Wrap,
             uniform: <MaterialUniform as bytemuck::Zeroable>::zeroed(),
             buf,
             bind_group,
@@ -11104,9 +11364,229 @@ impl Renderer {
     }
 }
 
+/// An overlay's rectangle (physical pixels) moved onto whole pixels, its size kept. The
+/// overlays are pictures drawn texel for pixel - a text, a plate - and the linear filter
+/// blended every pixel of one placed between pixels with its neighbour: the interface's texts
+/// were soft at every size whose layout fell between them (most but 100 %, and the timetable's
+/// rows at that too). A line thinner than a pixel stays one pixel wide or high.
+fn snap_rect(r: [f32; 4]) -> [f32; 4] {
+    // (half up the same way left of the window as right of it: `round` goes away from zero,
+    // and a rectangle across the left edge came out a pixel wider)
+    let snap = |v: f32| (v + 0.5).floor();
+    let (x0, y0) = (snap(r[0]), snap(r[1]));
+    let x1 = if r[2] > r[0] { snap(r[2]).max(x0 + 1.0) } else { snap(r[2]) };
+    let y1 = if r[3] > r[1] { snap(r[3]).max(y0 + 1.0) } else { snap(r[3]) };
+    [x0, y0, x1, y1]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Overlays drawn texel for pixel: onto whole pixels, their size kept.
+    #[test]
+    fn overlays_land_on_whole_pixels() {
+        // (a 120 x 26 text a quarter and a half pixel off: moved, the same size)
+        assert_eq!(snap_rect([25.25, 40.5, 145.25, 66.5]), [25.0, 41.0, 145.0, 67.0]);
+        assert_eq!(snap_rect([10.0, 20.0, 30.0, 40.0]), [10.0, 20.0, 30.0, 40.0]);
+        // (left of the window as well: the same size)
+        assert_eq!(snap_rect([-0.5, -2.5, 19.5, 7.5]), [0.0, -2.0, 20.0, 8.0]);
+        // (a separator 0.6 px high stays a line)
+        let line = snap_rect([16.0, 100.3, 300.0, 100.9]);
+        assert_eq!(line[3] - line[1], 1.0);
+        // (an empty rectangle stays empty)
+        assert_eq!(snap_rect([5.2, 5.2, 5.2, 5.2]), [5.0, 5.0, 5.0, 5.0]);
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; renders terrain and foliage lighting"]
+    fn enhanced_masked_and_uncut_ground_share_lighting() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = pollster::block_on(Renderer::new_with(
+            &instance,
+            None,
+            Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions {
+                msaa: 1,
+                ssao: false,
+                shadow_size: 1024,
+                fxaa: false,
+                render_scale: 1.0,
+                ..Default::default()
+            },
+        ))
+        .expect("test renderer");
+        let mut scene = renderer.new_scene();
+        let mut texture = |rgba: [u8; 4]| {
+            renderer.add_texture(
+                &mut scene,
+                &omsi_texture::Image {
+                    width: 1,
+                    height: 1,
+                    rgba: rgba.to_vec(),
+                    has_alpha: true,
+                },
+                false,
+            )
+        };
+        let grey = texture([100, 100, 100, 255]);
+        let opaque = texture([255; 4]);
+        let transparent = texture([100, 100, 100, 0]);
+        let masked = renderer.add_terrain_material(
+            &mut scene,
+            Some(grey),
+            Some(opaque),
+            None,
+            1.0,
+            None,
+            0.0,
+        );
+        let uncut =
+            renderer.add_terrain_material(&mut scene, Some(grey), None, None, 1.0, None, 0.0);
+        let cut = renderer.add_terrain_material(
+            &mut scene,
+            Some(grey),
+            Some(transparent),
+            None,
+            1.0,
+            None,
+            0.0,
+        );
+        let foliage =
+            renderer.add_material(&mut scene, Some(grey), AlphaMode::Test, [1.0; 4], false);
+        let cut_foliage = renderer.add_material(
+            &mut scene,
+            Some(transparent),
+            AlphaMode::Test,
+            [1.0; 4],
+            false,
+        );
+        let backdrop = renderer.add_material(
+            &mut scene,
+            None,
+            AlphaMode::Opaque,
+            [1.0, 0.0, 0.0, 1.0],
+            true,
+        );
+        let mut quad = |left: f32, right: f32, z: f32, material| {
+            let mesh = renderer.add_mesh(
+                &mut scene,
+                &MeshData {
+                    positions: vec![
+                        Vec3::new(left, -5.0, z),
+                        Vec3::new(right, -5.0, z),
+                        Vec3::new(right, 5.0, z),
+                        Vec3::new(left, 5.0, z),
+                    ],
+                    normals: vec![Vec3::Z; 4],
+                    uvs: vec![glam::Vec2::splat(0.5); 4],
+                    indices: vec![0, 1, 2, 0, 2, 3],
+                    ranges: vec![(0, 6, 0)],
+                    one_sided: false,
+                },
+            );
+            renderer.add_instance(
+                &mut scene,
+                mesh,
+                DVec3::ZERO,
+                Mat4::IDENTITY,
+                vec![material],
+            )
+        };
+        // Symmetric samples in the same image share exposure, view and lamp distances.
+        quad(-6.0, 6.0, -1.0, backdrop);
+        let ground = quad(-5.0, -0.5, 0.0, masked);
+        let mapped = quad(0.5, 5.0, 0.0, uncut);
+        scene.instances[ground].render_phase = RenderPhase::Terrain;
+        scene.instances[mapped].render_phase = RenderPhase::Spline;
+        scene.instances[mapped].surface = true;
+        let camera = Camera {
+            position: DVec3::new(0.0, -0.105, 6.0),
+            yaw: 0.0,
+            pitch: -89.0,
+            roll: 0.0,
+            fov_deg: 90.0,
+            near: 0.1,
+            far: 100.0,
+        };
+        let day = Lighting {
+            enhanced: true,
+            sun_dir: Vec3::Z,
+            sun_intensity: 1.0,
+            shadows: false,
+            detail: false,
+            fog_density: 0.0,
+            ..Default::default()
+        };
+        let night = Lighting {
+            sun_dir: -Vec3::Z,
+            sun_intensity: 0.0,
+            night: 1.0,
+            ..day.clone()
+        };
+        let pixel = |rgba: &[u8], x: usize| -> [u8; 3] {
+            rgba[(32 * 64 + x) * 4..(32 * 64 + x) * 4 + 3]
+                .try_into()
+                .unwrap()
+        };
+        for (name, lighting) in [("sun", &day), ("lamp", &night)] {
+            scene.lights = if name == "lamp" {
+                vec![PointLight {
+                    position: DVec3::new(0.0, 0.0, 4.0),
+                    radius: 20.0,
+                    core: 10.0,
+                    intensity: 1.0,
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            };
+            let rgba = renderer
+                .render_to_image(&mut scene, 64, 64, &camera, lighting)
+                .unwrap();
+            let (a, b) = (pixel(&rgba, 16), pixel(&rgba, 47));
+            assert!(
+                a.iter().all(|v| *v > 10 && *v < 245),
+                "lit, unclipped {name}: {a:?}"
+            );
+            assert!(
+                a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 2),
+                "masked terrain and uncut mapped ground differ under {name}: {a:?} / {b:?}"
+            );
+        }
+        // A road cut still reveals the geometry beneath it.
+        renderer.set_material(&mut scene, ground, 0, cut);
+        let rgba = renderer
+            .render_to_image(&mut scene, 64, 64, &camera, &night)
+            .unwrap();
+        let a = pixel(&rgba, 16);
+        assert!(
+            a[0] > a[1] + 30 && a[0] > a[2] + 30,
+            "road cut must reveal red: {a:?}"
+        );
+
+        // Real foliage still scatters light arriving from behind its normal; ground does not.
+        renderer.set_material(&mut scene, ground, 0, masked);
+        renderer.set_material(&mut scene, mapped, 0, foliage);
+        scene.lights[0].position.z = -4.0;
+        let rgba = renderer
+            .render_to_image(&mut scene, 64, 64, &camera, &night)
+            .unwrap();
+        let (a, b) = (pixel(&rgba, 16), pixel(&rgba, 47));
+        assert!(
+            b[1] > a[1] + 8,
+            "foliage retains backlighting: ground {a:?}, foliage {b:?}"
+        );
+        renderer.set_material(&mut scene, mapped, 0, cut_foliage);
+        let rgba = renderer
+            .render_to_image(&mut scene, 64, 64, &camera, &night)
+            .unwrap();
+        let b = pixel(&rgba, 47);
+        assert!(
+            b[0] > b[1] + 30 && b[0] > b[2] + 30,
+            "foliage cutout must reveal red: {b:?}"
+        );
+    }
 
     #[test]
     #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
@@ -11532,11 +12012,12 @@ mod tests {
     fn shaders_validate_and_match_the_uniforms() {
         use wgpu::naga;
         let modules = [
-            ("scene", scene_shader_source()),
+            ("scene", scene_shader_source(false)),
             ("sky", sky_shader_source()),
             ("corona", corona_shader_source()),
             ("post", include_str!("post.wgsl").to_string()),
             ("ssao", include_str!("ssao.wgsl").to_string()),
+            ("puddles", puddles::shader_source()),
             ("upscale", include_str!("upscale.wgsl").to_string()),
             ("mip", include_str!("mip.wgsl").to_string()),
             ("xr_ui", include_str!("xr_ui.wgsl").to_string()),
@@ -11544,6 +12025,8 @@ mod tests {
         let sizes: &[(&str, usize)] = &[
             ("Enhanced", std::mem::size_of::<EnhancedUniform>()),
             ("PostParams", std::mem::size_of::<PostUniform>()),
+            ("PuddleParams", std::mem::size_of::<puddles::Uniform>()),
+            ("VehicleReflection", std::mem::size_of::<puddles::VehicleUniform>()),
             ("PointLight", std::mem::size_of::<GpuPointLight>()),
             ("Camera", std::mem::size_of::<CameraUniform>()),
             ("MaterialParams", std::mem::size_of::<MaterialUniform>()),
@@ -11620,6 +12103,37 @@ mod tests {
             }
         }
         assert_eq!(checked.len(), sizes.len(), "structs checked: {checked:?}");
+    }
+
+    /// The scene module as the OpenGL backend gets it translates to GLSL ES 3.10 and desktop
+    /// GLSL 4.30 for every entry point, with no `invariant gl_FragCoord` (rejected by AMD's
+    /// desktop GL and by GLES) and no texture read through two samplers (#617, #610).
+    #[test]
+    fn the_scene_shader_translates_to_glsl() {
+        use wgpu::naga;
+        use wgpu::naga::back::glsl;
+        let src = scene_shader_source(true);
+        let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
+        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .expect("validate");
+        let (module, info) =
+            naga::back::pipeline_constants::process_overrides(&module, &info, None, &Default::default()).expect("overrides");
+        for version in [glsl::Version::Embedded { version: 310, is_webgl: false }, glsl::Version::Desktop(430)] {
+            let options = glsl::Options { version, ..Default::default() };
+            for entry in &module.entry_points {
+                let pipeline = glsl::PipelineOptions {
+                    shader_stage: entry.stage,
+                    entry_point: entry.name.clone(),
+                    multiview: None,
+                };
+                let mut out = String::new();
+                glsl::Writer::new(&mut out, &module, &info, &options, &pipeline, Default::default())
+                    .and_then(|mut w| w.write())
+                    .unwrap_or_else(|e| panic!("{version:?} {}: {e:?}", entry.name));
+                assert!(!out.contains("invariant gl_FragCoord"), "{version:?} {}", entry.name);
+            }
+        }
     }
 
     #[test]

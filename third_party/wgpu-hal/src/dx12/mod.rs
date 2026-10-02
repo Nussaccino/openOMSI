@@ -381,6 +381,7 @@ impl DxgiLib {
     }
 
     /// Will error with crate::DeviceError::Unexpected if DXGI 1.3 is not available.
+    #[allow(dead_code)] // (openOMSI: the instance asks for no IDXGIFactoryMedia, see instance.rs)
     pub fn create_factory_media(&self) -> Result<Dxgi::IDXGIFactoryMedia, crate::DeviceError> {
         // Calls windows::Win32::Graphics::Dxgi::CreateDXGIFactory1 on dxgi.dll
         type Fun = extern "system" fn(

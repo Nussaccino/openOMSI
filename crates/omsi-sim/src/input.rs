@@ -56,6 +56,11 @@ pub struct KeyboardAxes {
     /// "Old Steering": let go, the wheel stays where it is and is turned back by hand - OMSI
     /// without `[autoCenter]`.
     pub old_steering: bool,
+    /// OMSI's `[redSteerSpd]` option (off by default, as in Omsi.exe): the keys turn the
+    /// wheel, and `steering_neutral` and the self-centring bring it back, slower at speed -
+    /// by min(1, 1.5 e^(-0.1 v)), v in m/s (key handler 0x7e614c, frame 0x7d5124): all of
+    /// the pace up to 14.6 km/h, 0.37 of it at 50.
+    pub red_steer_spd: bool,
     pub lock_curvature: f32,
     /// OMSI's held brake (the default): let go, the brake stays where the key left it until
     /// the throttle key is pressed - tap the brake and it keeps that pressure. Off, the brake
@@ -92,6 +97,7 @@ impl KeyboardAxes {
             speed_kmh: self.speed_kmh,
             linear: self.linear,
             old_steering: self.old_steering,
+            red_steer_spd: self.red_steer_spd,
             lock_curvature: self.lock_curvature,
             pedal_hold: self.pedal_hold,
             centering: self.centering,
@@ -148,13 +154,20 @@ impl KeyboardAxes {
             let back = base * (0.25 + 0.75 * (v / 25.0).min(1.0));
             (back * 1.1, back)
         };
+        // `[redSteerSpd]`: the key's pace, and OMSI's return (the linear one), less at speed
+        let red = if self.red_steer_spd { (1.5 * (-0.1 * v / 3.6).exp()).min(1.0) } else { 1.0 };
+        let (rate, back) = (rate * red, if self.linear { back * red } else { back });
         if self.neutral_key {
             self.centering = true;
         }
         if self.left_key || self.right_key {
             self.centering = false;
         }
-        if self.left_key {
+        if self.left_key && self.right_key {
+            // Omsi.exe keeps the wheel where it is while both steering keys are held.
+            // Releasing either key immediately hands control to the direction still held.
+            self.steer_vel = 0.0;
+        } else if self.left_key {
             self.steering = (self.steering - rate * dt).max(-1.0);
             self.steer_vel = 0.0;
         } else if self.right_key {
@@ -165,7 +178,7 @@ impl KeyboardAxes {
             // to the middle at the pace the keys turn it in OMSI - 0.05 of curvature a second -
             // in a straight line, and stays there until a steering key is pressed; it used to
             // jump to the middle, a jerk of the whole bus at speed
-            let r = (0.05 / self.lock_curvature.max(0.01)).clamp(0.05, 5.0);
+            let r = (0.05 / self.lock_curvature.max(0.01)).clamp(0.05, 5.0) * red;
             let step = r * dt;
             self.steering -= self.steering.clamp(-step, step);
             self.steer_vel = 0.0;
@@ -210,6 +223,20 @@ mod tests {
             a.update(0.01);
         }
         assert!((a.steering - 0.25).abs() < 0.02, "it comes back at the same pace: {}", a.steering);
+    }
+
+    /// `[redSteerSpd]` with the steady pace: Omsi.exe's keys at speed (0x7e614c).
+    #[test]
+    fn red_steer_spd_slows_the_keys_at_speed() {
+        for (v, want) in [(50.0, 0.5 * 1.5 * (-0.1f32 * 50.0 / 3.6).exp()), (10.0, 0.5)] {
+            let mut a = KeyboardAxes { linear: true, red_steer_spd: true, lock_curvature: 0.1, speed_kmh: v, ..Default::default() };
+            a.right_key = true;
+            for _ in 0..100 {
+                a.update(0.01);
+            }
+            assert!((a.steering - want).abs() < 1e-3, "{v} km/h: {} against {want}", a.steering);
+        }
+        assert!((0.5 * 1.5 * (-0.1f32 * 50.0 / 3.6).exp() - 0.187).abs() < 1e-3);
     }
 
     /// Omsi.exe's keyboard pedals: the brake stays until the throttle key, the throttle
@@ -276,6 +303,56 @@ mod tests {
         a.right_key = false;
         a.update(0.5);
         assert!(a.steering > 0.5, "old steering stays: {}", a.steering);
+    }
+
+    /// Omsi.exe treats the two steering keys symmetrically: either one works alone,
+    /// both together hold the current wheel position, and releasing one immediately lets
+    /// the other continue steering.
+    #[test]
+    fn opposite_steering_keys_hold_then_resume_remaining_direction() {
+        let mut a = KeyboardAxes {
+            steering: 0.25,
+            ..Default::default()
+        };
+
+        a.left_key = true;
+        a.update(0.1);
+        let after_left = a.steering;
+        assert!(after_left < 0.25, "left alone must steer left: {after_left}");
+
+        a.right_key = true;
+        a.update(0.2);
+        assert!(
+            (a.steering - after_left).abs() < 1e-6,
+            "both keys must hold the wheel: {} -> {}",
+            after_left,
+            a.steering
+        );
+
+        a.left_key = false;
+        a.update(0.1);
+        let after_right_resume = a.steering;
+        assert!(
+            after_right_resume > after_left,
+            "releasing left while right remains held must steer right: {after_left} -> {after_right_resume}"
+        );
+
+        a.left_key = true;
+        a.update(0.2);
+        assert!(
+            (a.steering - after_right_resume).abs() < 1e-6,
+            "both keys must hold symmetrically: {} -> {}",
+            after_right_resume,
+            a.steering
+        );
+
+        a.right_key = false;
+        a.update(0.1);
+        assert!(
+            a.steering < after_right_resume,
+            "releasing right while left remains held must steer left: {after_right_resume} -> {}",
+            a.steering
+        );
     }
 
     #[test]

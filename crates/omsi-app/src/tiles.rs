@@ -14,7 +14,7 @@
 //!   thread, uploads what they produced a little each frame and unloads the far ones.
 
 use glam::{DVec2, DVec3, Mat4, Vec3};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use omsi_geometry::SplineCurve;
 use omsi_map::{tile_size, MapSpline, SplineAttachment, Tile};
 use rayon::prelude::*;
@@ -48,6 +48,10 @@ pub struct MapIndex {
     /// Every object and spline file the map names (as written, lower case), with the number
     /// of records naming it and one tile that does.
     pub files: HashMap<String, (usize, (i32, i32))>,
+    /// Crossing ids whose light program runs: placed `[trafficlight]` objects name them, or
+    /// a child of any kind names one of their lights (`names_traffic_light`), including
+    /// children on other tiles.
+    pub traffic_light_parents: HashSet<i64>,
     /// Tile → the world rectangle (x0, y0, x1, y1) its tile square and its splines (with
     /// room for their width) cover.
     pub covers: HashMap<(i32, i32), [f64; 4]>,
@@ -56,6 +60,16 @@ pub struct MapIndex {
     /// Object id → how many passengers get off at it, as Omsi.exe weighs a `[busstop]`'s
     /// strings (see [`stop_exit_weight`]); only objects that carry strings.
     pub stop_weights: HashMap<i64, f32>,
+    /// Object id → its `[busstop]`'s (pass_enter_max, pass_enter_min) (see
+    /// [`stop_enter`]); only objects that carry strings.
+    pub stop_enter: HashMap<i64, (f32, f32)>,
+    /// Object id → the side the stop's platform lies on (see [`stop_side`]): 0 = right of
+    /// the way the map lays the road (the side a bus stopping in its own lane keeps its
+    /// doors on), 1 = the other. Only objects that carry strings.
+    pub stop_side: HashMap<i64, f32>,
+    /// Object id → the stop's length (string 4, 30 m when not given; Omsi.exe's +0x7c,
+    /// sub_620058): how far along it the waiting places and a standing bus may be.
+    pub stop_length: HashMap<i64, f32>,
 }
 
 /// How many passengers get off at a bus stop, as Omsi.exe reads the stop object's strings
@@ -65,28 +79,121 @@ pub struct MapIndex {
 /// off among the stops ahead by these numbers (0x61baa8), so a stop with twice the number
 /// takes twice the riders; the stock maps put 10 on every stop.
 pub fn stop_exit_weight(strings: &[String]) -> f32 {
-    let num = |i: usize| strings.get(i).map(|s| s.trim()).filter(|s| !s.is_empty()).and_then(|s| s.replace(',', ".").parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v.round() as f32);
-    let max = num(1).unwrap_or(1.0);
-    let min = num(2).unwrap_or(0.0);
-    num(3).unwrap_or((min + max) / 2.0).max(0.0)
+    let (max, min) = stop_enter(strings);
+    stop_num(strings, 3).unwrap_or((min + max) / 2.0).max(0.0)
+}
+
+fn stop_num(strings: &[String], i: usize) -> Option<f32> {
+    strings.get(i).map(|s| s.trim()).filter(|s| !s.is_empty()).and_then(|s| s.replace(',', ".").parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v.round() as f32)
+}
+
+/// A bus stop's `pass_enter_max` (string 1, else 1) and `pass_enter_min` (string 2, else
+/// 0), rounded, as Omsi.exe sets the station up (0x620058): how many people wait there.
+pub fn stop_enter(strings: &[String]) -> (f32, f32) {
+    (stop_num(strings, 1).unwrap_or(1.0), stop_num(strings, 2).unwrap_or(0.0))
+}
+
+/// The side a bus stop's platform lies on, as Omsi.exe reads it off the stop object's
+/// *timetable data* strings: string 5 (0-based, after name and the entering/exiting
+/// numbers), 0 = the right of the way the map lays the road down, 1 = the other side.
+///
+/// AiList vehicles that carry doors on both sides (Urumqi61's `[AI]YoungMan*`) read it as
+/// `AI_Scheduled_AtStation_Side` and open only the platform's doors; without it a left-hand
+/// platform is served through the traffic, and the door lamps on that side stay dark.
+///
+/// Anything else (an empty string, rubbish) means the map says nothing, which OMSI takes
+/// as the right-hand side: 0. Stops whose strings are not timetable data at all (Spandau's
+/// `bss1\*.jpg` entry-point signs carry flag 7 too) land on the same default. A value past
+/// 1 (OMSI's door scripts test `= 1`, so their other branch covers everything else) is kept
+/// as it stands, up to the two a script that knows the sides can tell apart.
+pub fn stop_length(strings: &[String]) -> f32 {
+    strings.get(4).map(|s| s.trim()).filter(|s| !s.is_empty()).and_then(|s| s.replace(',', ".").parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v as f32).unwrap_or(30.0)
+}
+
+pub fn stop_side(strings: &[String]) -> f32 {
+    strings.get(5).map(|s| s.trim()).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 2.0) as f32).unwrap_or(0.0)
+}
+
+/// Does a child of a crossing name one of its lights? OMSI's `RefreshAmpelParenting`
+/// (0x77d460) switches a crossing's light program on for every object whose `[varparent]`
+/// is that crossing and whose first string is a light index (`StrToInt` >= 0) - whatever
+/// kind of object it is: it never asks for `[trafficlight]`. A mod's lamp without that
+/// keyword (a copy of a lamp with its own script) still runs its junction, and the lamp
+/// shows that light.
+pub fn names_traffic_light(strings: &[String]) -> bool {
+    strings.first().and_then(|s| s.trim().parse::<i64>().ok()).is_some_and(|i| i >= 0)
+}
+
+fn traffic_light_parents(tile: &Tile, mut is_signal: impl FnMut(&str) -> bool) -> HashSet<i64> {
+    light_children(tile)
+        .filter_map(|(file, _, parent)| is_signal(file).then_some(parent))
+        .collect()
+}
+
+/// Every child of another object in a tile: (file, strings, parent id).
+fn light_children(tile: &Tile) -> impl Iterator<Item = (&str, &[String], i64)> {
+    tile.objects.iter().chain(&tile.attach_objects)
+        .filter_map(|o| o.var_parent.or(o.parent_id).map(|parent| (o.file.as_str(), o.extra.as_slice(), parent)))
+        .chain(tile.spline_attachments.iter().filter_map(|a| a.var_parent.map(|parent| (a.file.as_str(), a.strings.as_slice(), parent))))
+}
+
+/// The parents a tile's children name a light of (`names_traffic_light`), whatever the
+/// children are: whether the parent is a crossing with a light program is settled once
+/// the whole map is read (it may stand on another tile).
+fn light_naming_parents(tile: &Tile) -> HashSet<i64> {
+    light_children(tile)
+        .filter_map(|(_, strings, parent)| names_traffic_light(strings).then_some(parent))
+        .collect()
 }
 
 impl MapIndex {
-    /// Read every tile file of the map (with the active chrono patches) - no meshes, no
-    /// object types, just the records. Spandau's 329 tiles take a fraction of a second on
-    /// the worker pool; a tile that cannot be read is logged and left out. `tiles` are
+    /// Read every tile file of the map (with the active chrono patches), without meshes.
+    /// Signal types are read only to identify installed traffic lights. The tiles are read
+    /// on the worker pool; a tile that cannot be read is logged and left out. `tiles` are
     /// (index in global.cfg's `[map]` list, x, y, file): repeaters and timetable tracks name
     /// a tile by that index, which a missing tile file must not shift.
-    pub fn build(tiles: &[(usize, i32, i32, PathBuf)], chrono_dirs: &[PathBuf]) -> MapIndex {
+    pub fn build(tiles: &[(usize, i32, i32, PathBuf)], chrono_dirs: &[PathBuf], root: &Path) -> MapIndex {
         /// What one tile adds besides its own index part: its rows (key, spline, start
         /// distance, interval) and its repeaters (master key, spline, first object index).
         type RowParts = (Vec<((usize, i64), i64, f64, f64)>, Vec<((usize, i64), i64, usize)>);
         let t0 = std::time::Instant::now();
-        let parts: Vec<Option<(MapIndex, RowParts)>> = tiles
+        let signal_types = parking_lot::Mutex::new(HashMap::new());
+        // (per tile: the parents its children name a light of, and its objects' files - the
+        // objects by id, the files once each - to tell afterwards which of those parents
+        // are crossings with a light program)
+        type LightParts = (HashSet<i64>, Vec<(i64, u32)>, Vec<String>);
+        let parts: Vec<Option<(MapIndex, RowParts, LightParts)>> = tiles
             .par_iter()
             .map(|(gi, tx, ty, path)| {
                 let tile = read_tile(path, chrono_dirs)?;
                 let mut part = MapIndex::default();
+                part.traffic_light_parents = traffic_light_parents(&tile, |file| {
+                    let key = file.replace('/', "\\").to_ascii_lowercase();
+                    *signal_types.lock().entry(key).or_insert_with(|| {
+                        let path = omsi_cfg::resolve_path(root, file);
+                        match omsi_scenery::SceneryObject::load(&path) {
+                            Ok(sco) => sco.is_traffic_light,
+                            Err(e) => {
+                                log::warn!("reading traffic light type: {e}");
+                                false
+                            }
+                        }
+                    })
+                });
+                let lights: LightParts = {
+                    let named = light_naming_parents(&tile);
+                    let mut names: Vec<String> = Vec::new();
+                    let mut by_name: HashMap<&str, u32> = HashMap::new();
+                    let mut ids = Vec::with_capacity(tile.objects.len());
+                    for o in &tile.objects {
+                        let k = *by_name.entry(o.file.as_str()).or_insert_with(|| {
+                            names.push(o.file.clone());
+                            names.len() as u32 - 1
+                        });
+                        ids.push((o.id, k));
+                    }
+                    (named, ids, names)
+                };
                 let mut rows: RowParts = Default::default();
                 for s in tile.splines.iter().filter(|s| !s.deleted) {
                     let map_chain_offset = if tile.version >= 11 || tile.version == 0 {
@@ -131,10 +238,16 @@ impl MapIndex {
                     part.objects.insert(o.id, ((*tx, *ty), DVec3::new(origin.x + o.pos[0], origin.y + o.pos[1], o.pos[2] + ground), o.rot));
                     if o.extra.len() >= 2 {
                         part.stop_weights.insert(o.id, stop_exit_weight(&o.extra));
+                        part.stop_enter.insert(o.id, stop_enter(&o.extra));
+                        part.stop_side.insert(o.id, stop_side(&o.extra));
+                        part.stop_length.insert(o.id, stop_length(&o.extra));
                     }
                 }
                 for a in tile.spline_attachments.iter().filter(|a| a.repeater.is_none() && a.strings.len() >= 2) {
                     part.stop_weights.insert(a.id, stop_exit_weight(&a.strings));
+                    part.stop_enter.insert(a.id, stop_enter(&a.strings));
+                    part.stop_side.insert(a.id, stop_side(&a.strings));
+                    part.stop_length.insert(a.id, stop_length(&a.strings));
                 }
                 // an object put on a spline (`[splineAttachement]`: an entry point or a stop
                 // on the road): where the row's first object stands on its own spline - enough
@@ -146,14 +259,33 @@ impl MapIndex {
                     part.objects.entry(a.id).or_insert(((*tx, *ty), first.pose.pos, [first.pose.heading(), 0.0, 0.0]));
                 }
                 part.tiles_read = 1;
-                Some((part, rows))
+                Some((part, rows, lights))
             })
             .collect();
         let mut index = MapIndex::default();
         let mut rows: RowParts = Default::default();
+        let named: HashSet<i64> = parts.iter().flatten().flat_map(|p| p.2 .0.iter().copied()).collect();
+        let mut programs: HashMap<String, bool> = HashMap::new();
+        for (_, ids, names) in parts.iter().flatten().map(|p| &p.2) {
+            for &(id, k) in ids {
+                if !named.contains(&id) || index.traffic_light_parents.contains(&id) {
+                    continue;
+                }
+                let file = &names[k as usize];
+                let key = file.replace('/', "\\").to_ascii_lowercase();
+                let has = *programs.entry(key).or_insert_with(|| {
+                    omsi_scenery::SceneryObject::load(&omsi_cfg::resolve_path(root, file))
+                        .map(|sco| !sco.traffic_lights.is_empty())
+                        .unwrap_or(false)
+                });
+                if has {
+                    index.traffic_light_parents.insert(id);
+                }
+            }
+        }
         for p in parts {
             match p {
-                Some((p, (r, q))) => {
+                Some((p, (r, q), _)) => {
                     index.splines.extend(p.splines);
                     for (id, v) in p.objects {
                         if let Some(prev) = index.objects.get(&id).filter(|prev| prev.0 != v.0) {
@@ -164,6 +296,10 @@ impl MapIndex {
                     }
                     index.covers.extend(p.covers);
                     index.stop_weights.extend(p.stop_weights);
+                    index.stop_enter.extend(p.stop_enter);
+                    index.stop_side.extend(p.stop_side);
+                    index.stop_length.extend(p.stop_length);
+                    index.traffic_light_parents.extend(p.traffic_light_parents);
                     for (f, (n, t)) in p.files {
                         index.files.entry(f).or_insert((0, t)).0 += n;
                     }
@@ -917,6 +1053,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn traffic_light_parents_follow_placed_signals_not_other_children() {
+        let object = |file: &str, parent| omsi_map::MapObject {
+            file: file.into(), var_parent: Some(parent), ..Default::default()
+        };
+        let tile = Tile {
+            objects: vec![object("signal.sco", 10), object("sign.sco", 20)],
+            attach_objects: vec![
+                omsi_map::MapObject { file: "signal.sco".into(), parent_id: Some(30), ..Default::default() },
+                omsi_map::MapObject { parent_id: Some(40), ..object("signal.sco", 50) },
+            ],
+            spline_attachments: vec![SplineAttachment {
+                file: "signal.sco".into(), var_parent: Some(60), ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(traffic_light_parents(&tile, |file| file == "signal.sco"), [10, 30, 50, 60].into_iter().collect());
+    }
+
+    #[test]
+    fn a_child_naming_a_light_counts_whatever_its_type() {
+        // (OMSI's RefreshAmpelParenting reads the light index, not the object's kind)
+        let object = |file: &str, parent, strings: &[&str]| omsi_map::MapObject {
+            file: file.into(),
+            var_parent: Some(parent),
+            extra: strings.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let tile = Tile {
+            objects: vec![
+                object("mod_lamp.sco", 10, &["2"]),
+                object("mod_lamp.sco", 20, &[" 0 "]),
+                object("display.sco", 30, &["", ""]),
+                object("sign.sco", 40, &["-1"]),
+                object("sign.sco", 50, &["Hbf"]),
+                object("sign.sco", 60, &[]),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(light_naming_parents(&tile), [10, 20].into_iter().collect());
+        assert!(traffic_light_parents(&tile, |_| false).is_empty());
+        assert!(names_traffic_light(&["3".into()]) && !names_traffic_light(&["x".into()]));
+    }
+
+    #[test]
+    fn a_junction_template_without_placed_signals_is_unsignalized() {
+        let tile = Tile {
+            objects: vec![omsi_map::MapObject { file: "junction.sco".into(), id: 10, ..Default::default() }],
+            ..Default::default()
+        };
+        assert!(traffic_light_parents(&tile, |_| false).is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires OMSI_ROOT with the stock Grundorf map"]
+    fn grundorf_traffic_light_parents_exclude_gaussdorf() {
+        let root = PathBuf::from(std::env::var_os("OMSI_ROOT").expect("OMSI_ROOT"));
+        let map_dir = root.join("maps/Grundorf");
+        let global = omsi_map::GlobalCfg::load(&map_dir.join("global.cfg")).expect("Grundorf");
+        let tiles = global.tiles.iter().map(|t| (t.index, t.x, t.y, map_dir.join(&t.file))).collect::<Vec<_>>();
+        let index = MapIndex::build(&tiles, &[], &root);
+        assert_eq!(index.tiles_failed, 0);
+        assert!(index.traffic_light_parents.contains(&4174), "the real signalized junction");
+        for id in [759, 761] {
+            assert!(!index.traffic_light_parents.contains(&id), "Gaussdorf junction {id} has no signals");
+        }
+    }
+
+    #[test]
     fn indexed_tile_search_matches_full_distance_scan() {
         let coords: Vec<(i32, i32)> = (-5..=5).flat_map(|x| (-5..=5).map(move |y| (x, y))).collect();
         let mut lookup: hashbrown::HashMap<(i32, i32), Vec<usize>> = hashbrown::HashMap::new();
@@ -1167,6 +1371,23 @@ mod tests {
         assert_eq!(v(&["A", "1", "0", "2.6"]), 3.0);
         assert_eq!(v(&["A", "1", "0", "-4"]), 0.0);
         assert_eq!(v(&["A", "1", "0", "x"]), 0.5);
+    }
+
+    #[test]
+    fn stop_side_as_omsi_reads_it() {
+        let v = |a: &[&str]| stop_side(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // Urumqi61's shape: name, enter max, enter min, exit, ?, side, "", ""
+        assert_eq!(v(&["NianZiGou", "10", "0", "", "80", "1", "", ""]), 1.0);
+        assert_eq!(v(&["RenMinGuangChang", "50", "20", "100", "80", "0", "", ""]), 0.0);
+        // both sides
+        assert_eq!(v(&["A", "10", "0", "", "30", "2", "", ""]), 2.0);
+        // nothing said / rubbish / a short block: the right-hand side, as OMSI's default
+        assert_eq!(v(&["A", "10", "0", "", "30"]), 0.0);
+        assert_eq!(v(&["A", "10", "0", "", "30", "", "", ""]), 0.0);
+        assert_eq!(v(&["bss1\\11.jpg", "bss1\\6.jpg", "", "", "", "", "", ""]), 0.0);
+        assert_eq!(v(&["A", "10", "0", "", "30", "x", "", ""]), 0.0);
+        // a value out of range is clamped, not trusted into a side that does not exist
+        assert_eq!(v(&["A", "10", "0", "", "30", "80", "", ""]), 2.0);
     }
 
     #[test]

@@ -36,14 +36,17 @@ pub(crate) fn run_offscreen(
     // (a player who joins another's game draws the host's traffic in it, whatever their own
     // count says: without it the host's cars had nowhere to go - "passengers, but no
     // traffic" on a server)
-    let mut traffic = if args.traffic > 0 || args.schedule || crate::rail_drive::args_rail(args) || args.lan_join.is_some() {
+    // (and without traffic it still runs the light programs and switches the lamps)
+    let mut traffic = {
         let mut t = traffic::Traffic::new(&args.root, &world, args.traffic)?;
+        t.lights_only = !(args.traffic > 0 || args.schedule || crate::rail_drive::args_rail(args) || args.lan_join.is_some());
         if let Some(seed) = lan_seed {
             t.set_lan_seed(seed);
         }
+        if args.traffic > 0 {
+            t.precache_random(&world, &renderer, &mut scene);
+        }
         Some(t)
-    } else {
-        None
     };
     let mut schedule = if args.schedule {
         Some(schedule::Schedule::new(
@@ -98,6 +101,14 @@ pub(crate) fn run_offscreen(
                     d.start_at(k, args.duty_first_stop);
                 }
                 d.update(&mut p.vehicle, parse_time(&args.time));
+                let mut fonts = world.fonts.lock();
+                if let Err(e) = crate::schedule_paper::update_vehicle(
+                    &mut p.vehicle,
+                    &d,
+                    &mut fonts,
+                ) {
+                    log::warn!("driver timetable paper: {e:#}");
+                }
                 log::info!(
                     "duty: line {} tour {} trip {} next stop {} ({}) delay {:.0} s, stops {:?}",
                     d.line,
@@ -131,6 +142,11 @@ pub(crate) fn run_offscreen(
             }
         }
     }
+    if let Some(p) = player.as_mut() {
+        let active = if duty.is_some() { 1.0 } else { 0.0 };
+        p.vehicle.host.schedule_active = active;
+        p.vehicle.set_var("schedule_active", active);
+    }
     let mut career = args
         .driver
         .as_deref()
@@ -152,11 +168,14 @@ pub(crate) fn run_offscreen(
                 h.money = Some(money::Money::new(&args.root, &world.global.money_system));
             }
         }
+        // (with the passengers setting, as in the window)
         h.density = world
             .global
-            .passenger_density((parse_time(&args.time) / 3600.0) as f32);
+            .passenger_density((parse_time(&args.time) / 3600.0) as f32)
+            * settings.pax_density;
         h.time_of_day = parse_time(&args.time);
         h.stop_targets = schedule.as_ref().map(|s| s.stop_targets());
+        h.stop_names = schedule.as_ref().map(|s| s.stop_names());
         h.populate(&world, &renderer, &mut scene, center);
         if let Some(p) = player.as_ref() {
             if args.riders > 0 {
@@ -178,7 +197,7 @@ pub(crate) fn run_offscreen(
     let mut service_seconds = 0.0f64;
     let daylight0 = omsi_sim::Daylight::compute(&start_clock(args), envir.as_ref());
     if let Some(p) = player.as_mut() {
-        p.vehicle.set_var("Envir_Brightness", daylight0.brightness);
+        p.vehicle.set_var("Envir_Brightness", daylight0.envir_brightness(world.light_map_light_at(p.vehicle.position)));
         let mut clock = p.vehicle.host.clock.clone();
         let was = clock.time;
         let at_station = at_petrol_station(&world, &p.vehicle);
@@ -259,13 +278,14 @@ pub(crate) fn run_offscreen(
     }
     if let Some(t) = traffic.as_mut() {
         t.day_time = parse_time(&args.time);
-        t.night = omsi_sim::Daylight::compute(
+        let daylight = omsi_sim::Daylight::compute(
             &start_clock(args),
             omsi_content::Envir::load(&args.root.join("envir.cfg"))
                 .ok()
                 .as_ref(),
-        )
-        .lamps_on;
+        );
+        t.night = daylight.brightness < 0.75;
+        t.daylight = Some(daylight);
         t.populate(&world, &renderer, &mut scene, center);
     }
     // OMSI_GROUND_SAMPLE=<csv>: what the wheels stand on every metre along the street lanes
@@ -320,13 +340,24 @@ pub(crate) fn run_offscreen(
             args,
             &world,
             traffic.as_ref().map(|t| &t.net),
-                        lan::WELCOME_WAIT,
-                    );
+            lan::WELCOME_WAIT,
+        );
     }
     let run_clock = start_clock(args);
     // a dedicated server's administration and clock (see `admin`)
     let mut srv_admin = crate::admin::ServerAdmin::default();
     let mut srv_clock = 0.0f64;
+    // the METAR sync of a dedicated server: the report is downloaded in the background (at
+    // once, then every ten minutes) and its values are told to the players
+    let srv_metar: Option<String> = if server { crate::server::SERVER_METAR.get().cloned().flatten() } else { None };
+    let mut srv_metar_due = std::time::Instant::now();
+    let mut srv_metar_rx: Option<std::sync::mpsc::Receiver<Option<omsi_content::weather::Weather>>> = None;
+    // (the weather's name on the status page)
+    let mut srv_weather_name = if weather.path.to_string_lossy().starts_with("metar:") {
+        weather.name.clone()
+    } else {
+        weather.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+    };
     if let (true, Some((pw, speed))) = (server, crate::server::SERVER_ADMIN.get()) {
         srv_admin.password = pw.clone();
         if let Some(l) = lan_off.as_mut() {
@@ -337,18 +368,82 @@ pub(crate) fn run_offscreen(
         let t_s = i as f32 * dt;
         if server {
             srv_clock += dt as f64 * lan_off.as_ref().map(|l| l.clock_speed).unwrap_or(1.0);
+            // a server on the real time (server.cfg): its clock reads this machine's
+            if i % 30 == 0 && crate::real_time::server_real() {
+                if let Some(n) = crate::real_time::now() {
+                    let have = (parse_time(&args.time) + srv_clock + srv_admin.shift).rem_euclid(86400.0);
+                    let off = (n.secs - have + 43_200.0).rem_euclid(86_400.0) - 43_200.0;
+                    if off.abs() > 0.5 {
+                        srv_admin.shift += off;
+                    }
+                }
+            }
+            if let (Some(icao), Some(l)) = (srv_metar.as_ref(), lan_off.as_mut()) {
+                if srv_metar_rx.is_some() {
+                    let got = srv_metar_rx.as_ref().map(|rx| rx.try_recv());
+                    match got {
+                        Some(Ok(report)) => {
+                            srv_metar_rx = None;
+                            // (a failed download is tried again in a minute)
+                            let wait = if report.is_some() { 600 } else { 60 };
+                            srv_metar_due = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+                            if let Some(w) = report {
+                                if let Some(wire) = crate::weather_setup::report_wire(&w) {
+                                    if wire != l.weather() {
+                                        log::info!("server: weather now the METAR report of {icao}: {wire}");
+                                        l.set_weather(&wire);
+                                    }
+                                    srv_weather_name = w.name.clone();
+                                }
+                            }
+                        }
+                        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                            srv_metar_rx = None;
+                            srv_metar_due = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                        }
+                        _ => {}
+                    }
+                } else if std::time::Instant::now() >= srv_metar_due {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    srv_metar_rx = Some(rx);
+                    let icao = icao.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(crate::weather_setup::try_metar(&icao));
+                    });
+                }
+            }
             if let Some(l) = lan_off.as_mut() {
                 let positions = |id: u32| remotes_off.remotes.get(&id).map(|r| (r.vehicle().position, r.vehicle().heading));
                 srv_admin.prune(l);
                 for (from, text) in l.take_commands() {
                     crate::admin::server_command(l, from, &text, &mut srv_admin, &positions);
                 }
+                // a tool on this machine (POST /admin, checked by the gateway): an admin of its own
+                for text in crate::lan::take_local_admin() {
+                    srv_admin.admins.insert(crate::admin::LOCAL_ADMIN);
+                    crate::admin::server_command(l, crate::admin::LOCAL_ADMIN, &format!("admin {text}"), &mut srv_admin, &positions);
+                }
                 // an admin set the time of day: the shift that makes the clock read it
                 if let Some(want) = srv_admin.set_clock.take() {
                     let now = (parse_time(&args.time) + srv_clock + srv_admin.shift).rem_euclid(86400.0);
                     srv_admin.shift += (want - now + 43_200.0).rem_euclid(86_400.0) - 43_200.0;
                 }
-                if std::mem::take(&mut srv_admin.next_weather) {
+                if let Some(want) = srv_admin.set_weather.take() {
+                    // only an installed weather (the name came over the network)
+                    let found = omsi_cfg::read_dir_merged("Weather")
+                        .into_iter()
+                        .filter_map(|p| p.file_name().map(|n| format!("Weather/{}", n.to_string_lossy())))
+                        .find(|f| f.eq_ignore_ascii_case(&want));
+                    match found {
+                        Some(f) => {
+                            log::info!("server: weather now {f}");
+                            l.set_weather(&f);
+                        }
+                        None => log::info!("server: weather {want} is not installed"),
+                    }
+                }
+                // (the weather follows the METAR report: no next weather for the admins)
+                if std::mem::take(&mut srv_admin.next_weather) && srv_metar.is_none() {
                     let mut files: Vec<String> = omsi_cfg::read_dir_merged("Weather")
                         .into_iter()
                         .filter(|p| p.extension().map(|e| e.eq_ignore_ascii_case("owt")).unwrap_or(false))
@@ -370,7 +465,7 @@ pub(crate) fn run_offscreen(
             }
             if i % 30 == 0 {
                 if let Some(l) = lan_off.as_ref() {
-                    crate::server::tick_status(l, parse_time(&args.time) + srv_clock + srv_admin.shift, weather.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default().as_str());
+                    crate::server::tick_status(l, parse_time(&args.time) + srv_clock + srv_admin.shift, srv_weather_name.as_str());
                 }
             }
             if lan_off.is_none() {
@@ -385,10 +480,10 @@ pub(crate) fn run_offscreen(
                 Some(c) => c,
                 None => match player.as_ref() {
                     Some(p)
-                        if args.cam.is_none() && args.view != "free" && args.follow.is_none() =>
-                    {
-                        p.camera(&args.view, &camera)
-                    }
+                    if args.cam.is_none() && args.view != "free" && args.follow.is_none() =>
+                        {
+                            p.camera(&args.view, &camera)
+                        }
                     _ => Camera {
                         position: camera.position,
                         yaw: camera.yaw,
@@ -435,7 +530,7 @@ pub(crate) fn run_offscreen(
                     let lighting = weather_lighting(
                         &daylight,
                         &weather,
-                        run_clock.time,
+                        cloud_drift_at(&weather, run_clock.time),
                         0.0,
                         settings.shadows,
                     );
@@ -489,7 +584,7 @@ pub(crate) fn run_offscreen(
             t.others = lan_outlines(&remotes_off);
             t.others.extend(own_outlines(player.as_ref(), &[]));
             t.player_priority = player.as_ref().and_then(|p| p.vehicle.var("TrafficPriority")).is_some_and(|v| v > 0.5);
-                        t.tick(dt, player.as_ref().map(|p| player_outline(p)));
+            t.tick(dt, player.as_ref().map(|p| player_outline(p)));
             world.set_switches(&t.switch_requests());
             world.set_signals(&t.signal_aspects(&world.signal_routes, None));
             if let Some(p) = player.as_mut() {
@@ -500,7 +595,10 @@ pub(crate) fn run_offscreen(
             player.tick_startup(dt);
             if let Some(d) = duty.as_mut() {
                 if let Some(stop) = player.html_next_stop.take() {
-                    d.skip_to(stop);
+                    if d.skip_to(stop) {
+                        let (trip, k) = d.trip_for_ibis();
+                        player.ibis_to_stop(trip, k);
+                    }
                 }
                 if let Some((arrival, departure)) =
                     d.update(&mut player.vehicle, parse_time(&args.time) + t_s as f64)
@@ -510,6 +608,14 @@ pub(crate) fn run_offscreen(
                 if d.take_trip_change() && player.duty_typed {
                     let (trip, stop) = d.trip_for_ibis();
                     player.set_duty_destination(trip, stop);
+                }
+                let mut fonts = world.fonts.lock();
+                if let Err(e) = crate::schedule_paper::update_vehicle(
+                    &mut player.vehicle,
+                    d,
+                    &mut fonts,
+                ) {
+                    log::warn!("driver timetable paper: {e:#}");
                 }
             }
             career.tick(
@@ -725,7 +831,7 @@ pub(crate) fn run_offscreen(
                 // what the window's HUD would say about a bus that does not move
                 // (once per reason: the numbers in a line change all the time)
                 if i % 30 == 0 {
-                    let why = standing_reasons(&player.vehicle);
+                    let why = standing_reasons(&player.vehicle, &|a| crate::diagnostics::rebound_key(&player.bindings, a));
                     let key = |l: &String| l.split('(').next().unwrap_or_default().to_string();
                     for line in why
                         .iter()
@@ -782,6 +888,33 @@ pub(crate) fn run_offscreen(
             }
         }
         if let Some(h) = humans_off.as_mut() {
+            // keep density and time_of_day up to date every tick, as app_events.rs does
+            // (stop_target = enter_mean * density; without this it stays at the startup
+            // value and the new formula returns 0 for the whole session when the map has
+            // a low hourly density at the start time)
+            h.density = world
+                .global
+                .passenger_density((run_clock.time / 3600.0) as f32)
+                * settings.pax_density;
+            h.time_of_day = run_clock.time;
+            // populate stops near every LAN player every 2 seconds, as app_events.rs
+            // does every 2 s near the local player.  At startup `center` is ZERO (no
+            // player bus on a headless server), so stops on the actual map – which can
+            // be thousands of metres away – fall outside the 600 m filter in
+            // `populate_with` and are never seeded without this loop.
+            if i % 60 == 0 {
+                let player_centers: Vec<glam::DVec3> = remotes_off
+                    .remotes
+                    .values()
+                    .map(|r| r.vehicle().position)
+                    .chain(player.as_ref().map(|p| p.vehicle.position))
+                    .collect();
+                for c in &player_centers {
+                    h.populate(&world, &renderer, &mut scene, *c);
+                }
+                // also update which stops the LAN players are near
+                h.lan_centers = player_centers;
+            }
             // what the passengers must not be seen appearing in front of
             let followed = traffic
                 .as_ref()
@@ -827,6 +960,8 @@ pub(crate) fn run_offscreen(
                 }
             }
             if let Some(t) = traffic.as_mut() {
+                let (alighting, waiting) = h.stop_wishes();
+                t.set_stop_wishes(alighting, waiting);
                 for (id, secs) in h.take_holds() {
                     t.hold_boarding(id, secs);
                 }
@@ -867,8 +1002,7 @@ pub(crate) fn run_offscreen(
             }
             if std::mem::take(&mut h.stop_request) {
                 if let Some(p) = player.as_mut() {
-                    p.vehicle.trigger("door_haltewunsch");
-                    p.vehicle.trigger("door_haltewunsch_off");
+                    p.vehicle.trigger("int_haltewunsch");
                 }
             }
         }
@@ -1002,7 +1136,7 @@ pub(crate) fn run_offscreen(
                 let mut lighting = weather_lighting(
                     &daylight,
                     &weather,
-                    snap_clock.time,
+                    cloud_drift_at(&weather, snap_clock.time),
                     if rate > 0.0 {
                         (0.4 + rate).min(1.0)
                     } else {
@@ -1017,6 +1151,11 @@ pub(crate) fn run_offscreen(
                         .bounding_box
                         .map(|bb| (p.vehicle.position, p.vehicle.heading, bb))
                 });
+                let puddle_surface = lighting.inside.and_then(|(o, _, _)| world.puddle_surface(o));
+                lighting.puddle_ground = puddle_surface.map(|(h, _)| h);
+                lighting.puddle_normal = puddle_surface.map_or(glam::Vec3::Z, |(_, n)| n);
+                lighting.puddle_parts = player.as_ref().into_iter().flat_map(|p| &p.vehicle.trailers)
+                    .filter_map(|t| t.ty.def.bounding_box.map(|bb| (t.position, t.heading, bb))).take(3).collect();
                 lighting.detail = settings.detail_textures;
                 world.finish_texture_upgrades(&renderer, &mut scene);
                 let pixels = renderer.render_to_image(&mut scene, w, h, &cam, &lighting)?;
@@ -1521,7 +1660,7 @@ pub(crate) fn run_offscreen(
                     let run = |v: &mut omsi_sim::VehicleInstance,
                                name: Option<&str>,
                                d: (f32, f32)|
-                     -> (bool, Vec<f32>, Vec<f32>, Vec<String>) {
+                               -> (bool, Vec<f32>, Vec<f32>, Vec<String>) {
                         restore(v);
                         v.host.fired_triggers.clear();
                         v.host.fired_file_triggers.clear();
@@ -1573,7 +1712,7 @@ pub(crate) fn run_offscreen(
                                 .filter(|&k| {
                                     !noisy[k]
                                         && (differs(after[k], idle[k])
-                                            || differs(held[k], idle_held[k]))
+                                        || differs(held[k], idle_held[k]))
                                 })
                                 .collect();
                             played = sounds
@@ -1646,6 +1785,9 @@ pub(crate) fn run_offscreen(
             }
         }
         vehicle_camera(&player, &mut camera);
+        // the driver at the wheel, as the window has him every frame (not posed, he was
+        // not drawn - or stood in the aisle in the file's T-pose)
+        player.sync_driver(&renderer, &mut scene, 1.0 / 30.0, settings.driver, args.view == "driver");
         player_ref = Some(player);
     }
     if let Some(mut h) = humans_off.take() {
@@ -2207,7 +2349,7 @@ pub(crate) fn run_offscreen(
     {
         wetness = v;
     }
-    let mut lighting = weather_lighting(&daylight, &weather, clock.time, wetness, settings.shadows);
+    let mut lighting = weather_lighting(&daylight, &weather, cloud_drift_at(&weather, clock.time), wetness, settings.shadows);
     // the player's vehicle has moved into `player_ref` by now (after --drive): without
     // this the offscreen picture had no cab box, unlike the window
     lighting.inside = player_ref.as_ref().or(player.as_ref()).and_then(|p| {
@@ -2217,6 +2359,11 @@ pub(crate) fn run_offscreen(
             .bounding_box
             .map(|bb| (p.vehicle.position, p.vehicle.heading, bb))
     });
+    let puddle_surface = lighting.inside.and_then(|(o, _, _)| world.puddle_surface(o));
+    lighting.puddle_ground = puddle_surface.map(|(h, _)| h);
+    lighting.puddle_normal = puddle_surface.map_or(glam::Vec3::Z, |(_, n)| n);
+    lighting.puddle_parts = player_ref.as_ref().or(player.as_ref()).into_iter().flat_map(|p| &p.vehicle.trailers)
+        .filter_map(|t| t.ty.def.bounding_box.map(|bb| (t.position, t.heading, bb))).take(3).collect();
     lighting.detail = settings.detail_textures;
     lighting.glass_wind = player_ref.as_ref().or(player.as_ref()).map(|p| crate::lights::vehicle_velocity(&p.vehicle)).unwrap_or_default();
     // OMSI_GLASS_WIND=<m/s>: the rain on the glass as the bus would meet it at that speed
@@ -2254,7 +2401,7 @@ pub(crate) fn run_offscreen(
                 &mut scene,
                 dt,
                 camera.position,
-                daylight.lamps_on,
+                daylight.brightness,
                 &phase,
                 None,
                 false,
@@ -2291,7 +2438,7 @@ pub(crate) fn run_offscreen(
                 camera.position,
                 Vec3::ZERO,
                 &mut scene,
-                &lighting.inside.into_iter().collect::<Vec<_>>(),
+                &player_ref.as_ref().or(player.as_ref()).map(|p| rain::vehicle_boxes(&p.vehicle)).unwrap_or_default(),
             );
         }
         // a moving player's wheels through the puddles the enhanced renderer paints on wet
@@ -2386,8 +2533,9 @@ pub(crate) fn run_offscreen(
         hud.update(&renderer, &mut scene, &lines);
         // the navigator, as the window shows it (its camera settled first)
         if settings.navigator {
-            let mut nav = navigator::Navigator::new(true, settings.navigator_opacity, &settings.navigator_corner);
+            let mut nav = navigator::Navigator::new(true, settings.ui_opacity, &settings.navigator_corner);
             nav.schedule = omsi_cfg::env::var_os("OMSI_NAV_SCHEDULE").is_some();
+            nav.show_ai = settings.nav_ai;
             if omsi_cfg::env::var_os("OMSI_NAV_MAP").is_some() {
                 nav.toggle_map();
             }
@@ -2401,20 +2549,26 @@ pub(crate) fn run_offscreen(
                 let g = nav.global_version + (1 << 40);
                 nav.set_route(&key, lanes, true, g);
             }
+            let (outside_temp, inside_temp) = crate::app_events::vehicle_temperatures(p);
             let frame = navigator::NavFrame {
                 traffic: traffic.as_ref(),
                 bus: p.vehicle.position,
                 heading: p.vehicle.heading,
                 speed_kmh: p.vehicle.physics.velocity_kmh(),
+                outside_temp,
+                inside_temp,
                 line,
                 terminus,
                 stops,
                 delay: duty.as_ref().map(|_| p.vehicle.host.tt_delay as f64),
                 passengers: humans_off.as_ref().map(|h| h.riding()),
+                stop_requested: navigator::stop_requested(&p.vehicle),
                 time: clock.time,
                 weekday: clock.weekday(),
                 language: &settings.language,
                 screen: (w as f32, h as f32),
+                ui_scale: settings.ui_scale,
+                follow_window: settings.ui_scale_window,
                 dt: 0.1,
             };
             for _ in 0..30 {
@@ -2692,10 +2846,10 @@ fn vehicle_camera(player: &Player, camera: &mut Camera) {
     if v.len() >= 5 {
         camera.position = player.vehicle.position
             + player
-                .vehicle
-                .body_rotation()
-                .transform_point3(Vec3::new(v[0], v[1], v[2]))
-                .as_dvec3();
+            .vehicle
+            .body_rotation()
+            .transform_point3(Vec3::new(v[0], v[1], v[2]))
+            .as_dvec3();
         camera.yaw = player.vehicle.heading as f32 + v[3];
         camera.pitch = v[4];
         camera.near = 0.02;

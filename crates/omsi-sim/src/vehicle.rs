@@ -800,6 +800,12 @@ pub struct AiFrame {
     /// shut); 0 = not at a stop (a script still closing its doors is told -1 until it
     /// answers, see `VehicleInstance::station_released`).
     pub at_station: i32,
+    /// `AI_Scheduled_AtStation_Side`: which side's doors a bus standing at its stop opens -
+    /// 0 = the side the map lays its road on, 1 = the other, 2 = both. AiList vehicles whose
+    /// model has doors on both sides read it (Urumqi61's `[AI]YoungMan*`: the BRT platforms
+    /// lie left, the ordinary stops right) and a script without the variable opens the right
+    /// side, which is OMSI's default too. 0 when the vehicle is not at a stop.
+    pub at_station_side: f32,
     /// `TrafficPriorityWarningNeeded`: a vehicle with right of way (`TrafficPriority`) has
     /// something in its way that is to be warned - the stock ambulance's script sounds its
     /// siren for the next 30 m on it.
@@ -951,6 +957,14 @@ impl VehicleInstance {
             })
             .collect();
         host.number_var = program.str_var("number");
+        // The vehicle dialog has already chosen these. They must exist before {init}: many
+        // mods branch on the fleet number to choose equipment, textures or script state.
+        if let (Some(i), Some(number)) = (program.str_var("number"), host.initial_number.as_ref()) {
+            state.str_vars[i as usize] = number.clone();
+        }
+        if let (Some(i), Some(ident)) = (program.str_var("ident"), host.initial_ident.as_ref()) {
+            state.str_vars[i as usize] = ident.clone();
+        }
         // defaults every bus expects before {init}
         let mut var_index = HashMap::new();
         for (i, n) in program.var_names.iter().enumerate() {
@@ -1681,9 +1695,15 @@ impl VehicleInstance {
             .map(|w| w.rpm)
             .unwrap_or(0.0);
         self.put(self.v_n_wheel, n_wheel);
-        self.put(self.v_accel[0], rb.accel_body.x);
-        self.put(self.v_accel[1], rb.accel_body.y);
-        self.put(self.v_accel[2], rb.accel_body.z);
+        // `A_Trans_*` as Omsi.exe has them (0x7d5124): the change of the body's velocity
+        // over the frame, turned into the body frame - its acceleration, not what an
+        // accelerometer reads, so 0 standing or cruising. `accel_body` carries gravity's
+        // 9.81 m/s² (the wheels' springs need it), which as `A_Trans_Z` kept checks such
+        // as the NEOMAN ECAS's "|A_Trans_Z| < 3 while driving" from ever passing.
+        let a = scripts_acceleration(rb.accel_body, rb.orientation);
+        self.put(self.v_accel[0], a.x);
+        self.put(self.v_accel[1], a.y);
+        self.put(self.v_accel[2], a.z);
         for (ai, axle) in self.v_wheels.clone().iter().enumerate() {
             for (si, w) in axle.iter().enumerate() {
                 if let Some(rw) = rb.wheels.get(ai * 2 + si) {
@@ -1716,10 +1736,20 @@ impl VehicleInstance {
         self.rigid = Some(rb);
     }
 
+    /// Where variable `name` sits among the script's variables (`State::vars`).
+    pub fn var_slot(&self, name: &str) -> Option<usize> {
+        self.var_index.get(&name.to_ascii_lowercase()).map(|&i| i as usize)
+    }
+
     pub fn var(&self, name: &str) -> Option<f32> {
         self.var_index
             .get(&name.to_ascii_lowercase())
             .map(|&i| self.state.vars[i as usize])
+    }
+
+    /// Whether variable `name` was declared in the vehicle's script set (as opposed to built-in host variables).
+    pub fn has_script_var(&self, name: &str) -> bool {
+        self.ty.program.has_script_var(name)
     }
 
     /// The name of script variable `index` (lower case), for diagnostics and key helpers.
@@ -1755,6 +1785,27 @@ impl VehicleInstance {
         let p = self.ty.program.clone();
         self.vm
             .run_trigger(&p, name, &mut self.state, &mut self.host)
+    }
+
+    /// The script variables as `names` would leave them, run one after another, with the
+    /// vehicle left exactly as it was: its variables, the machine's random numbers, the
+    /// sounds and messages the triggers asked for.
+    pub fn trial_triggers(&mut self, names: &[&str]) -> Vec<f32> {
+        let (state, vm) = (self.state.clone(), self.vm.clone());
+        let (fired, fired_files, messages, time_written) = (self.host.fired_triggers.len(), self.host.fired_file_triggers.len(), self.host.messages.clone(), self.host.time_written);
+        let fired_vars = self.host.fired_trigger_vars.len();
+        for n in names {
+            self.trigger(n);
+        }
+        let out = self.state.vars.clone();
+        self.state = state;
+        self.vm = vm;
+        self.host.fired_triggers.truncate(fired);
+        self.host.fired_trigger_vars.truncate(fired_vars);
+        self.host.fired_file_triggers.truncate(fired_files);
+        self.host.messages = messages;
+        self.host.time_written = time_written;
+        out
     }
 
     /// Dirt and spray. OMSI writes three engine variables every frame and the bus scripts
@@ -1811,18 +1862,18 @@ impl VehicleInstance {
         self.update_driver_seat(dt);
         // `[kmcounter_init] year km`: in service since that year, so many kilometres a year -
         // the odometer starts at what that comes to on the day driven (it stood at 0 on
-        // every bus that has one, #305), a little different from bus to bus of the kind
+        // every bus that has one, #305), a little different from bus to bus of the kind.
+        // Omsi.exe 0x7d18e8: Random(100)/10 + 8 + max(0, years) * km * (1 + 0.2 *
+        // (Random(100) - 50) / 50), and 1980 / 60000 km a year without the keyword
+        // (TRoadVehicle.LoadFromFile's defaults).
         if !self.km_started {
             self.km_started = true;
-            if let (Some((year, per_year)), true) = (self.ty.def.km_counter_init, self.host.km_base == 0.0) {
-                // (a map whose day lies before the bus was built: the part of this year)
-                let part = self.host.clock.day_of_year as f64 / 365.0;
-                let years = ((self.host.clock.year - year) as f64 + part).max(part);
-                if years > 0.0 && per_year > 0.0 {
-                    let seed = (std::ptr::addr_of!(self.host) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40;
-                    let spread = 0.85 + 0.3 * (seed % 1000) as f64 / 1000.0;
-                    self.host.km_base = years * per_year as f64 * spread;
-                }
+            if self.host.km_base == 0.0 {
+                let (year, per_year) = self.ty.def.km_counter_init.unwrap_or((1980, 60000.0));
+                let years = ((self.host.clock.year - year) as f64 + self.host.clock.day_of_year as f64 / 365.0).max(0.0);
+                let seed = (std::ptr::addr_of!(self.host) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40;
+                let (r1, r2) = ((seed % 100) as f64, ((seed / 100) % 100) as f64);
+                self.host.km_base = r1 / 10.0 + 8.0 + years * per_year as f64 * (1.0 + 0.2 * (r2 - 50.0) / 50.0);
             }
         }
         // (the sum is split, not the parts: 0.7 km + 0.5 km is 1 km 200 m, not 0 km 1200 m)
@@ -1957,29 +2008,6 @@ impl VehicleInstance {
             .fold(0.0, f32::max)
     }
 
-    /// The saloon lamps' light at a point of the model frame (0..1): each lit
-    /// `[interiorlight]` as the Direct3D point light OMSI makes of it (full within its
-    /// range, falling with the square of the distance beyond), summed and saturated. Unlike
-    /// [`Self::interior_light`] a lamp at the far end of the saloon hardly reaches the point,
-    /// and a lamp that is off gives nothing.
-    pub fn interior_light_at(&self, p: Vec3) -> f32 {
-        self.ty
-            .model
-            .interior_lights
-            .iter()
-            .map(|il| {
-                let on = il.variable.trim().parse::<f32>().ok().or_else(|| self.var(&il.variable)).unwrap_or(0.0).clamp(0.0, 1.0);
-                if on <= 0.0 {
-                    return 0.0;
-                }
-                let core = il.range.max(0.05);
-                let d2 = (Vec3::from(il.pos) - p).length_squared().max(1e-4);
-                on * (core * core / d2).min(1.0)
-            })
-            .sum::<f32>()
-            .min(1.0)
-    }
-
     /// Run one simulation frame: physics, scripts, then animations.
     pub fn update(&mut self, dt: f32) {
         self.host.clock.advance(dt);
@@ -1992,7 +2020,8 @@ impl VehicleInstance {
             self.host.coll_energy = 0.0;
         }
         self.update_dirt(dt);
-        self.driven_km += (self.physics.velocity_kmh().abs() as f64 / 3600.0) * dt as f64;
+        // (signed, as Omsi.exe 0x7e5163 adds it: reversing takes it back)
+        self.driven_km += (self.physics.velocity_kmh() as f64 / 3600.0) * dt as f64;
         self.update_engine_vars(dt);
         let p = self.ty.program.clone();
         self.vm.run_frame(&p, &mut self.state, &mut self.host);
@@ -2154,6 +2183,11 @@ impl VehicleInstance {
             ("AI_Interiorlight", ai.lights as i32 as f32),
             ("AI_Engine", 1.0),
             ("AI_Scheduled_AtStation", station),
+            // Which side's doors: OMSI hands the stop's side to the script, and a vehicle
+            // with doors on both sides opens only the platform's (the BRT stops in
+            // Urumqi61 lie left, the ordinary ones right). Off a stop it is 0 (OMSI's
+            // default), so a script that reads it there does the same as ever.
+            ("AI_Scheduled_AtStation_Side", ai.at_station_side),
             ("TrafficPriorityWarningNeeded", ai.priority_warning as i32 as f32),
         ] {
             self.set_var(name, v);
@@ -2626,7 +2660,8 @@ pub fn compute_mesh_props(ty: &VehicleType, var: &dyn Fn(&str) -> Option<f32>) -
                             .parse::<f32>()
                             .ok()
                             .or_else(|| var(v))
-                            .unwrap_or(0.0);
+                            // (a variable the bus does not have: always on, see below)
+                            .unwrap_or(1.0);
                         props.slot_light[slot] = props.slot_light[slot].max(if x >= 0.5 { 1.0 } else { 0.0 });
                     }
                 }
@@ -2707,7 +2742,7 @@ impl PropSource {
 #[derive(Debug, Clone, Default)]
 struct MeshPlan {
     slots: usize,
-    /// `[matl_change]` (default 1) and `[matl_lightmap]` (default 0) per slot.
+    /// `[matl_change]` (default 1) and `[matl_lightmap]` (default 1: a variable the bus does not have is on) per slot.
     night: Vec<(usize, PropSource)>,
     light: Vec<(usize, PropSource)>,
     /// `[visible]` variable and value.
@@ -2827,9 +2862,10 @@ impl PropsPlan {
                 props.slot_light[slot] = 0.0;
             }
             // (a light map is on at its variable's 0.5 and off below - Omsi.exe skips the
-            // texture stage of one whose variable reads under 0.5, 0x7fe51f - never half lit)
+            // texture stage of one whose variable reads under 0.5, 0x7fe51f - never half lit;
+            // one whose variable the bus does not have - index -1 - is always on, 0x7fe4e7)
             for &(slot, src) in &plan.light {
-                props.slot_light[slot] = props.slot_light[slot].max(if src.value(vars, 0.0) >= 0.5 { 1.0 } else { 0.0 });
+                props.slot_light[slot] = props.slot_light[slot].max(if src.value(vars, 1.0) >= 0.5 { 1.0 } else { 0.0 });
             }
             if let Some((i, value)) = plan.visible {
                 if let Some(x) = vars.get(i) {
@@ -2859,6 +2895,16 @@ impl PropsPlan {
 /// crown between the wheels, and clear of it for the surfaces' depth bias.
 pub const SHADOW_LIFT: f32 = 0.02;
 
+/// How far over the wheel's own plane the face it stands on may lie for a `[isshadow]`
+/// blob's plane (m): a kerb or a ramp, the step the AI's wheels climb
+/// (`ai_motion::AI_STEP_UP`).
+const SHADOW_STEP_UP: f64 = 0.6;
+/// How far under it (m). Loose: the model's origin plane is the contact plane of the
+/// *unloaded* springs, so a body at rest stands its ground 10-16 cm below its own plane,
+/// and a map may put a vehicle down a little over its road. Farther down is another level -
+/// a road under a bridge - and not the face this wheel stands on.
+const SHADOW_STEP_DOWN: f64 = 3.0;
+
 /// How strong the film on the glass gets in the thickest snowfall (`Rain_Window_*_Wetness`,
 /// 0 … 1): a haze of crystals, not a windscreen running with water.
 const SNOW_ON_GLASS: f32 = 0.22;
@@ -2867,6 +2913,30 @@ fn is_shadow_mesh(ty: &VehicleType, i: usize) -> bool {
     ty.meshes
         .get(i)
         .is_some_and(|m| ty.model.meshes[m.def_index].is_shadow)
+}
+
+/// What one wheel of a body without a rigid body stands on at world `p` (the point on the
+/// model's z = 0 plane under it): the drawn road there, within a step of the wheel - the same
+/// level-limited probe the AI bodies ask (`ai_motion::AiBody::settle`). The plain height
+/// sampler knows only x and y and gives the *highest* face, so a vehicle under a bridge or a
+/// canopy had its `[isshadow]` blob laid onto the deck over it (the same sampler lifted the
+/// coupled parts onto the bridge, #140). The plain sampler stays the fallback where the
+/// tiles put no road face near the wheel.
+fn wheel_ground(
+    contact: Option<&dyn crate::rigid::Ground>,
+    ground: Option<&(dyn Fn(f64, f64) -> Option<f64> + Send + Sync)>,
+    p: DVec3,
+) -> Option<f64> {
+    if let Some(c) = contact {
+        if let Some(g) = c
+            .probe(p.x, p.y, p.z + SHADOW_STEP_UP)
+            .below
+            .filter(|g| *g >= p.z - SHADOW_STEP_DOWN)
+        {
+            return Some(g);
+        }
+    }
+    ground.and_then(|g| g(p.x, p.y))
 }
 
 /// Body frame → body frame with the plane z = 0 laid onto z = p[0] + p[1]·x + p[2]·y
@@ -2966,6 +3036,13 @@ pub struct TrailerPart {
     pub text_textures: Vec<crate::texttex::TextTextureState>,
 }
 
+/// The body-frame acceleration the scripts see as `A_Trans_*` (Omsi.exe 0x7d5124: the
+/// velocity's change over the frame, rotated into the body): `accel_body`, the specific force
+/// an accelerometer would read, less gravity's share in the body frame.
+fn scripts_acceleration(accel_body: Vec3, orientation: Quat) -> Vec3 {
+    accel_body - orientation.inverse().mul_vec3(Vec3::new(0.0, 0.0, 9.81))
+}
+
 impl TrailerPart {
     /// Pitch (degrees, nose up), eased axle height and the track point it stands on (for
     /// the `OMSI_DEBUG_TRAILERS` trace).
@@ -3026,8 +3103,17 @@ impl TrailerPart {
         } else {
             Vec3::new(0.0, -4.0, 0.3)
         });
-        // the pivot axle: the one farthest from the coupled end
-        let axle_long = if reversed {
+        // the line the part turns about: its own `[rot_pnt_long]` where a road part names
+        // one (Omsi.exe runs every section as a body of its own on the same wheel physics,
+        // each axle steered towards the turning centre on that line), else the axle
+        // farthest from the coupled end. A rear section whose axle steers (the Van Hool
+        // AG300's, set ahead of its axle) followed it as if it were a fixed one (#322);
+        // the stock GN92's line is its axle, a semitrailer's the middle of its axle group,
+        // and rail cars name none.
+        let turning_line = (ty.def.rot_pnt_long != 0.0 && !ty.def.axles.is_empty()).then_some(ty.def.rot_pnt_long);
+        let axle_long = if let Some(r) = turning_line {
+            r
+        } else if reversed {
             let a = ty.def.axles.iter().map(|a| a.long).fold(f32::MIN, f32::max);
             if a == f32::MIN {
                 0.5
@@ -3172,13 +3258,11 @@ impl TrailerPart {
         Mat4::from_translation(self.position.as_vec3()) * self.body_rotation()
     }
 
-    /// Position/direction of one of the part's own `.bus` cameras in world space: (eye,
-    /// yaw, pitch) - as `VehicleInstance::camera_world` for the front part.
-    pub fn camera_world(&self, cam: &omsi_vehicle::Camera) -> (DVec3, f32, f32) {
-        let local = Vec3::new(cam.pos[0], cam.pos[1], cam.pos[2]);
-        let eye = self.position + self.body_rotation().transform_point3(local).as_dvec3();
-        let heading = if self.reversed { self.heading + 180.0 } else { self.heading };
-        (eye, heading as f32 + cam.yaw, cam.pitch)
+    /// One of the part's own `.bus` cameras fixed to its body: (eye, yaw, pitch, roll), as
+    /// `VehicleInstance::camera_world_full` for the front part (`dist` and the body's pitch
+    /// and bank included).
+    pub fn camera_world_full(&self, cam: &omsi_vehicle::Camera) -> (DVec3, f32, f32, f32) {
+        camera_in_body(self.position, self.body_rotation(), cam)
     }
 
     /// Transform for mesh `i` relative to the part's position; a shadow blob lies on the
@@ -3265,8 +3349,23 @@ impl TrailerPart {
             let h = main.heading.to_radians();
             dir = glam::DVec2::new(h.sin(), h.cos());
         }
-        let dir = dir.normalize();
-        self.heading = dir.x.atan2(dir.y).to_degrees();
+        let mut dir = dir.normalize();
+        let mut heading = dir.x.atan2(dir.y).to_degrees();
+        // `[coupling_front_character]`: a bus joint (type != 0) stops hard at its max
+        // alpha (Omsi.exe 0x7e0848); the rear section's axle is dragged sideways there
+        // instead of jackknifing through the part in front.
+        if let Some([amax, _, _, kind]) = self.ty.def.coupling_front_character {
+            if kind != 0.0 && amax > 0.0 {
+                let a = amax as f64;
+                let rel = ((lead_heading - heading + 540.0) % 360.0) - 180.0;
+                if rel.abs() > a {
+                    heading = lead_heading - rel.clamp(-a, a);
+                    let h = heading.to_radians();
+                    dir = glam::DVec2::new(h.sin(), h.cos());
+                }
+            }
+        }
+        self.heading = heading;
         let new_pivot = c - DVec3::new(dir.x, dir.y, 0.0) * self.length as f64;
         let ds = (new_pivot - pivot).truncate().length() as f32;
         self.odometer += ds * (main.physics.velocity_kmh().signum().max(0.0) * 2.0 - 1.0).max(-1.0);
@@ -3312,26 +3411,33 @@ impl TrailerPart {
             .track
             .filter(|t| (t.truncate() - new_pivot.truncate()).length() < 1.0)
             .map(|t| t.z);
+        // the height of the part's origin over its axle (where the ground has none: level
+        // with the coupling, as before)
+        let level = c.z - self.coupling_front.z as f64;
         // the ground under its axle: what the wheels stand on where the world says, else the
         // plain height sampler
         let ground_z = match (on_track, &main.contact, &main.ground) {
             (Some(_), _, _) => None,
-            (None, Some(c), _) => {
-                c.probe(new_pivot.x, new_pivot.y, self.position.z + 1.5)
-                    .below
+            (None, Some(g), _) => {
+                // Looked for from above the coupling's level as well as from the part's own
+                // height: from its own height alone, a rear section that had once dropped
+                // under a viaduct's deck (a frame's step at the ramp, a gap at a joint) only
+                // ever found the ground beneath and hung there under the bridge while the
+                // front section drove on above (#135).
+                let top = self.position.z.max(level) + 1.5;
+                g.probe(new_pivot.x, new_pivot.y, top).below
             }
             (None, None, Some(g)) => g(new_pivot.x, new_pivot.y),
             _ => None,
         };
-        // the height of the part's origin over its axle (where the ground has none: level
-        // with the coupling, as before)
         // A height far from where the coupling holds the part is another level's: the AI's
         // ground lookup knows only x and y and gives the highest road there, which under a
         // bridge is the deck (or, on the deck, a road that runs on beneath it) - the trailer
         // of a lorry and the rear of an articulated bus stood up on the bridge or down under
-        // it (#140). Level with the coupling instead.
-        let level = c.z - self.coupling_front.z as f64;
-        let ground_z = ground_z.filter(|z| main.contact.is_some() || (z + lift - level).abs() < 1.5);
+        // it (#140). Level with the coupling instead. With the world's faces the part may
+        // stand lower than the coupling on a grade, but never metres under it: that is the
+        // road under a bridge seen through a gap in the deck (#135).
+        let ground_z = ground_z.filter(|z| if main.contact.is_some() { z + lift - level > -3.0 } else { (z + lift - level).abs() < 1.5 });
         let axle_z = match on_track.or(ground_z.map(|z| z + lift)) {
             Some(z) if on_track.is_some() => z,
             Some(z) if main.contact.is_some() && dt > 0.0 => {
@@ -3499,7 +3605,7 @@ impl VehicleInstance {
                     w.attach + Vec3::Z * (w.compression.max(-crate::rigid::DROOP) - w.radius),
                 );
             }
-        } else if let Some(g) = &self.ground {
+        } else {
             let rot = self.body_rotation();
             let inv = rot.inverse();
             for w in self.physics.wheels.iter().flatten() {
@@ -3507,7 +3613,7 @@ impl VehicleInstance {
                     + rot
                         .transform_vector3(Vec3::new(w.lat, w.long, 0.0))
                         .as_dvec3();
-                if let Some(z) = g(p.x, p.y) {
+                if let Some(z) = wheel_ground(self.contact.as_deref(), self.ground.as_deref(), p) {
                     points.push(
                         inv.transform_vector3((DVec3::new(p.x, p.y, z) - self.position).as_vec3()),
                     );
@@ -3532,23 +3638,28 @@ impl VehicleInstance {
     /// of its view with the body's pitch and bank in them - a mirror leans with the bus. A
     /// `dist` above zero puts the eye that far behind the point along the view.
     pub fn camera_world_full(&self, cam: &omsi_vehicle::Camera) -> (DVec3, f32, f32, f32) {
-        let rot = self.body_rotation();
-        let (sy, cy) = cam.yaw.to_radians().sin_cos();
-        let (sp, cp) = cam.pitch.to_radians().sin_cos();
-        let f_local = Vec3::new(sy * cp, cy * cp, sp);
-        let r_local = Vec3::new(cy, -sy, 0.0);
-        let f = rot.transform_vector3(f_local).normalize_or(Vec3::Y);
-        let up = rot.transform_vector3(r_local.cross(f_local)).normalize_or(Vec3::Z);
-        let local = Vec3::new(cam.pos[0], cam.pos[1], cam.pos[2]);
-        let eye = self.position + rot.transform_point3(local).as_dvec3() - (f * cam.dist.max(0.0)).as_dvec3();
-        let yaw = f.x.atan2(f.y).to_degrees();
-        let pitch = f.z.clamp(-1.0, 1.0).asin().to_degrees();
-        // (the roll the renderer's `Camera::up` turns back into this up)
-        let r0 = Vec3::new(f.y, -f.x, 0.0).normalize_or(Vec3::X);
-        let u0 = r0.cross(f);
-        let roll = up.dot(r0).atan2(up.dot(u0)).to_degrees();
-        (eye, yaw, pitch, roll)
+        camera_in_body(self.position, self.body_rotation(), cam)
     }
+}
+
+/// A camera in a body's own matrix (`rot`, at `position`): see
+/// `VehicleInstance::camera_world_full`.
+fn camera_in_body(position: DVec3, rot: Mat4, cam: &omsi_vehicle::Camera) -> (DVec3, f32, f32, f32) {
+    let (sy, cy) = cam.yaw.to_radians().sin_cos();
+    let (sp, cp) = cam.pitch.to_radians().sin_cos();
+    let f_local = Vec3::new(sy * cp, cy * cp, sp);
+    let r_local = Vec3::new(cy, -sy, 0.0);
+    let f = rot.transform_vector3(f_local).normalize_or(Vec3::Y);
+    let up = rot.transform_vector3(r_local.cross(f_local)).normalize_or(Vec3::Z);
+    let local = Vec3::new(cam.pos[0], cam.pos[1], cam.pos[2]);
+    let eye = position + rot.transform_point3(local).as_dvec3() - (f * cam.dist.max(0.0)).as_dvec3();
+    let yaw = f.x.atan2(f.y).to_degrees();
+    let pitch = f.z.clamp(-1.0, 1.0).asin().to_degrees();
+    // (the roll the renderer's `Camera::up` turns back into this up)
+    let r0 = Vec3::new(f.y, -f.x, 0.0).normalize_or(Vec3::X);
+    let u0 = r0.cross(f);
+    let roll = up.dot(r0).atan2(up.dot(u0)).to_degrees();
+    (eye, yaw, pitch, roll)
 }
 
 fn skin_key(ty: &VehicleType, i: usize, transforms: &[Mat4]) -> Vec<Mat4> {
@@ -3690,6 +3801,35 @@ mod tests {
         );
     }
 
+    /// The wheel of a body without a rigid body stands on the road the drawn faces put
+    /// under it, not on the deck of a bridge over that road (or a canopy above it): the
+    /// plain sampler knows only x and y and gives the highest face there, which laid the
+    /// `[isshadow]` blob up on the deck. Where the faces put nothing near the wheel - and
+    /// where there is no face probe at all - the plain sampler still answers.
+    #[test]
+    fn a_wheels_ground_is_the_road_under_it_not_the_highest_face() {
+        let (road, deck) = (12.0f64, 17.0f64);
+        // the faces: the deck above the wheel, the road under it
+        let faces = |_x: f64, _y: f64, top: f64| crate::rigid::GroundProbe {
+            below: [road, deck].into_iter().filter(|h| *h <= top).fold(None, |a: Option<f64>, b| Some(a.map_or(b, |a| a.max(b)))),
+            above: None,
+        };
+        let faces: &dyn crate::rigid::Ground = &faces;
+        // the plain sampler: the highest face at (x, y), which is the deck
+        let plain = |_x: f64, _y: f64| Some(deck);
+        let plain: &(dyn Fn(f64, f64) -> Option<f64> + Send + Sync) = &plain;
+        let wheel = DVec3::new(100.0, 200.0, road);
+        assert_eq!(wheel_ground(Some(faces), Some(plain), wheel), Some(road));
+        // a wheel standing on the deck itself gets the deck
+        assert_eq!(wheel_ground(Some(faces), Some(plain), DVec3::new(100.0, 200.0, deck)), Some(deck));
+        // nothing drawn within a step of the wheel: the plain sampler, as before
+        let empty = |_x: f64, _y: f64, _top: f64| crate::rigid::GroundProbe { below: None, above: Some(deck) };
+        let empty: &dyn crate::rigid::Ground = &empty;
+        assert_eq!(wheel_ground(Some(empty), Some(plain), wheel), Some(deck));
+        // no face probe at all (a rail or air lane): the plain sampler
+        assert_eq!(wheel_ground(None, Some(plain), wheel), Some(deck));
+    }
+
     /// The resolved property plan gives what `compute_mesh_props` gives, for a stock bus
     /// with its variables set to changing values, and after an engine variable joins.
     #[test]
@@ -3743,6 +3883,54 @@ mod tests {
         // Dirt_Norm is not declared by the scripts; the engine adds it later
         v.set_engine_var("Dirt_Norm", 0.63);
         compare(&v);
+    }
+
+    /// A `[matl_lightmap]` whose variable the bus does not have is always on (Omsi.exe's
+    /// index -1, 0x7fe4e7); one on a variable at 0.3 is off.
+    #[test]
+    fn a_lightmap_on_an_unknown_variable_is_on() {
+        let root = omsi_cfg::env::var_os("OMSI_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("../../../OMSI 2 Original"));
+        let bus = root.join("Vehicles/MAN_NL_NG/MAN_EN92_main.bus");
+        if !bus.exists() {
+            eprintln!("skipped: no {}", bus.display());
+            return;
+        }
+        let light = |name: Option<&str>, value: f32| {
+            let mut ty = VehicleType::load(&root, &bus).expect("EN92");
+            let (i, slot, var) = ty
+                .meshes
+                .iter()
+                .enumerate()
+                .find_map(|(i, vm)| {
+                    ty.model.meshes[vm.def_index].materials.iter().find_map(|m| {
+                        let (_, v) = m.lightmaps.first()?;
+                        Some((i, override_slot(&vm.materials, m)?, v.clone()))
+                    })
+                })
+                .expect("a lightmap");
+            let di = ty.meshes[i].def_index;
+            for m in ty.model.meshes[di].materials.iter_mut() {
+                if let Some(l) = m.lightmaps.first_mut() {
+                    l.1 = name.unwrap_or(&var).to_string();
+                    m.lightmaps.truncate(1);
+                }
+            }
+            let mut v = VehicleInstance::new(Arc::new(ty), VehicleHost::new(crate::SimClock::default()));
+            for x in v.state.vars.iter_mut() {
+                *x = value;
+            }
+            let mut plan = PropsPlan::default();
+            plan.refresh(&v.ty, &v.var_index);
+            let mut got = vec![MeshProps::default(); 3];
+            plan.apply(&v.state.vars, &mut got);
+            let want = compute_mesh_props(&v.ty, &|n| v.var(n));
+            assert_eq!(got[i].slot_light[slot], want[i].slot_light[slot]);
+            got[i].slot_light[slot]
+        };
+        assert_eq!(light(Some("no_such_var"), 0.3), 1.0);
+        assert_eq!(light(None, 0.3), 0.0);
     }
 
     /// The articulated GN92 turning right: the angle goes to `articulation_0_alpha` (the
@@ -3844,6 +4032,150 @@ mod tests {
             .map(|(p, r)| (*p - *r).length())
             .fold(0.0f32, f32::max);
         assert!(worst < 1e-3, "straight bellows off by {worst}");
+    }
+
+    /// A bus without `[kmcounter_init]` starts with Omsi.exe's defaults (in service since
+    /// 1980, 60000 km a year, +-20 %), not at 0 km; reversing takes the counter back.
+    #[test]
+    fn odometer_starts_at_the_default_service_life() {
+        let root = omsi_cfg::env::var_os("OMSI_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("../../../OMSI 2 Original"));
+        let bus = root.join("Vehicles/MAN_SD200/MAN_SD77.bus");
+        if !bus.exists() {
+            eprintln!("skipped: no {}", bus.display());
+            return;
+        }
+        let mut ty = VehicleType::load(&root, &bus).expect("SD77");
+        ty.def.km_counter_init = None;
+        let mut v = VehicleInstance::new(Arc::new(ty), VehicleHost::new(crate::SimClock::default()));
+        v.host.clock.year = 2011;
+        v.host.clock.day_of_year = 0;
+        v.update_engine_vars(0.02);
+        let base = v.host.km_base;
+        assert!((31.0 * 60000.0 * 0.8 + 8.0..=31.0 * 60000.0 * 1.2 + 18.0).contains(&base), "{base}");
+        v.driven_km = -0.5;
+        v.update_engine_vars(0.02);
+        let km = v.var("kmcounter_km").unwrap() as f64 + v.var("kmcounter_m").unwrap() as f64 / 1000.0;
+        assert!((km - (base - 0.5)).abs() < 1.0, "{km} for {base}");
+    }
+
+    /// The GN92's joint stops at `[coupling_front_character]`'s 52.5 degrees: the front
+    /// section swinging round 90 degrees drags the rear section's axle with it.
+    #[test]
+    fn articulation_stops_at_the_coupling_max_alpha() {
+        let root = omsi_cfg::env::var_os("OMSI_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("../../../OMSI 2 Original"));
+        let bus = root.join("Vehicles/MAN_NL_NG/MAN_GN92_main.bus");
+        let trail = root.join("Vehicles/MAN_NL_NG/MAN_GN92_trail.bus");
+        if !bus.exists() || !trail.exists() {
+            eprintln!("skipped: no {}", bus.display());
+            return;
+        }
+        let ty = Arc::new(VehicleType::load(&root, &bus).expect("GN92"));
+        let mut v = VehicleInstance::new(ty, VehicleHost::new(crate::SimClock::default()));
+        v.attach_trailer_ex(
+            Arc::new(VehicleType::load(&root, &trail).expect("GN92 trail")),
+            false,
+        );
+        v.heading = 10.0;
+        v.update_visuals(0.02);
+        for h in [100.0, -80.0] {
+            v.heading = h;
+            v.update_visuals(0.02);
+            let alpha = v.var("articulation_0_alpha").unwrap();
+            assert!((alpha.abs() - 52.5).abs() < 1e-3, "alpha {alpha} at heading {h}");
+        }
+    }
+
+    /// `A_Trans_*` are the body's acceleration without gravity, as in Omsi.exe: 0 for a bus
+    /// standing still, on the level or on a grade, and the braking's deceleration alone.
+    #[test]
+    fn scripts_acceleration_leaves_gravity_out() {
+        let level = super::scripts_acceleration(Vec3::new(0.0, 0.0, 9.81), Quat::IDENTITY);
+        assert!(level.length() < 1e-4, "{level}");
+        // standing nose up on a 10 % grade: the accelerometer reads gravity's share along it
+        let rot = Quat::from_rotation_x(0.1f32.atan());
+        let reading = rot.inverse().mul_vec3(Vec3::new(0.0, 0.0, 9.81));
+        let grade = super::scripts_acceleration(reading, rot);
+        assert!(grade.length() < 1e-4, "{grade}");
+        // braking at 3 m/s² on the level
+        let braking = super::scripts_acceleration(Vec3::new(0.0, -3.0, 9.81), Quat::IDENTITY);
+        assert!((braking - Vec3::new(0.0, -3.0, 0.0)).length() < 1e-4, "{braking}");
+    }
+
+    /// A rear section turns about its own `[rot_pnt_long]` line: the stock GN92's is its
+    /// axle; one set ahead of the axle (a steered rear axle, #322) is where it turns.
+    #[test]
+    fn rear_section_turns_about_its_rot_pnt_long() {
+        let root = omsi_cfg::env::var_os("OMSI_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("../../../OMSI 2 Original"));
+        let bus = root.join("Vehicles/MAN_NL_NG/MAN_GN92_main.bus");
+        let trail = root.join("Vehicles/MAN_NL_NG/MAN_GN92_trail.bus");
+        if !bus.exists() || !trail.exists() {
+            eprintln!("skipped: no {}", bus.display());
+            return;
+        }
+        let ty = Arc::new(VehicleType::load(&root, &bus).expect("GN92"));
+        let mut tt = VehicleType::load(&root, &trail).expect("GN92 trail");
+        let stock = TrailerPart::new(Arc::new(VehicleType::load(&root, &trail).unwrap()), &ty, &ty.program, 2);
+        assert!((stock.pivot_length() - (4.169 + 0.387)).abs() < 1e-3, "{}", stock.pivot_length());
+        tt.def.rot_pnt_long = 1.0;
+        let steered = TrailerPart::new(Arc::new(tt), &ty, &ty.program, 2);
+        assert!((steered.pivot_length() - (4.169 - 1.0)).abs() < 1e-3, "{}", steered.pivot_length());
+    }
+
+    /// The rear section of an articulated bus on a viaduct stays on the deck: one frame with
+    /// no deck under its axle (a gap at a joint) does not drop it onto the road below, and
+    /// one that had sunk under the deck finds it again (#135).
+    #[test]
+    fn rear_section_stays_on_a_viaduct_deck() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let root = omsi_cfg::env::var_os("OMSI_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("../../../OMSI 2 Original"));
+        let bus = root.join("Vehicles/MAN_NL_NG/MAN_GN92_main.bus");
+        let trail = root.join("Vehicles/MAN_NL_NG/MAN_GN92_trail.bus");
+        if !bus.exists() || !trail.exists() {
+            eprintln!("skipped: no {}", bus.display());
+            return;
+        }
+        let ty = Arc::new(VehicleType::load(&root, &bus).expect("GN92"));
+        let mut v = VehicleInstance::new(ty, VehicleHost::new(crate::SimClock::default()));
+        v.attach_trailer_ex(Arc::new(VehicleType::load(&root, &trail).expect("GN92 trail")), false);
+        // 0: a deck at 10 m over a road at 0; 1: a gap in the deck
+        let mode = Arc::new(AtomicU8::new(0));
+        let m = mode.clone();
+        let ground = move |_x: f64, _y: f64, top: f64| {
+            let deck = m.load(Ordering::Relaxed) == 0;
+            if deck && top >= 10.0 {
+                crate::rigid::GroundProbe { below: Some(10.0), above: None }
+            } else if deck {
+                crate::rigid::GroundProbe { below: Some(0.0), above: Some(10.0) }
+            } else {
+                crate::rigid::GroundProbe { below: Some(0.0), above: None }
+            }
+        };
+        v.contact = Some(Arc::new(ground));
+        v.position = DVec3::new(0.0, 0.0, 10.0);
+        for _ in 0..50 {
+            v.update_visuals(0.02);
+        }
+        let on_deck = v.trailers[0].position.z;
+        assert!((on_deck - 10.0).abs() < 0.5, "rear section at {on_deck}");
+        mode.store(1, Ordering::Relaxed);
+        v.update_visuals(0.02);
+        assert!(v.trailers[0].position.z > 9.0, "dropped through the gap to {}", v.trailers[0].position.z);
+        // sunk under the deck: it comes back up
+        mode.store(0, Ordering::Relaxed);
+        v.trailers[0].position.z = 0.2;
+        v.trailers[0].axle_z = Some(0.0);
+        for _ in 0..5 {
+            v.update_visuals(0.02);
+        }
+        assert!(v.trailers[0].position.z > 9.0, "stayed under the deck at {}", v.trailers[0].position.z);
     }
 
     /// A timetable duty and a random traffic car load their bus with `VehicleType::load_ai`,

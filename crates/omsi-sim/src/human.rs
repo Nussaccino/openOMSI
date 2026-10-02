@@ -174,8 +174,8 @@ pub struct Rig {
     pub seat_lift: f32,
     /// Size relative to a 1.75 m adult.
     pub scale: f32,
-    /// `[walk_param]`: preferred speed (m/s), step length (m), arm swing and hip sway.
-    pub walk_speed: f32,
+    /// From `[walk_param]`: the step length at full stride (m) - half the file's first
+    /// line, the stride ({schrittweite}, 1.4 by default) -, the arm swing and the hip sway.
     pub walk_step: f32,
     pub arm_swing: f32,
     pub hip_sway: f32,
@@ -315,17 +315,10 @@ impl Rig {
             head_top,
             seat_lift,
             scale,
-            walk_speed: if wp[0] > 0.3 {
-                wp[0].clamp(0.6, 2.0)
-            } else {
-                1.4
-            },
-            // read as the step length in cm at that speed (66 … 83 in the stock files)
-            walk_step: if wp[1] > 20.0 {
-                (wp[1] / 100.0).clamp(0.5, 0.9)
-            } else {
-                0.75 * scale
-            },
+            // (line 1 is the stride, hum+0x2d8: Omsi.exe's walk phase 0x626ae8 runs 2.0 per
+            // two strides and sets a foot down at 0.2, 0.7, 1.2 and 1.7, one step per half a
+            // stride; line 2, {upper_arm_beta}, is an angle of the arm)
+            walk_step: 0.5 * if wp[0] > 0.3 { wp[0] } else { 1.4 },
             arm_swing: if wp[2] > 0.0 {
                 wp[2].clamp(0.2, 1.6)
             } else {
@@ -360,20 +353,20 @@ impl Rig {
         (self.thigh * 0.85).clamp(0.25, 0.4)
     }
 
-    /// Steps per second at `speed`, from `[walk_param]` and the leg length, never with a
-    /// step longer than the legs allow.
+    /// Steps per second at `speed`, as Omsi.exe times the walk (0x626ae8): the stride is
+    /// the full one from 1.2 m/s on and shortens with the speed below that, so the steps
+    /// keep one pace when walking slowly; never with a step longer than the legs allow.
     pub fn cadence(&self, speed: f32) -> f32 {
         let v = speed.max(0.05);
-        let own = self.walk_speed / self.walk_step;
-        let by_leg = 2.0 * (0.9 / self.leg().max(0.4)).sqrt();
-        let f0 = (0.5 * own + 0.5 * by_leg).clamp(1.5, 2.3);
-        let f = f0 * (v / self.walk_speed).powf(0.45);
-        f.max(v / (0.8 * self.leg())).clamp(0.9, 3.4)
+        let f = v / (self.walk_step * (v / 1.2).min(1.0));
+        f.max(v / (0.8 * self.leg())).min(3.4)
     }
 }
 
 pub struct HumanType {
     pub def: Human,
+    /// The skeleton as Omsi.exe animates it (see [`crate::human_omsi`]).
+    pub omsi: crate::human_omsi::OmsiRig,
     pub model: Model,
     pub model_dir: PathBuf,
     pub meshes: Vec<HumanMesh>,
@@ -484,6 +477,7 @@ impl HumanType {
             }
         }
         Ok(HumanType {
+            omsi: crate::human_omsi::OmsiRig::new(&def),
             joints,
             rig,
             def,
@@ -661,20 +655,6 @@ fn split_feet(m: &mut HumanMesh, rig: &Rig) {
     let bottom = rig.sole + rig.ankle_h - 0.03;
     for (i, inf) in m.skin.iter_mut().enumerate() {
         let v = m.data.positions[i];
-        for side in 0..2 {
-            if !(0..inf.n as usize).any(|k| inf.slot[k] as usize == THIGH[side]) {
-                continue;
-            }
-            let (a, b) = (rig.hip[side], rig.knee[side]);
-            let t = ((v - a).dot(b - a) / (b - a).length_squared().max(1e-4)).clamp(0.0, 1.0);
-            // the leg is about 13 cm thick at the top of the thigh and 6 cm at the knee
-            let radius = (0.13 + (0.06 - 0.13) * t) * rig.scale;
-            let beyond = (a + (b - a) * t - v).length() - radius;
-            let cloth = smoothstep(0.06, 0.12, beyond) * smoothstep(0.35, 0.55, t) * 0.7;
-            if cloth > 0.0 {
-                move_weight(inf, THIGH[side], HIP, cloth);
-            }
-        }
         if v.z >= top {
             continue;
         }
@@ -2195,6 +2175,19 @@ fn limit_quat(q: Quat, max: f32) -> Quat {
     }
 }
 
+/// The bone transforms of [`skin`] from Omsi.exe's thirteen bones
+/// ([`crate::human_omsi::OmsiAnim::bones`]): the feet and toes, which the original does not
+/// have, go with the shins they were split off.
+pub fn slots_from_omsi(b: &[Affine3A; crate::human_omsi::BONES]) -> [Affine3A; SLOTS] {
+    let mut out = [Affine3A::IDENTITY; SLOTS];
+    out[..crate::human_omsi::BONES].copy_from_slice(b);
+    for side in 0..2 {
+        out[FOOT[side]] = b[SHIN[side]];
+        out[TOE[side]] = b[SHIN[side]];
+    }
+    out
+}
+
 /// Deform `mesh` with the bone transforms (linear blend skinning).
 pub fn skin(
     mesh: &HumanMesh,
@@ -2289,6 +2282,10 @@ mod tests {
         assert!(r.seat_lift > 0.05 && r.seat_lift < 0.15);
         let c = r.cadence(1.35);
         assert!(c > 1.7 && c < 2.1, "cadence {c} steps/s at 1.35 m/s");
+        // `[walk_param]` 1.4 (the stride) / 80 (an arm angle): 0.7 m steps
+        assert!((r.walk_step - 0.7).abs() < 1e-6, "{}", r.walk_step);
+        // slower than 1.2 m/s the stride shortens and the pace stays: 2.4 / 1.4 steps a second
+        assert!((r.cadence(0.6) - 2.4 / 1.4).abs() < 1e-4, "{}", r.cadence(0.6));
     }
 
     #[test]

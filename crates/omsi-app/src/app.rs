@@ -23,6 +23,10 @@ pub(crate) struct App {
     /// The object editor, while it is on (`crate::editor`).
     pub(crate) editor: Option<crate::editor::Editor>,
     pub(crate) vehicle_list: Vec<(String, String)>,
+    /// The drop-down open over a row of the settings window, if one is.
+    pub(crate) dropdown: Option<crate::game_lists::Dropdown>,
+    /// (manufacturer, type) of each vehicle of `vehicle_list`, by its path.
+    pub(crate) vehicle_meta: std::collections::HashMap<String, (String, String)>,
     pub(crate) world: Option<Arc<World>>,
     /// Tile streaming around the camera (the window's default).
     pub(crate) streamer: Option<tiles::Streamer>,
@@ -40,6 +44,8 @@ pub(crate) struct App {
     pub(crate) hud: Option<hud::Hud>,
     /// The route navigator (ETS2-style map in a corner).
     pub(crate) navigator: Option<navigator::Navigator>,
+    pub(crate) vr_nav_profiles: crate::vr_navigator::Profiles,
+    pub(crate) vr_nav_edit: Option<crate::vr_navigator::Editing>,
     /// Chat, mouse-over names and name tags (Roboto).
     pub(crate) ui: Option<ui::Ui>,
     pub(crate) fps: f32,
@@ -86,11 +92,11 @@ pub(crate) struct App {
     pub(crate) last: Instant,
     pub(crate) speed: f32,
     pub(crate) mouse_look: bool,
-    /// The left and right mouse buttons held (`both_drag` needs both).
+    /// The left and right mouse buttons held.
     pub(crate) buttons_held: (bool, bool),
-    /// Both buttons held: OMSI's M_Zoom (0x82c5f8) - moving the mouse up zooms in (in the
-    /// bus) or takes the outside camera further away, by the value at the press over 500
-    /// pixels: (the cursor's height then, the zoom or distance then).
+    /// The right button (or both) held: OMSI's mouse zoom (0x82c5f8) - moving the mouse up
+    /// widens the view in the bus or takes the outside camera further away, by the value at
+    /// the press over 500 pixels: (the cursor's height then, the zoom or distance then).
     pub(crate) both_drag: Option<(f32, f32)>,
     /// Right mouse button toggles the headset picture zoom.
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -99,6 +105,8 @@ pub(crate) struct App {
     pub(crate) hover: Option<String>,
     /// The part under the cursor when it is not a switch, so the HUD can say so.
     pub(crate) hover_part: Option<String>,
+    /// A `[mouseevent]` mesh is under the cursor (named in `hover` or not): the hand cursor.
+    pub(crate) hover_hand: bool,
     /// `OMSI_INPUT` script: (seconds after start, command), in order.
     pub(crate) input_script: Vec<(f32, String)>,
     /// `shot <file>` of the input script: the next frame is also rendered into this PNG.
@@ -112,8 +120,16 @@ pub(crate) struct App {
     /// (in lines, fractional while dragged); `None`: the chosen line is kept in view.
     pub(crate) menu_top: Option<f32>,
     pub(crate) menu_scroll_drag: bool,
-    /// The game menu shows all its lines ("More..."), not only the everyday ones.
-    pub(crate) menu_more: bool,
+    /// The timetable beside the tours scrolled with the wheel: (the tour's line in the list,
+    /// the first stop shown).
+    pub(crate) pane_scroll: Option<(usize, usize)>,
+    /// The digits of a time being typed in the world page of the game menu (None: not typing).
+    pub(crate) menu_edit: Option<String>,
+    /// The line of the open list whose slider the mouse button holds (it follows the cursor).
+    pub(crate) menu_drag: Option<usize>,
+    /// The keyboard chose the line of the menu last (the mouse moved since: false), so the
+    /// chosen line is shown lit; with the mouse only the line under it is.
+    pub(crate) menu_kbd: bool,
     /// Keys pressed (true) and let go since the Lua plugins' last frame.
     pub(crate) plugin_keys: Vec<(String, bool)>,
     /// Seconds Ctrl+Shift+Page Up/Down has been held (the clock runs faster the longer).
@@ -129,6 +145,8 @@ pub(crate) struct App {
     pub(crate) discord_t: f32,
     /// Head tracking (Settings → head tracking), started with the first frame that wants it.
     pub(crate) headtrack: Option<crate::headtrack::HeadTracker>,
+    /// When head tracking last failed to start (tried again a few seconds later).
+    pub(crate) headtrack_failed: Option<std::time::Instant>,
     /// Steering wheels, pedals, joysticks and gamepads (`Inputs/gamectrler.cfg`).
     pub(crate) controllers: Option<crate::controllers::Controllers>,
     /// OMSI's mouse control (`toggel_mouse_ctrl`, O): the cursor's place steers (across) and
@@ -142,6 +160,17 @@ pub(crate) struct App {
     /// speed, and at 30 km/h the edge of the screen was a third of the lock, with nowhere
     /// further to move.
     pub(crate) mouse_edge: f32,
+    /// Where the cursor steered when the right button began to look round: it goes back
+    /// there when the button is let go, so the wheel does not jump to where looking left it.
+    pub(crate) steer_cursor: Option<(f32, f32)>,
+    /// The cursor is put in the middle of the window before the mouse steers for the first
+    /// time (a game started with the mouse steering on: wherever the cursor was, the wheel
+    /// turned and the bus drove off on full throttle).
+    pub(crate) center_cursor: bool,
+    /// The cursor hidden while a controller drives: where it stood.
+    pub(crate) cursor_hidden: Option<(f32, f32)>,
+    /// The wheel's place when it last counted as moved.
+    pub(crate) last_ctl_steer: Option<f32>,
     /// The mouse's throttle and brake (eased in with the steering).
     pub(crate) mouse_pedals: (f32, f32),
     /// The speed mouse steering divides by, smoothed.
@@ -192,7 +221,8 @@ pub(crate) struct App {
     /// Whether the game stood paused before the menu opened (closing it goes back to that).
     pub(crate) menu_prev_pause: bool,
     /// OMSI's information bar (`view_toggle_informationdisplay`, Ctrl+Y): time, speed, the
-    /// trip and its next stop along the top of the picture.
+    /// air and cabin temperatures, the passengers aboard, the trip and its next stop along
+    /// the top of the picture.
     pub(crate) info_bar: bool,
     /// A time of day the bus's script wrote (`(S.S.Time)`), for the clock at the next frame.
     pub(crate) pending_time: Option<f64>,
@@ -234,10 +264,16 @@ pub(crate) struct App {
     pub(crate) career: career::Career,
     /// How wet the roads are (0..1), built up by rain and dried by the sun.
     pub(crate) wetness: f32,
+    /// How far the cloud cover has drifted with the wind (fractions of its tiling), summed
+    /// up frame by frame so that a change of wind does not throw the sky around.
+    pub(crate) cloud_drift: [f32; 2],
     /// A change of weather coming in (see `weather_cycle`).
     pub(crate) weather_blend: Option<crate::weather_cycle::Blend>,
     /// The weather cycle, when the weather chosen is `cycle`.
     pub(crate) weather_cycle: Option<crate::weather_cycle::Cycle>,
+    /// The METAR sync's download under way (see `tick_metar`), and the seconds to the next one.
+    pub(crate) metar_rx: Option<std::sync::mpsc::Receiver<Option<omsi_content::weather::Weather>>>,
+    pub(crate) metar_next: f64,
     /// The mouse cursor currently shows the hand (it is over a switch).
     pub(crate) cursor_kind: u8,
     pub(crate) settings: settings::Settings,
@@ -307,10 +343,14 @@ impl App {
                 )
             })
             .unwrap_or((1600, 900));
+        let (fit, at) = crate::startup::fit_window(event_loop, lw as f64, lh as f64);
         let mut attrs = Window::default_attributes()
             .with_title("openOMSI")
-            .with_inner_size(winit::dpi::LogicalSize::new(lw, lh))
+            .with_inner_size(fit)
             .with_window_icon(crate::startup::window_icon());
+        if let Some(at) = at {
+            attrs = attrs.with_position(at);
+        }
         if self.settings.fullscreen {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
@@ -435,7 +475,6 @@ impl App {
                         distance,
                         700.0,
                     ));
-                    self.hud = Some(hud::Hud::new(&mut w.fonts.lock()));
                     self.world = Some(w);
                     self.starting = Some(cam);
                 }
@@ -552,14 +591,14 @@ impl App {
                 if self.camera.is_none() {
                     self.camera = Some(cam);
                 }
-                self.hud = Some(hud::Hud::new(&mut w.fonts.lock()));
                 self.navigator = Some(navigator::Navigator::new(
                     self.settings.navigator,
-                    self.settings.navigator_opacity,
+                    self.settings.ui_opacity,
                     &self.settings.navigator_corner,
                 ));
                 if let Some(n) = self.navigator.as_mut() {
                     n.arrows = self.settings.nav_arrows;
+                    n.show_ai = self.settings.nav_ai;
                 }
                 if let Some(d) = self.args.driver.as_deref() {
                     self.career = career::Career::load(&self.args.root, d);
@@ -593,11 +632,18 @@ impl App {
                 }
                 // (a player who joins draws the host's traffic in it, whatever their own count
                 // says: the host's cars had nowhere to go without it)
-                if self.args.traffic > 0 || self.args.schedule || crate::rail_drive::args_rail(&self.args) || self.args.lan_join.is_some() {
+                let populated = self.args.traffic > 0 || self.args.schedule || crate::rail_drive::args_rail(&self.args) || self.args.lan_join.is_some();
+                // Without traffic it still runs the light programs and switches the lamps:
+                // they stood frozen with red, yellow and green all lit (#727).
+                {
                     match traffic::Traffic::new(&self.args.root, &w, self.args.traffic) {
                         Ok(mut t) => {
+                            t.lights_only = !populated;
                             if let Some(lan) = self.lan.as_ref() {
                                 t.set_lan_seed(lan::population_seed(lan));
+                            }
+                            if self.args.traffic > 0 {
+                                t.precache_random(&w, &renderer, &mut scene);
                             }
                             t.day_time = parse_time(&self.args.time);
                             self.traffic = Some(t);
@@ -642,6 +688,16 @@ impl App {
                                 d.update(&mut p.vehicle, parse_time(&self.args.time));
                                 let (trip, stop) = d.trip_for_ibis();
                                 p.set_duty_destination(trip, stop);
+                            }
+                            if let Some(d) = self.duty.as_ref() {
+                                let mut fonts = w.fonts.lock();
+                                if let Err(e) = crate::schedule_paper::update_vehicle(
+                                    &mut p.vehicle,
+                                    d,
+                                    &mut fonts,
+                                ) {
+                                    log::warn!("driver timetable paper: {e:#}");
+                                }
                             }
                         }
                         self.schedule = Some(sch);
@@ -719,13 +775,15 @@ impl App {
                 }
             })
             .unwrap_or_default();
+        let mut reconfigure = false;
         if let (Some(ui), Some(s), Some(win)) = (
             self.ui.as_mut(),
             self.surface.as_ref(),
             self.window.as_ref(),
         ) {
             scene.overlays.clear();
-            let scale = win.scale_factor() as f32;
+            let dpi = win.scale_factor() as f32;
+            let scale = dpi * crate::ui::size_factor(s.config.height as f32, dpi, self.settings.ui_scale, self.settings.ui_scale_window);
             ui.loading(
                 &renderer,
                 &mut scene,
@@ -736,8 +794,14 @@ impl App {
                 "",
                 done as f32 / total.max(1) as f32,
             );
+            let acquired = s.surface.get_current_texture();
+            // a swapchain that no longer fits the window (Vulkan says so after the switch
+            // to full screen, without a resize event) is made again, as the game's own
+            // frames do: left as it was, every later frame of the loading screen failed
+            // the same way and its picture stood still until the map was there (#776)
+            reconfigure = matches!(acquired, wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost);
             if let wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) = s.surface.get_current_texture()
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) = acquired
             {
                 let view = frame.texture.create_view(&Default::default());
                 // the tiles loaded so far stay out of the picture: the camera looks at nothing
@@ -772,6 +836,12 @@ impl App {
             win.request_redraw();
         } else {
             self.renderer = Some(renderer);
+        }
+        if reconfigure {
+            if let (Some(s), Some(r), Some(win)) = (self.surface.as_mut(), self.renderer.as_ref(), self.window.as_ref()) {
+                let size = win.inner_size();
+                s.resize(r, size.width, size.height);
+            }
         }
         self.scene = Some(scene);
         self.starting = Some(cam);

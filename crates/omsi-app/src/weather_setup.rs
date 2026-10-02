@@ -10,9 +10,14 @@ pub(crate) fn load_weather(args: &Args) -> omsi_content::weather::Weather {
         .filter(|w| !crate::weather_cycle::is_cycle(Some(w)))
         .unwrap_or_else(|| "Weather/#CAVOK.owt".into());
     // OMSI 2's current weather: `metar:<ICAO>` fetches the airport's report
-    let loaded = match rel.strip_prefix("metar:").or_else(|| rel.strip_prefix("METAR:")) {
-        Some(icao) => Ok(fetch_metar(icao.trim())),
-        None => omsi_content::weather::Weather::load(&omsi_cfg::resolve_path(&args.root, &rel)),
+    let loaded = if rel.starts_with(REPORT) {
+        // a report the host or server tells (see `report_wire`): its values, no download
+        Ok(from_report(&rel).unwrap_or_else(|| omsi_content::weather::from_metar("", "CAVOK")))
+    } else {
+        match rel.strip_prefix("metar:").or_else(|| rel.strip_prefix("METAR:")) {
+            Some(icao) => Ok(fetch_metar(icao.trim())),
+            None => omsi_content::weather::Weather::load(&omsi_cfg::resolve_path(&args.root, &rel)),
+        }
     };
     match loaded {
         Ok(w) => {
@@ -55,20 +60,21 @@ pub(crate) fn setup_sky(
     envir: Option<&omsi_content::Envir>,
     weather: Option<&omsi_content::weather::Weather>,
 ) {
-    let names = envir.map(|e| e.sky_textures.clone()).unwrap_or_else(|| {
-        [
-            "Texture\\himmel01.bmp".into(),
-            "Texture\\himmel04.bmp".into(),
-            "Texture\\himmel05.bmp".into(),
-        ]
-    });
+    const STOCK: [&str; 3] = ["Texture\\himmel01.bmp", "Texture\\himmel04.bmp", "Texture\\himmel05.bmp"];
+    let names = envir.map(|e| e.sky_textures.clone()).unwrap_or_else(|| STOCK.map(String::from));
     let mut ids = Vec::new();
-    for n in &names {
+    for (n, stock) in names.iter().zip(STOCK) {
         let p = omsi_cfg::resolve_path(&args.root, n);
-        match omsi_texture::decode_file(&p) {
+        // a sky pack's picture that cannot be read leaves the stock one in its place: giving
+        // up here took the clouds with it, whatever the weather (#749)
+        let img = omsi_texture::decode_file(&p).or_else(|e| {
+            log::warn!("sky texture {}: {e}", p.display());
+            omsi_texture::decode_file(&omsi_cfg::resolve_path(&args.root, stock))
+        });
+        match img {
             Ok(img) => ids.push(renderer.add_texture(scene, &img, false)),
             Err(e) => {
-                log::warn!("sky texture {}: {e}", p.display());
+                log::warn!("sky texture {stock}: {e}");
                 return;
             }
         }
@@ -240,7 +246,7 @@ fn cloud_texture(root: &Path, kind: &str) -> Option<omsi_texture::Image> {
 
 /// Cloud cover of a weather file: `[clouds] type density`, type -1 = clear, density up to
 /// ~300 (Cumulus 3) - mapped to 0..1; the cover drifts with the wind.
-pub(crate) fn clouds_of(w: &omsi_content::weather::Weather, time: f64) -> (f32, [f32; 2]) {
+pub(crate) fn clouds_of(w: &omsi_content::weather::Weather, drift: [f32; 2]) -> (f32, [f32; 2]) {
     let kind = w.clouds.0.trim();
     if kind.is_empty() || kind.starts_with("-1") || !CLOUDS.load(std::sync::atomic::Ordering::Relaxed) {
         return (0.0, [0.0; 2]);
@@ -263,13 +269,25 @@ pub(crate) fn clouds_of(w: &omsi_content::weather::Weather, time: f64) -> (f32, 
     } else {
         0.5
     };
-    // [wind] direction (deg) speed (m/s): drift over the 2500 m tiling. (It was the time of
-    // day, and at midnight the whole sky jumped back.)
-    let (dir, speed) = (w.wind.0.to_radians(), w.wind.1);
-    // `time` runs on over midnight (seconds since the year began, see the callers); the
-    // field repeats every tile, so only the fraction of a tile is kept
-    let drift = (time * speed as f64 / 2500.0).rem_euclid(1.0) as f32;
-    (density, [dir.sin() * drift, dir.cos() * drift])
+    (density, drift)
+}
+
+/// The clouds' drift after `time` seconds of a steady wind (see `cloud_drift_step`).
+pub(crate) fn cloud_drift_at(w: &omsi_content::weather::Weather, time: f64) -> [f32; 2] {
+    let mut d = [0.0; 2];
+    cloud_drift_step(&mut d, w, time);
+    d
+}
+
+/// Move the clouds on by `secs` of [wind] direction (deg) speed (m/s), over the 2500 m
+/// tiling; the field repeats every tile, so only the fraction of a tile is kept. (Taken
+/// from the absolute time, every change of the wind while a weather blends in moved the
+/// whole sky by time x change.)
+pub(crate) fn cloud_drift_step(d: &mut [f32; 2], w: &omsi_content::weather::Weather, secs: f64) {
+    let (dir, speed) = (w.wind.0.to_radians() as f64, w.wind.1 as f64);
+    let s = secs * speed / 2500.0;
+    d[0] = (d[0] as f64 + dir.sin() * s).rem_euclid(1.0) as f32;
+    d[1] = (d[1] as f64 + dir.cos() * s).rem_euclid(1.0) as f32;
 }
 
 /// How wet the roads are: rain soaks them in a few minutes, sunshine dries them in about
@@ -287,14 +305,14 @@ pub(crate) fn road_wetness(rate: f32, secs: f64, start: f32) -> f32 {
 pub(crate) fn weather_lighting(
     daylight: &omsi_sim::Daylight,
     w: &omsi_content::weather::Weather,
-    time: f64,
+    cloud_drift: [f32; 2],
     wetness: f32,
     shadows: bool,
 ) -> omsi_render::Lighting {
     let mut lighting = lights::lighting_from(daylight, w.fog.0);
     lighting.enhanced = ENHANCED.load(std::sync::atomic::Ordering::Relaxed);
     lighting.classic = CLASSIC.load(std::sync::atomic::Ordering::Relaxed);
-    let (density, offset) = clouds_of(w, time);
+    let (density, offset) = clouds_of(w, cloud_drift);
     lighting.cloud_density = density;
     lighting.cloud_offset = offset;
     let (kind, rate) = precip_of(w);
@@ -306,7 +324,10 @@ pub(crate) fn weather_lighting(
         if w.snow { 1.0 } else { 0.0 },
     );
     lighting.wetness = wetness;
-    lighting.shadows = shadows;
+    // Omsi.exe hides the sun under an 'ovc' cloud type (the Overcast ones in clouds.cfg) and
+    // draws no sun shadows below 350 m visibility
+    let overcast = w.clouds.0.trim().to_ascii_lowercase().starts_with("overcast");
+    lighting.shadows = shadows && !overcast && w.fog.0 > 350.0;
     lighting
 }
 
@@ -373,9 +394,36 @@ pub(crate) fn initial_wetness(w: &omsi_content::weather::Weather) -> f32 {
 }
 
 
+/// The airports OMSI's METAR list (`Weather/ICAO.txt`) offers: (ICAO, "ICAO - name").
+pub(crate) fn metar_airports(root: &std::path::Path) -> Vec<(String, String)> {
+    let text = std::fs::read(omsi_cfg::resolve_path(root, "Weather/ICAO.txt"))
+        .map(|b| omsi_cfg::codepage::decode(&b))
+        .unwrap_or_default();
+    let mut v: Vec<(String, String)> = text
+        .lines()
+        .filter_map(|l| l.split_once(" - ").map(|(c, n)| (c.trim().to_ascii_uppercase(), format!("{} - {}", c.trim(), n.trim()))))
+        .filter(|(c, _)| c.len() == 4)
+        .collect();
+    if !v.iter().any(|a| a.0 == "EDDB") {
+        v.insert(0, ("EDDB".into(), "EDDB - Berlin Brandenburg".into()));
+    }
+    v
+}
+
 /// The weather of an airport's METAR report (aviationweather.gov), or a clear day when it
 /// cannot be had (no network, an unknown station).
 pub(crate) fn fetch_metar(icao: &str) -> omsi_content::weather::Weather {
+    match try_metar(icao) {
+        Some(w) => w,
+        None => {
+            log::warn!("current weather at {icao}: no METAR report could be had; a clear day instead");
+            omsi_content::weather::from_metar(icao, "CAVOK")
+        }
+    }
+}
+
+/// The weather of an airport's METAR report, None when it cannot be had.
+pub(crate) fn try_metar(icao: &str) -> Option<omsi_content::weather::Weather> {
     // (Tegel, OMSI's Berlin default, closed in 2020: Berlin's airport now reports)
     let icao = match icao.to_ascii_uppercase().as_str() {
         "EDDT" | "EDDI" | "" => "EDDB".to_string(),
@@ -389,16 +437,45 @@ pub(crate) fn fetch_metar(icao: &str) -> omsi_content::weather::Weather {
         .and_then(|r| r.into_string().ok())
         .map(|t| t.lines().next().unwrap_or("").trim().to_string())
         .filter(|t| !t.is_empty());
-    match text {
-        Some(t) => {
-            log::info!("current weather at {icao}: {t}");
-            let mut w = omsi_content::weather::from_metar(&icao, &t);
-            w.path = std::path::PathBuf::from(format!("metar:{icao}"));
-            w
+    let t = text?;
+    log::info!("current weather at {icao}: {t}");
+    let mut w = omsi_content::weather::from_metar(&icao, &t);
+    w.path = std::path::PathBuf::from(format!("metar:{icao}"));
+    Some(w)
+}
+
+/// The start of a weather text that carries a METAR report's values (not a file, not a
+/// download): what a host or server with the METAR sync tells the players, who make the
+/// weather from it themselves and need no sync of their own.
+pub(crate) const REPORT: &str = "metar-report:";
+
+/// `w` (made from a METAR report) as the text the session tells the players: the station and
+/// the report up to its forecast, which `from_metar` does not read either.
+pub(crate) fn report_wire(w: &omsi_content::weather::Weather) -> Option<String> {
+    let path = w.path.to_string_lossy();
+    let icao = path.strip_prefix("metar:")?;
+    let mut raw: Vec<&str> = Vec::new();
+    for t in w.description.split_whitespace() {
+        if matches!(t.trim_end_matches('='), "TEMPO" | "BECMG" | "NOSIG" | "RMK" | "PROB30" | "PROB40") {
+            break;
         }
-        None => {
-            log::warn!("current weather at {icao}: no METAR report could be had; a clear day instead");
-            omsi_content::weather::from_metar(&icao, "CAVOK")
-        }
+        raw.push(t);
     }
+    let raw = raw.join(" ");
+    if icao.is_empty() || raw.is_empty() {
+        return None;
+    }
+    // (the network's weather field holds 260 characters)
+    Some(format!("{REPORT}{icao} {raw}").chars().take(250).collect())
+}
+
+/// The weather of a text made by `report_wire`.
+pub(crate) fn from_report(s: &str) -> Option<omsi_content::weather::Weather> {
+    let (icao, raw) = s.trim().strip_prefix(REPORT)?.split_once(' ')?;
+    if !(3..=5).contains(&icao.len()) || !icao.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let mut w = omsi_content::weather::from_metar(icao, raw);
+    w.path = std::path::PathBuf::from(format!("metar:{icao}"));
+    Some(w)
 }

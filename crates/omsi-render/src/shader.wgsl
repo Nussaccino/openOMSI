@@ -152,9 +152,13 @@ fn weather_outside_n(world: vec3<f32>, n: vec3<f32>, terrain: bool, surface: f32
     }
     // a vehicle's part (lib.rs `Instance::roof`): under its roof it is dry, whichever
     // vehicle it is - the one the camera is in, another player's, a timetable bus
+    // (what faces up only: taken for every face below the roof, the whole outer skin of
+    // every car and bus below the roof's edge was cab - lit by the dim cab light in the
+    // enhanced picture, dry in the rain - with a hard seam round the body 0.3 m under the
+    // roof where the sky's light began, #805)
     if (surface < -500.0) {
         let roof = -surface - 5000.0;
-        if (world.z < roof - 0.3) {
+        if (world.z < roof - 0.3 && n.z > 0.5) {
             return 0.0;
         }
     }
@@ -305,6 +309,8 @@ struct MaterialParams {
     pbr: vec4<f32>,
     // x: one of the bus's own screens (the enhanced glow and FXAA leave it alone)
     flags: vec4<f32>,
+    // rgb: the D3D material's ambient colour, which takes the ambient light (C)
+    ambient: vec4<f32>,
 };
 @group(1) @binding(2) var<uniform> material: MaterialParams;
 @group(1) @binding(3) var t_trans: texture_2d<f32>;
@@ -315,6 +321,24 @@ struct MaterialParams {
 @group(1) @binding(8) var t_bump: texture_2d<f32>;
 @group(1) @binding(9) var t_pbr_normal: texture_2d<f32>;
 @group(1) @binding(10) var t_pbr_orm: texture_2d<f32>;
+@group(1) @binding(11) var s_tile: sampler;
+
+// Paint/cut masks and night light maps cover one tile. Wrapping at its edge blends in
+// the opposite edge of the SAME tile, opening grass seams even when adjacent masks
+// agree. The diffuse/detail textures still repeat through s_diffuse.
+fn sample_transmap(uv: vec2<f32>) -> vec4<f32> {
+    if (material.extra.x > 0.5) {
+        return textureSample(t_trans, s_tile, uv);
+    }
+    return textureSample(t_trans, s_diffuse, uv);
+}
+
+fn sample_nightmap(uv: vec2<f32>) -> vec4<f32> {
+    if (material.extra.x > 0.5) {
+        return textureSample(t_night, s_tile, uv);
+    }
+    return textureSample(t_night, s_diffuse, uv);
+}
 
 // The reflection mask of a [matl_envmap] material: the alpha of its [matl_envmap_mask]
 // texture when it has one, else the diffuse texture's alpha - which reads 1 for a texture
@@ -340,7 +364,13 @@ fn diffuse_border(tex: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
         material.flags.w,
     );
     let outside = any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0));
-    return select(tex, border, material.flags.y > 0.5 && outside);
+    return select(tex, border, material.flags.y > 0.5 && material.flags.y < 1.5 && outside);
+}
+
+// [matl_texadress_mirroronce]: Direct3D mirrors the coordinates once about 0 and clamps
+// them beyond; the clamping sampler does the rest.
+fn tex_address(uv: vec2<f32>) -> vec2<f32> {
+    return select(uv, abs(uv), material.flags.y > 1.5);
 }
 
 fn reflection_mask(uv: vec2<f32>, diffuse_a: f32) -> f32 {
@@ -393,6 +423,19 @@ struct VsOut {
     @location(4) params2: vec4<f32>,
     // the D3D material's highlight, lit at the vertex as Omsi.exe's fixed function lights
     // it: from the sun (light A) and from the light above (light B)
+    @location(5) spec_sun: vec3<f32>,
+    @location(6) spec_sky: vec3<f32>,
+};
+// What the fragment shaders take: VsOut without the invariant on the position. The
+// invariant belongs to the vertex output; on a fragment input naga's GLSL writer turns it
+// into `invariant gl_FragCoord`, which desktop GL drivers and GLES reject.
+struct FsIn {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) params: vec4<f32>,
+    @location(4) params2: vec4<f32>,
     @location(5) spec_sun: vec3<f32>,
     @location(6) spec_sky: vec3<f32>,
 };
@@ -467,6 +510,49 @@ fn vertex_main(in_pos: vec3<f32>, in_normal: vec3<f32>, in_uv: vec2<f32>, in_ins
         out.clip = vec4<f32>(0.0, 0.0, 2.0, 1.0);
     }
     return out;
+}
+
+struct VehicleBox { a: vec4<f32>, b: vec4<f32>, c: vec4<f32> };
+struct VehicleReflection { plane: vec4<f32>, parts: array<VehicleBox, 4> };
+@group(2) @binding(0) var<uniform> vehicle_reflection: VehicleReflection;
+
+@vertex
+fn vs_puddle_vehicle(in: VsIn) -> VsOut {
+    let e = draw_list[in.inst];
+    let m = model_matrix(e);
+    var out: VsOut;
+    out.world = (m * vec4<f32>(in.pos, 1.0)).xyz;
+    out.normal = safe_normal((m * vec4<f32>(in.normal, 0.0)).xyz);
+    let pr = inst_params[e * 2u];
+    out.uv = in.uv + pr.zw;
+    out.params = pr;
+    out.params2 = inst_params[e * 2u + 1u];
+    out.spec_sun = vec3<f32>(0.0);
+    out.spec_sky = vec3<f32>(0.0);
+    let plane = vehicle_reflection.plane;
+    let reflected = out.world - 2.0 * plane.xyz * (dot(plane.xyz, out.world) - plane.w);
+    out.clip = camera.view_proj * vec4<f32>(reflected, 1.0);
+    if (out.params.y < 0.5) { out.clip = vec4<f32>(0.0, 0.0, 2.0, 1.0); }
+    return out;
+}
+
+// Close an open legacy underbody with one depth-tested face in the same reflected
+// view. Wheels and authored panels occlude it normally; no screen-space bands.
+@vertex
+fn vs_puddle_chassis(@builtin(vertex_index) i: u32, @builtin(instance_index) part: u32) -> @builtin(position) vec4<f32> {
+    let corners = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0));
+    let box = vehicle_reflection.parts[part];
+    let local = corners[i] * max(box.b.yz - vec2<f32>(0.12, 0.18), vec2<f32>(0.0)) + box.c.xy;
+    let sh = box.a.w;
+    let ch = box.b.x;
+    let xy = box.a.xy + vec2<f32>(local.x * ch + local.y * sh, -local.x * sh + local.y * ch);
+    let plane = vehicle_reflection.plane;
+    let road_z = (plane.w - dot(plane.xy, xy)) / plane.z;
+    let z = max(road_z + 0.18, box.a.z + box.c.z - box.b.w + 0.04);
+    let world = vec3<f32>(xy, z);
+    let reflected = world - 2.0 * plane.xyz * (dot(plane.xyz, world) - plane.w);
+    return camera.view_proj * vec4<f32>(reflected, 1.0);
 }
 
 // Shadow map passes: depth from the sun, alpha-tested materials cut out by their texture.
@@ -545,11 +631,26 @@ fn vs_shadow_far(in: VsIn) -> VsOut {
 }
 
 @fragment
-fn fs_shadow(in: VsOut) {
+fn fs_shadow(in: FsIn) {
+}
+
+// Reflection rays need the window surface as well as the opaque interior behind it.
+// This writes a private hit-depth texture after colour compositing; ordinary depth and
+// AO still leave glass transparent. Reject absent/fully faded layers and texture holes.
+@fragment
+fn fs_puddle_glass_depth(in: FsIn) {
+    var a = diffuse_border(textureSample(t_diffuse, s_diffuse, tex_address(in.uv)), in.uv).a;
+    if (material.params.z > 0.5) {
+        let tm = sample_transmap(tex_address(in.uv - in.params.zw));
+        a = select(1.0, tm.a, material.params.w > 0.5);
+    }
+    if (a * material.color.a * in.params.x < 0.002) {
+        discard;
+    }
 }
 
 @fragment
-fn fs_shadow_test(in: VsOut) {
+fn fs_shadow_test(in: FsIn) {
     if (!cutout_covers(in.uv, in.params)) {
         discard;
     }
@@ -557,7 +658,7 @@ fn fs_shadow_test(in: VsOut) {
 
 // Whether an alpha-tested material covers its pixel in the depth passes (`fs_shadow_test`).
 fn cutout_covers(in_uv: vec2<f32>, in_params: vec4<f32>) -> bool {
-    var duv = in_uv;
+    var duv = tex_address(in_uv);
     if (material.extra.x > 0.5) {
         duv = in_uv * material.extra.z;
     }
@@ -571,7 +672,7 @@ fn cutout_covers(in_uv: vec2<f32>, in_params: vec4<f32>) -> bool {
     var a = select(diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv).a, 1.0, material.params.x > 1.5 && material.params.z < 0.5);
     if (material.params.z > 0.5) {
         // (the transmap stays where it is: [texcoordtransX/Y] only moves the diffuse stage)
-        let tm = textureSample(t_trans, s_diffuse, in_uv - in_params.zw);
+        let tm = sample_transmap(tex_address(in_uv - in_params.zw));
         a = select(1.0, tm.a, material.params.w > 0.5);
     }
     return a >= 0.5;
@@ -581,8 +682,8 @@ fn cutout_covers(in_uv: vec2<f32>, in_params: vec4<f32>) -> bool {
 // Once the surface phases are complete, only fully covered diffuse pixels occlude
 // later scenery. The transparent borders must not become invisible depth walls.
 @fragment
-fn fs_surface_depth(in: VsOut) -> @location(0) vec4<f32> {
-    let a = diffuse_border(textureSample(t_diffuse, s_diffuse, in.uv), in.uv).a
+fn fs_surface_depth(in: FsIn) -> @location(0) vec4<f32> {
+    let a = diffuse_border(textureSample(t_diffuse, s_diffuse, tex_address(in.uv)), in.uv).a
         * material.color.a * in.params.x;
     if (a < 0.999) {
         discard;
@@ -598,7 +699,7 @@ fn fs_surface_depth(in: VsOut) -> @location(0) vec4<f32> {
 // the effectively opaque part of a transmap in a separate depth-only pass; window pixels
 // remain out of the prepass and are composited normally.
 @fragment
-fn fs_transmap_depth(in: VsOut) {
+fn fs_transmap_depth(in: FsIn) {
     if (!transmap_covers(in.uv, in.params)) {
         discard;
     }
@@ -606,7 +707,7 @@ fn fs_transmap_depth(in: VsOut) {
 
 // Whether the opaque part of a blended transmap covers its pixel (`fs_transmap_depth`).
 fn transmap_covers(in_uv: vec2<f32>, in_params: vec4<f32>) -> bool {
-    let tm = textureSample(t_trans, s_diffuse, in_uv - in_params.zw);
+    let tm = sample_transmap(tex_address(in_uv - in_params.zw));
     let a = select(1.0, tm.a, material.params.w > 0.5) * in_params.x;
     // Only what the colour pass will cover completely may hide what lies behind it: a
     // texel that is merely more opaque than not (the dimmer and anti-aliased dots of a
@@ -1327,7 +1428,7 @@ fn rain_env_vanilla(d: vec3<f32>) -> vec3<f32> {
 }
 
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
     if (material.emissive.w > 1.5) {
         // a pane's film of water: drops, not the sliding texture
         let v = normalize(camera.cam_pos.xyz - in.world);
@@ -1340,7 +1441,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let near = 1.0 - smoothstep(5.0, 15.0, distance(in.world, camera.cam_pos.xyz));
         return vec4<f32>(min(d.rgb, vec3<f32>(1.5)), d.a * near);
     }
-    var duv = in.uv;
+    var duv = tex_address(in.uv);
     if (material.extra.x > 0.5) {
         // terrain: uv is tile space; the ground texture repeats extra.z times per tile
         duv = in.uv * material.extra.z;
@@ -1349,7 +1450,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // The texture coordinates without the [texcoordtransX/Y] offset: in Omsi.exe's
     // fixed-function pipeline the texture transform is the diffuse stage's alone, the
     // transmap, night map and light map stay in place under a scrolling roller blind.
-    let buv = in.uv - in.params.zw;
+    let buv = tex_address(in.uv - in.params.zw);
     if (material.extra.x > 0.5 && material.extra.y > 0.0) {
         // the ground texture's detail texture, repeated finer than the texture itself and
         // modulated over it as the original's terrain pass does. The stock detail maps are
@@ -1363,19 +1464,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // is opaque, as D3D samples it: the WH UK AI cars' paint layer has a black 24-bit
         // `transmap_null.tga`, read as luminance the paint was invisible);
         // for terrain the map is the per-tile surface mask in tile space
-        let tm = textureSample(t_trans, s_diffuse, buv);
+        let tm = sample_transmap(buv);
         tex.a = select(1.0, tm.a, material.params.w > 0.5);
         if (material.extra.x > 0.5 && material.params.x > 1.5) {
             // A painted ground layer. The brush mask is coarse (0.6-3 m per texel) and
             // binary; the loader smooths it into a soft ramp around a smooth curve
-            // (`smooth_paint_mask` in scene.rs). Sharpen the ramp and let the ground
-            // texture's own light and dark decide where the new surface wins within the
-            // ramp - cobbles then fray into the grass stone by stone instead of in soft
-            // rectangles. (On the raw mask this sharpening is what drew the texel grid
-            // as a staircase along every painted edge.)
-            let lum = dot(tex.rgb, vec3<f32>(0.333, 0.333, 0.333));
-            let m = tex.a + (lum - 0.5) * 0.45;
-            tex.a = smoothstep(0.32, 0.68, m);
+            // (`smooth_paint_mask` in scene.rs). Sharpen only that coverage ramp:
+            // diffuse/detail mip colours change with viewing angle, and including
+            // their luminance made covered ground fade into lower layers at a slant.
+            tex.a = smoothstep(0.32, 0.68, tex.a);
         }
     }
     let mode = material.params.x;
@@ -1426,8 +1523,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let map_lamps = select(1.0, 0.0, (material.params.y > 0.2 && material.params.y < 0.3) || lm_only || tree_unlamped);
     let lamp_light = point_lights(in.world, n, map_lamps);
     var light = diffuse + lamp_light;
+    // D3D lights the material's diffuse colour with the sun, the light from above and the
+    // lamps, and its ambient colour with the ambient light (C). Omsi.exe makes every o3d
+    // slot's ambient white (0x7c62f8), so a white sign texture on a green material shows
+    // white in the shade, not green.
+    let ambient_light = camera.ambient.xyz * ao;
+    let mat_light = material.color.rgb * (light - ambient_light) + material.ambient.rgb * ambient_light;
     let light_mapped = material.params2.x > 0.5 && material.extra.x < 0.5;
-    var lit = albedo * material.color.rgb * light;
+    var lit = albedo * mat_light;
     // The vanilla picture: Omsi.exe's texture stages multiply the gamma-encoded texture by
     // the vertex light (clamped at 1); here the texture is sampled linear and the target
     // encodes again, so multiplied here a light L showed as L^(1/2.2) - a night at 0.06
@@ -1444,7 +1547,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         && material.extra.w > 0.5
         && material.extra.w < 1.5;
     if (classic && material.params.y < 0.5) {
-        var v = clamp(material.emissive.rgb + material.color.rgb * (light + interior_lamps(in.world, n, in.params2.z)), vec3<f32>(0.0), vec3<f32>(1.0));
+        var v = clamp(material.emissive.rgb + mat_light + material.color.rgb * interior_lamps(in.world, n, in.params2.z), vec3<f32>(0.0), vec3<f32>(1.0));
         if (light_mapped) {
             let lm = srgb_encode(textureSample(t_light, s_diffuse, buv).rgb) * clamp(in.params2.x, 0.0, 1.0);
             v = v + lm * (vec3<f32>(1.0) - v);
@@ -1455,7 +1558,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             // ground instead, as a night map glows, its faint fringe (0.01, linear) put
             // one beige veil over cobbles and grass alike, a whole car park the colour of
             // sand where OMSI 2 shows it dark grey.
-            let nm = srgb_encode(textureSample(t_night, s_diffuse, vec2<f32>(in.uv.x, 1.0 - in.uv.y)).rgb);
+            let nm = srgb_encode(sample_nightmap(vec2<f32>(in.uv.x, 1.0 - in.uv.y)).rgb);
             v = min(v + nm * camera.sun_color.w * clamp(in.params2.y, 0.0, 1.0), vec3<f32>(1.0));
         }
         lit = srgb_decode(srgb_encode(albedo) * v);
@@ -1469,7 +1572,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // saloon lamps lit a cabin twice over, flat white where the map was full; and the
         // material's colour took the map down with it.)
         let lm = textureSample(t_light, s_diffuse, buv).rgb * clamp(in.params2.x, 0.0, 1.0);
-        let v = clamp(material.emissive.rgb + material.color.rgb * (light + interior_lamps(in.world, n, in.params2.z)), vec3<f32>(0.0), vec3<f32>(1.0));
+        let v = clamp(material.emissive.rgb + mat_light + material.color.rgb * interior_lamps(in.world, n, in.params2.z), vec3<f32>(0.0), vec3<f32>(1.0));
         lit = albedo * (v + lm * (vec3<f32>(1.0) - v));
     }
     // the D3D material's own highlight (specular colour and power of the o3d file or a
@@ -1498,7 +1601,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // [matl_nightmap]: self-illumination that fades in with the night
         // terrain: the tile light map in tile space (north at the top row)
         let nuv = select(buv, vec2<f32>(in.uv.x, 1.0 - in.uv.y), material.extra.x > 0.5);
-        let nm = textureSample(t_night, s_diffuse, nuv);
+        let nm = sample_nightmap(nuv);
         // a [matl_item] night map is switched by its variable (warning lamps, displays):
         // it glows whenever that is on, by day as well; the others fade in with the night
         let night = select(camera.sun_color.w, 1.0, material.extra.w > 1.5);
@@ -1638,9 +1741,9 @@ struct Motion {
     // w: how many entries it holds
     params: vec4<f32>,
 };
-@group(2) @binding(0) var<uniform> motion: Motion;
+@group(3) @binding(0) var<uniform> motion: Motion;
 // last frame's model matrices, as `models`
-@group(2) @binding(1) var<storage, read> prev_models: array<vec4<f32>>;
+@group(3) @binding(1) var<storage, read> prev_models: array<vec4<f32>>;
 
 struct MotionOut {
     @builtin(position) @invariant clip: vec4<f32>,
@@ -1650,6 +1753,17 @@ struct MotionOut {
     @location(3) params: vec4<f32>,
     @location(4) params2: vec4<f32>,
     // (without the jitter) this frame's and last frame's clip position
+    @location(5) cur: vec4<f32>,
+    @location(6) prev: vec4<f32>,
+};
+// (the fragment side of MotionOut, without the invariant: see FsIn)
+struct MotionFsIn {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) params: vec4<f32>,
+    @location(4) params2: vec4<f32>,
     @location(5) cur: vec4<f32>,
     @location(6) prev: vec4<f32>,
 };
@@ -1688,12 +1802,12 @@ fn motion_pixels(cur: vec4<f32>, prev: vec4<f32>) -> vec4<f32> {
 }
 
 @fragment
-fn fs_motion(in: MotionOut) -> @location(0) vec4<f32> {
+fn fs_motion(in: MotionFsIn) -> @location(0) vec4<f32> {
     return motion_pixels(in.cur, in.prev);
 }
 
 @fragment
-fn fs_motion_test(in: MotionOut) -> @location(0) vec4<f32> {
+fn fs_motion_test(in: MotionFsIn) -> @location(0) vec4<f32> {
     if (!cutout_covers(in.uv, in.params)) {
         discard;
     }
@@ -1701,7 +1815,7 @@ fn fs_motion_test(in: MotionOut) -> @location(0) vec4<f32> {
 }
 
 @fragment
-fn fs_motion_transmap(in: MotionOut) -> @location(0) vec4<f32> {
+fn fs_motion_transmap(in: MotionFsIn) -> @location(0) vec4<f32> {
     if (!transmap_covers(in.uv, in.params)) {
         discard;
     }

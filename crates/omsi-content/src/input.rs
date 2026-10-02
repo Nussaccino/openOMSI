@@ -87,6 +87,19 @@ impl KeyboardCfg {
         if !q_taken && !self.vehicles.iter().any(|b| b.action.eq_ignore_ascii_case("IBIS_vor")) {
             self.vehicles.push(KeyBinding { action: "IBIS_vor".into(), scan_code: 16, modifier: 0 });
         }
+        // the LAN chat's keys, which the player can move like any other (#130): V shows
+        // and hides the chat (scan code 47, bound to nothing in OMSI's file), '/' (53)
+        // opens the line to write in
+        for (action, scan_code) in [("chat_toggle", 47), ("chat_open", 53)] {
+            if !self.game.iter().any(|b| b.action.eq_ignore_ascii_case(action)) {
+                self.game.push(KeyBinding { action: action.into(), scan_code, modifier: 0 });
+            }
+        }
+        for action in ["blinker_left_toggle", "blinker_right_toggle"] {
+            if !self.vehicles.iter().any(|b| b.action.eq_ignore_ascii_case(action)) {
+                self.vehicles.push(KeyBinding { action: action.into(), scan_code: 0, modifier: 0 });
+            }
+        }
         self
     }
 
@@ -97,6 +110,8 @@ impl KeyboardCfg {
             ("vr_recenter", 19, KEY_SHIFT | KEY_CTRL),
             ("vr_toggle_desktop_mirror", 65, 0),
             ("vr_toggle_mode", 66, 0),
+            ("vr_toggle_navigator", 49, KEY_SHIFT | KEY_CTRL),
+            ("vr_position_navigator", 50, KEY_SHIFT | KEY_CTRL),
         ] {
             if !self.game.iter().any(|b| b.action.eq_ignore_ascii_case(action)) {
                 self.game.push(KeyBinding { action: action.into(), scan_code, modifier });
@@ -198,6 +213,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn indicator_toggles_are_unbound_and_preserve_existing_bindings() {
+        let custom = KeyBinding { action: "BLINKER_LEFT_TOGGLE".into(), scan_code: 44, modifier: 0 };
+        let cfg = KeyboardCfg { vehicles: vec![custom.clone()], ..Default::default() }
+            .with_game_defaults().with_game_defaults();
+        assert_eq!(cfg.vehicles.iter().filter(|b| b.action.eq_ignore_ascii_case("blinker_left_toggle")).count(), 1);
+        assert!(cfg.vehicles.contains(&custom));
+        let right = cfg.vehicles.iter().find(|b| b.action == "blinker_right_toggle").unwrap();
+        assert_eq!((right.scan_code, right.modifier), (0, 0));
+    }
+
+    #[test]
+    fn the_chat_keys_are_in_the_list_and_a_moved_one_stays_moved() {
+        let cfg = KeyboardCfg::default().with_game_defaults();
+        let key = |c: &KeyboardCfg, a: &str| c.game.iter().filter(|b| b.action == a).map(|b| (b.scan_code, b.modifier)).collect::<Vec<_>>();
+        assert_eq!(key(&cfg, "chat_toggle"), vec![(47, 0)]);
+        assert_eq!(key(&cfg, "chat_open"), vec![(53, 0)]);
+        let moved = KeyboardCfg { game: vec![KeyBinding { action: "chat_open".into(), scan_code: 20, modifier: KEY_CTRL }], ..Default::default() }.with_game_defaults();
+        assert_eq!(key(&moved, "chat_open"), vec![(20, KEY_CTRL)]);
+    }
+
+    #[test]
     fn the_third_value_is_held_shift_ctrl_as_omsi_reads_it() {
         let b = |m: i32| KeyBinding { action: "a".into(), scan_code: 38, modifier: m };
         // throttle-like (1: held): the plain key, not Shift+key
@@ -219,6 +255,8 @@ mod tests {
         assert_eq!(cfg.game.iter().filter(|b| b.action == "vr_recenter").count(), 1);
         assert!(cfg.game.contains(&custom));
         assert!(cfg.game.iter().any(|b| b.action == "vr_toggle_mode" && b.scan_code == 66));
+        assert_eq!(cfg.game.iter().filter(|b| b.action == "vr_toggle_navigator").count(), 1);
+        assert!(cfg.game.iter().any(|b| b.action == "vr_toggle_navigator" && b.scan_code == 49 && b.modifier == (KEY_SHIFT | KEY_CTRL)));
     }
 
     #[test]

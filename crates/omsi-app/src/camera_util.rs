@@ -20,7 +20,7 @@ pub(crate) fn default_camera(world: &World) -> Camera {
             pitch,
             roll: 0.0,
             fov_deg: 60.0,
-            near: 0.5,
+            near: 0.1,
             far: 6000.0,
         };
         // the editor camera orbits the point at `dist`; step back along the view direction
@@ -34,7 +34,7 @@ pub(crate) fn default_camera(world: &World) -> Camera {
             pitch: -20.0,
             roll: 0.0,
             fov_deg: 60.0,
-            near: 0.5,
+            near: 0.1,
             far: 6000.0,
         }
     }
@@ -219,7 +219,7 @@ pub(crate) fn follow_camera(traffic: Option<&traffic::Traffic>, id: u64) -> Opti
                 pitch: f[4] as f32,
                 roll: 0.0,
                 fov_deg: 60.0,
-                near: 0.2,
+                near: 0.1,
                 far: 6000.0,
             });
         }
@@ -231,7 +231,7 @@ pub(crate) fn follow_camera(traffic: Option<&traffic::Traffic>, id: u64) -> Opti
                 pitch: f[4] as f32,
                 roll: 0.0,
                 fov_deg: 60.0,
-                near: 0.2,
+                near: 0.1,
                 far: 6000.0,
             });
         }
@@ -242,7 +242,7 @@ pub(crate) fn follow_camera(traffic: Option<&traffic::Traffic>, id: u64) -> Opti
         pitch: -80.0,
         roll: 0.0,
         fov_deg: 60.0,
-        near: 0.5,
+        near: 0.1,
         far: 6000.0,
     })
 }
@@ -308,6 +308,9 @@ pub(crate) fn mirror_view(v: &omsi_sim::VehicleInstance, c: &omsi_vehicle::Camer
 
 /// Where the driver's eye is (for a mirror drawn with no view to aim it by).
 pub(crate) fn driver_eye(p: &Player) -> DVec3 {
+    if let Some((t, c)) = p.trailer_driver_camera() {
+        return t.camera_world_full(c).0;
+    }
     let def = &p.vehicle.ty.def;
     let n = def.cameras_driver.len().max(1);
     match def.cameras_driver.get((def.camera_std + p.cam_choice.0) % n) {
@@ -356,8 +359,13 @@ pub(crate) fn render_mirrors(
     // whose light is OMSI's: a night that stays a blue dusk. The window's enhanced night is
     // far darker, and the mirrors showed the street by daylight beside it. The plain light
     // is taken down with the night (the lamps keep theirs) to the enhanced picture's level.
+    // (By the sun's darkness, Envir_Brightness's ramp from +6 to -6 degrees: `night` is
+    // whole at sunset already, from +10 degrees on, and rain raises it by day, and the
+    // mirrors were a fifth of the window's light through the whole dusk, #432.)
     if lighting.enhanced && omsi_cfg::env::var_os("OMSI_MIRROR_ENHANCED").is_none() {
-        let k = 1.0 - MIRROR_NIGHT_DIM * lighting.night.clamp(0.0, 1.0);
+        let alt = lighting.sun_dir.z.clamp(-1.0, 1.0).asin().to_degrees();
+        let dark = 1.0 - ((alt + 6.0) / 12.0).clamp(0.0, 1.0);
+        let k = 1.0 - MIRROR_NIGHT_DIM * dark;
         lighting.ambient *= k;
         lighting.secondary *= k;
         lighting.sun_color *= k;
