@@ -44,8 +44,7 @@ const OMSI_FRAME: f32 = 1.0 / 30.0;
 /// The suspension as Omsi.exe has it (see `step_slice`); `OMSI_TYRE_SUSPENSION=1` gives
 /// the old one with a wheel mass, a tyre and bump stops (A/B).
 fn omsi_suspension() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| omsi_cfg::env::var_os("OMSI_TYRE_SUSPENSION").is_none())
+    !omsi_cfg::flags::OMSI_TYRE_SUSPENSION.is_set()
 }
 
 /// What is left of the body's pitch and roll rate after `dt` seconds of OMSI's damping.
@@ -99,7 +98,7 @@ const WALL_HEIGHT: f64 = 1.5;
 const WALL_K: f32 = 1.5e6;
 const WALL_C: f32 = 6.0e4;
 /// Share of the closing speed an obstacle gives back, and the sliding friction along it.
-const RESTITUTION: f32 = 0.2;
+pub(crate) const RESTITUTION: f32 = 0.2;
 const SCRAPE_FRICTION: f32 = 0.4;
 /// Below this closing speed (m/s) a touch is a push, not a crash.
 pub const CRASH_SPEED: f32 = 0.4;
@@ -235,7 +234,7 @@ impl RigidWheel {
         let mu_n = friction * c.grip;
         // (`OMSI_NO_WHEEL_SLIP=1`: every wheel grips, as before the wheels had a turning of
         // their own - for comparison)
-        let no_slip = omsi_cfg::env::var_os("OMSI_NO_WHEEL_SLIP").is_some();
+        let no_slip = omsi_cfg::flags::OMSI_NO_WHEEL_SLIP.is_set();
         if no_slip {
             self.slipping = false;
             self.locked = false;
@@ -395,6 +394,8 @@ pub struct RigidBody {
     /// Axle index of each wheel (two per axle, left then right).
     pub wheel_axle: Vec<usize>,
     pub steer_deg: f32,
+    /// The curvature the steering asks for this step (1/m, positive to the right).
+    pub kappa: f32,
     pub max_steer_deg: f32,
     /// `[rot_pnt_long]` and `[inv_min_turnradius]`: the line the bus turns about and the
     /// curvature of the full lock.
@@ -478,7 +479,7 @@ impl RigidBody {
         let inv_min_turn_radius = if def.inv_min_turn_radius > 0.0 { def.inv_min_turn_radius } else { max_steer_deg.to_radians().tan() / s };
         let springs: f32 = def.axles.iter().map(|a| 2.0 * if a.spring > 0.0 { a.spring } else { 150.0 }).sum();
         let body_freq = (springs / (mass / 1000.0)).max(0.0).sqrt();
-        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true }
+        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, kappa: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true }
     }
 
     /// Place the body at rest with its wheels on the ground plane at `origin.z`: heading
@@ -518,6 +519,18 @@ impl RigidBody {
         let pitch = f.z.clamp(-1.0, 1.0).asin().to_degrees();
         let bank = (-r.z).clamp(-1.0, 1.0).asin().to_degrees();
         (heading, pitch, bank)
+    }
+
+    /// The steering angle of wheel `i`'s axle (rad, positive to the right): the angle at the
+    /// middle of the axle, atan((long - rot_pnt_long) x curvature), the same for its left and
+    /// right wheel. That is what Omsi.exe hands the scripts as `Axle_Steering_<n>_L` and
+    /// `_R` alike (0x7cffb8 writes both variables of 0x7ea834 from the axle record's +8) -
+    /// the tyres' own angles (Ackermann, `RigidWheel::steer`) made the steering
+    /// wheel of the cab, which turns with `Axle_Steering_0_L`, go further to the left than
+    /// to the right (#953, #1073).
+    pub fn axle_steer(&self, i: usize) -> f32 {
+        let Some(w) = self.wheels.get(i) else { return 0.0 };
+        ((w.attach.y - self.rot_pnt_long) * self.kappa).atan().clamp(-1.05, 1.05)
     }
 
     /// Forward speed (m/s) in the body frame.
@@ -586,6 +599,22 @@ impl RigidBody {
         // body covers the whole frame the clock, the odometer and the scripts count (it was
         // cut to 50 ms: at 10 fps the bus went half as far as the time went on)
         let dt = if dt.is_finite() { dt.clamp(0.0, 0.25) } else { 0.0 };
+        // A script's value that is no number - a bus's `M_Wheel` or a brake force of 0/0 or
+        // 1/0 - put the whole body at NaN within a step: the bus vanished and the steering's
+        // clamp stopped the game a frame later ("min > max, or either was NaN", #1045).
+        // Such an input counts as none; and should the body still come out of the step at NaN
+        // (a value of the file's), it stays where it stood before, at rest.
+        let finite = |x: f32| if x.is_finite() { x } else { 0.0 };
+        let (drive_torque, steer) = (finite(drive_torque), finite(steer));
+        let sane: Vec<f32>;
+        let brake = if brake.iter().all(|b| b.is_finite()) {
+            brake
+        } else {
+            sane = brake.iter().map(|&b| finite(b)).collect();
+            &sane
+        };
+        let before = (self.position, self.orientation, self.steer_deg);
+        let wheels_before: Vec<(f32, Option<f32>)> = self.wheels.iter().map(|w| (w.compression, w.touch)).collect();
         let slices = (dt / 0.05).ceil().max(1.0) as usize;
         let mut impacts = Vec::new();
         for _ in 0..slices {
@@ -609,6 +638,20 @@ impl RigidBody {
             }
         }
         self.wheel_impacts = impacts;
+        if !(self.position.is_finite() && self.orientation.is_finite() && self.velocity.is_finite() && self.omega.is_finite()) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| log::warn!("vehicle physics: the body's state became no number; it stays where it was, at rest"));
+            (self.position, self.orientation, self.steer_deg) = before;
+            self.velocity = Vec3::ZERO;
+            self.omega = Vec3::ZERO;
+            self.accel_body = Vec3::ZERO;
+            for (w, (c, t)) in self.wheels.iter_mut().zip(wheels_before) {
+                (w.compression, w.touch) = (c, t);
+                w.compression_rate = 0.0;
+                w.spin = 0.0;
+            }
+            self.wheel_impacts.clear();
+        }
     }
 
     fn step_slice(&mut self, dt: f32, drive_torque: f32, brake: &[f32], steer: f32, probe: &dyn Fn(f64, f64, f64) -> GroundProbe) {
@@ -618,6 +661,7 @@ impl RigidBody {
         // input's business (keys, mouse, wheel), not the axle's: the old fixed rate here
         // lagged every mouse and controller movement by up to 0.4 s.
         let kappa = steer.clamp(-1.0, 1.0) * self.inv_min_turn_radius;
+        self.kappa = kappa;
         let front = self.wheels.iter().map(|w| w.attach.y).fold(f32::MIN, f32::max);
         for w in self.wheels.iter_mut() {
             // each tyre square to the line from the centre of the turn to itself - the inner
@@ -880,7 +924,7 @@ impl RigidBody {
                     if before != 0.0 && sign(before) != sign(w.spin) && brake_w > 0.0 {
                         w.spin = 0.0;
                     }
-                    w.slipping = omsi_cfg::env::var_os("OMSI_NO_WHEEL_SLIP").is_none();
+                    w.slipping = !omsi_cfg::flags::OMSI_NO_WHEEL_SLIP.is_set();
                     w.rpm = w.spin * 60.0 / std::f32::consts::TAU;
                     w.rotation_deg = (w.rotation_deg + w.spin.to_degrees() * h).rem_euclid(360.0);
                     // the tyre off the ground (or nothing under it: the edge of the loaded
@@ -1190,10 +1234,17 @@ impl RigidBody {
                     continue;
                 }
             }
+            // (a car leaving the body fast goes out of it by itself)
+            if o.mass > 0.0 && vn_full > CRASH_SPEED {
+                continue;
+            }
             // out of the obstacle along the shortest way, a millimetre clear - out of a moving
-            // one only as far as the body itself ran into it this frame: a standing car is not
-            // ploughed through, and one that drives into the bus does not drag it along
-            let out = if o.mass > 0.0 { (c.depth as f32).min((-vn).max(0.0) * dt + 0.001) } else { c.depth as f32 + 0.001 };
+            // one that comes on only as far as the body itself ran into it this frame: a
+            // standing car is not ploughed through, and one that drives into the bus does not
+            // drag it along (not even creeping, below the crash speed). Out of a car that
+            // stands or draws away the bus comes all the way: it no longer hangs in it.
+            let approaching = o.mass > 0.0 && v_other.dot(n) > 0.0;
+            let out = if approaching { (c.depth as f32).min((-vn).max(0.0) * dt + 0.001) } else { c.depth as f32 + 0.001 };
             self.position += (n * out).as_dvec3();
             if vn_full >= 0.0 {
                 continue;
@@ -1541,6 +1592,66 @@ mod tests {
         for _ in 0..(secs * 60.0) as usize {
             rb.step(1.0 / 60.0, torque, &brakes, 0.0, g);
         }
+    }
+
+    #[test]
+    fn driving_past_a_thin_roadside_triangle_has_no_false_wall() {
+        let mut grid = omsi_geometry::DriveGrid::default();
+        grid.push([Vec3::ZERO, Vec3::new(30.0, 0.0, 0.0), Vec3::new(0.0, 50.0, 0.0)]);
+        grid.push([Vec3::new(30.0, 0.0, 0.0), Vec3::new(30.0, 50.0, 0.0), Vec3::new(0.0, 50.0, 0.0)]);
+        // Entirely beside the bus's wheel track. A tolerance on the infinite
+        // edge lines extended this face into the road and extrapolated its height.
+        grid.push([Vec3::new(10.0, 10.0, 0.0), Vec3::new(12.0, 9.6, 0.8), Vec3::new(10.0, 9.999, 0.0)]);
+        grid.build(300.0);
+        let ground = |x: f64, y: f64, top: f64| {
+            let p = grid.probe(x as f32, y as f32, top as f32);
+            GroundProbe { below: p.below.map(f64::from), above: p.above.map(f64::from) }
+        };
+        for fps in [30, 60] {
+            for kmh in [5.0, 40.0, 45.0, 60.0] {
+                let mut rb = RigidBody::from_definition(&bus(), &[]);
+                rb.place(DVec3::new(14.0, 4.0, 0.0), 0.0);
+                run(&mut rb, 2.0, 0.0, 0.0, &ground);
+                let speed = kmh / 3.6;
+                rb.velocity = Vec3::Y * speed;
+                for w in &mut rb.wheels { w.spin = speed / w.radius; }
+                let radius = rb.wheels.iter().find(|w| w.driven).unwrap().radius;
+                let dt = 1.0 / fps as f32;
+                // Hold speed with drive torque so the slow case crosses too.
+                for _ in 0..(18.0 / speed / dt).ceil() as usize {
+                    let torque = ((speed - rb.forward_speed()) * rb.mass * 2.0 + rb.rolling_resistance) * radius;
+                    rb.step(dt, torque, &[0.0; 4], 0.0, &ground);
+                    assert!(rb.wheel_impacts.is_empty(), "{kmh} km/h at {fps} fps: {:?}", rb.wheel_impacts);
+                    assert!(rb.wheels.iter().all(|w| w.walls.is_empty()), "{kmh} km/h at {fps} fps: false wheel wall");
+                }
+                assert!(rb.position.y > 20.0, "{kmh} km/h at {fps} fps: stopped at {:?}", rb.position);
+                assert!(rb.forward_speed() > speed * 0.9, "{kmh} km/h at {fps} fps: lost speed");
+            }
+        }
+    }
+
+    /// `Axle_Steering_*` is the axle's angle, one for both sides, the same to the left as to
+    /// the right (#953): the tyres keep their own Ackermann angles for the physics.
+    #[test]
+    fn the_axle_steers_as_far_left_as_right() {
+        let mut rb = RigidBody::from_definition(&bus(), &[]);
+        rb.place(DVec3::ZERO, 0.0);
+        let g = road(1e9, 0.0);
+        let mut at = |steer: f32| {
+            for _ in 0..5 {
+                rb.step(1.0 / 60.0, 0.0, &[0.0; 4], steer, &g);
+            }
+            (rb.axle_steer(0), rb.axle_steer(1), rb.wheels[0].steer, rb.wheels[1].steer)
+        };
+        let (l0, r0, tl0, tr0) = at(-1.0);
+        let (l1, r1, tl1, tr1) = at(1.0);
+        assert_eq!(l0, r0);
+        assert_eq!(l1, r1);
+        assert!((l0 + l1).abs() < 1e-6, "left {l0} right {l1}");
+        // (the full lock of 0.13 1/m, 5.94 m ahead of the turning line)
+        assert!((l1 - (5.938f32 * 0.13).atan()).abs() < 1e-3, "{l1}");
+        // the inner tyre turns further than the outer
+        assert!(tl0.abs() > tr0.abs() && tr1.abs() > tl1.abs(), "{tl0} {tr0} {tl1} {tr1}");
     }
 
     /// A brake stronger than the road takes locks the wheels (the ABS scripts see the
@@ -2183,6 +2294,57 @@ mod tests {
         assert!(hits[0].energy < 100_000.0, "{hits:?}");
     }
 
+    #[test]
+    fn moving_car_overlap_does_not_bulldoze_bus_and_clears_when_receding() {
+        let def = bus();
+        let bb = def.bounding_box.unwrap();
+        let mut rb = RigidBody::from_definition(&def, &[]);
+        rb.place(DVec3::ZERO, 0.0);
+        let g = road(1e9, 0.0);
+        run(&mut rb, 1.0, 0.0, 5000.0, &g);
+        let car = Obb::from_box(
+            [1.7, 4.2, 1.4, 0.0, 0.0, 0.7],
+            DVec3::new(-3.2, 0.0, 0.0),
+            90.0,
+        )
+        .moving(glam::DVec2::new(8.0, 0.0), 1000.0, 7);
+        assert!(rb.body_box(bb).overlaps(&car));
+
+        let impacts = rb.collide(bb, &[car], &|_| false, 1.0 / 30.0);
+
+        assert_eq!(impacts.len(), 1);
+        assert!(rb.body_box(bb).overlaps(&car));
+        assert!(rb.origin().x > 0.0 && rb.origin().x < 0.02, "{}", rb.origin().x);
+        let receding = Obb {
+            center: car.center - glam::DVec2::new(0.5, 0.0),
+            velocity: glam::DVec2::new(-8.0, 0.0),
+            ..car
+        };
+        rb.collide(bb, &[receding], &|_| false, 1.0 / 30.0);
+        assert!(!rb.body_box(bb).overlaps(&receding));
+    }
+
+    /// An AI car that creeps into the standing bus (below the crash speed, its planner blind
+    /// to the bus) does not shove it along at its own pace: the bus only leaves an overlap
+    /// as far as it moved into it itself, as it did before the moving-car change.
+    #[test]
+    fn a_creeping_car_does_not_shove_the_standing_bus() {
+        let def = bus();
+        let bb = def.bounding_box.unwrap();
+        let mut rb = RigidBody::from_definition(&def, &[]);
+        rb.place(DVec3::ZERO, 0.0);
+        let g = road(1e9, 0.0);
+        run(&mut rb, 1.0, 0.0, 5000.0, &g);
+        let x0 = rb.origin().x;
+        let mut car = Obb::from_box([1.7, 4.2, 1.4, 0.0, 0.0, 0.7], DVec3::new(-3.3, 0.0, 0.0), 90.0)
+            .moving(glam::DVec2::new(0.3, 0.0), 1000.0, 7);
+        for _ in 0..60 {
+            car.center += car.velocity / 30.0;
+            rb.collide(bb, &[car], &|_| false, 1.0 / 30.0);
+        }
+        assert!(rb.origin().x - x0 < 0.1, "the bus was shoved {:.2} m", rb.origin().x - x0);
+    }
+
     /// The scripts hear where the bodies meet - low down at the bumpers - not the height of
     /// the centre of gravity: reversing into a wall or a car is below 1.10 m and behind
     /// -4.70 m, where the stock buses damage their engine; a high beam is hit high.
@@ -2261,5 +2423,34 @@ mod tests {
         }
         assert!(broke);
         assert!(rb.forward_speed() > 25.0 / 3.6, "{}", rb.forward_speed() * 3.6);
+    }
+
+
+    /// A drive torque, steering or brake force that is no number (a script's 0/0) is taken
+    /// as none: the body keeps its place and speed instead of turning to NaN (#1045).
+    #[test]
+    fn inputs_that_are_no_number_leave_the_body_whole() {
+        for (torque, brake, steer) in [(f32::NAN, 0.0, 0.0), (3000.0, f32::INFINITY, 0.0), (3000.0, f32::NAN, 0.0), (3000.0, 0.0, f32::NAN), (f32::NEG_INFINITY, 0.0, 0.0)] {
+            let mut rb = RigidBody::from_definition(&bus(), &[]);
+            rb.place(DVec3::ZERO, 0.0);
+            let g = road(1e9, 0.0);
+            run(&mut rb, 1.0, 3000.0, 0.0, &g);
+            for _ in 0..60 {
+                rb.step(1.0 / 60.0, torque, &[brake; 4], steer, &g);
+            }
+            assert!(rb.position.is_finite() && rb.velocity.is_finite(), "{torque} {brake} {steer}: {:?} {:?}", rb.position, rb.velocity);
+            assert!(rb.forward_speed() > 0.1, "{torque} {brake} {steer}: {}", rb.forward_speed());
+            assert!(rb.wheels.iter().all(|w| w.compression.is_finite() && w.spin.is_finite()));
+        }
+        // a body whose own values are no number stays put
+        let mut rb = RigidBody::from_definition(&bus(), &[]);
+        rb.place(DVec3::ZERO, 0.0);
+        let g = road(1e9, 0.0);
+        run(&mut rb, 0.5, 0.0, 0.0, &g);
+        let at = rb.position;
+        rb.mass = f32::NAN;
+        rb.step(1.0 / 60.0, 3000.0, &[0.0; 4], 0.0, &g);
+        assert!(rb.position.is_finite() && (rb.position - at).length() < 1e-9, "{:?}", rb.position);
+        assert_eq!(rb.velocity, Vec3::ZERO);
     }
 }

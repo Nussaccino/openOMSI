@@ -53,7 +53,7 @@ fn substitute(c: char) -> char {
 /// Letters written as a base and a combining mark (Unicode's decomposed form, which is how
 /// macOS stores file names: "Eiseska\u{308}lte.owt") as the one letter Roboto draws - the
 /// mark alone was a box after a plain "a" in the launcher's weather list.
-fn composed(text: &str) -> std::borrow::Cow<'_, str> {
+pub fn composed(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.chars().any(|c| ('\u{300}'..='\u{36f}').contains(&c)) {
         return std::borrow::Cow::Borrowed(text);
     }
@@ -221,8 +221,13 @@ impl Fonts {
 
     /// Width of `text` in pixels at `px`.
     pub fn width(&self, text: &str, px: f32, weight: Weight) -> f32 {
-        let translated = crate::i18n::tr(text);
-        let comp = composed(&translated);
+        self.width_as_is(&crate::i18n::tr(text), px, weight)
+    }
+
+    /// [`Fonts::width`] of a text that is not the interface's own (a Lua plugin's): as it
+    /// is, not looked up in the translations.
+    pub fn width_as_is(&self, text: &str, px: f32, weight: Weight) -> f32 {
+        let comp = composed(text);
         let text = &*comp;
         let main = self.face(weight);
         let mut w = 0.0;

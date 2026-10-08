@@ -15,10 +15,15 @@ pub mod dds;
 pub mod gpu;
 pub mod tga;
 
+#[cfg(test)]
+mod format_tests;
+
 /// The widest and tallest texture any decoder accepts (what Direct3D 9 cards held).
 pub const MAX_DIMENSION: usize = 16384;
 
 pub mod pbr;
+pub mod season_mix;
+pub use season_mix::{find_texture_in_look, mixed_look, season_mix, set_season_mix, SeasonMix};
 pub use gpu::{gpu_options, set_gpu_options, GpuOptions, PixelFormat, TextureData};
 
 #[derive(Debug, Clone)]
@@ -218,14 +223,37 @@ fn bmp32_alpha(bytes: &[u8], width: u32, height: u32, rgba: &mut [u8]) -> bool {
 /// (may carry a path and any extension); `dirs` are searched in order.
 static SEASON: Mutex<Option<String>> = Mutex::new(None);
 
-/// Season texture subfolder (`spring`, `fall`, `Winter`, `WinterSnow`): textures found in
-/// `<texture dir>/<season>/` take precedence, like OMSI's `[addseason]`.
+/// Season texture subfolder (`Spring`, `Fall`, `Winter`, `WinterSnow`, `WinterSnowfall`,
+/// `SummerDry`): textures found in `<texture dir>/<season>/` take precedence, like OMSI's
+/// `[addseason]` - or in the folders after it that [`season_folders`] lists.
 pub fn set_season_folder(folder: Option<String>) {
     *SEASON.lock() = folder;
 }
 
 pub fn season_folder() -> Option<String> {
     SEASON.lock().clone()
+}
+
+/// The folders a texture's variant is looked for in under the season `head`, best first,
+/// as Omsi.exe picks it (0x7f910c): in snow the snowy roads of `WinterSnowfall` when the
+/// weather has snow on the road, else `WinterSnow`, and a texture with no snow picture
+/// takes its `Winter` one, else its `Fall` one; in winter `Winter`, else `Fall`. (With the
+/// one folder alone, a road whose snowy picture is in `WinterSnowfall` - the stock asphalt
+/// - stayed bare under the heaviest snowfall, and a texture with only a winter picture
+/// stayed green in the snow.)
+pub fn season_chain(head: &str) -> Vec<String> {
+    let chain: &[&str] = match head.to_ascii_lowercase().as_str() {
+        "wintersnowfall" => &["WinterSnowfall", "WinterSnow", "Winter", "Fall"],
+        "wintersnow" => &["WinterSnow", "Winter", "Fall"],
+        "winter" => &["Winter", "Fall"],
+        _ => return vec![head.to_string()],
+    };
+    chain.iter().map(|f| f.to_string()).collect()
+}
+
+/// The folders of the current season (see [`season_chain`]), none in summer.
+pub fn season_folders() -> Vec<String> {
+    season_folder().map(|f| season_chain(&f)).unwrap_or_default()
 }
 
 pub fn find_texture(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
@@ -261,7 +289,73 @@ pub fn find_texture(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
 }
 
 fn find_texture_uncached(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
-    find_texture_in_season(name, dirs, season_folder().as_deref())
+    find_texture_in_season(name, dirs, season_folder().as_deref()).or_else(|| find_texture_elsewhere(name, dirs))
+}
+
+/// A spline's or object's texture missing from its folders: the nearest same-named file under `Splines`/`Sceneryobjects`.
+fn find_texture_elsewhere(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
+    let name = name.trim();
+    if name.is_empty() || name.contains(['/', '\\']) {
+        return None;
+    }
+    let first = dirs.first()?;
+    let top = first.ancestors().find_map(|a| {
+        a.file_name().and_then(|f| f.to_str()).filter(|f| f.eq_ignore_ascii_case("Splines") || f.eq_ignore_ascii_case("Sceneryobjects")).map(|f| f.to_ascii_lowercase())
+    })?;
+    static INDEX: std::sync::OnceLock<Mutex<HashMap<String, (u64, Arc<HashMap<String, Vec<PathBuf>>>)>>> = std::sync::OnceLock::new();
+    let generation = omsi_cfg::content_generation();
+    let index = {
+        let mut all = INDEX.get_or_init(|| Mutex::new(HashMap::new())).lock();
+        match all.get(&top) {
+            Some((g, i)) if *g == generation => i.clone(),
+            _ => {
+                let i = Arc::new(texture_index(&top));
+                all.insert(top.clone(), (generation, i.clone()));
+                i
+            }
+        }
+    };
+    let key = |p: &Path| p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase());
+    let want = Path::new(name);
+    if !want.extension().and_then(|x| x.to_str()).is_some_and(|x| ["dds", "bmp", "jpg", "jpeg", "png", "tga"].iter().any(|t| x.eq_ignore_ascii_case(t))) {
+        return None;
+    }
+    let candidates = index.get(&key(want)?)?;
+    let shared = |p: &Path| p.components().zip(first.components()).take_while(|(a, b)| a == b).count();
+    let in_texture = |p: &Path| p.parent().and_then(|d| d.file_name()).and_then(|f| f.to_str()).is_some_and(|f| f.eq_ignore_ascii_case("texture"));
+    let same_ext = |p: &Path| p.extension().zip(want.extension()).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+    let found = candidates.iter().max_by_key(|p| (in_texture(p), shared(p), same_ext(p)))?.clone();
+    static SAID: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    if SAID.get_or_init(Default::default).lock().insert(name.to_ascii_lowercase()) {
+        log::info!("texture {name} is not in its folders ({}); taken from {}", first.display(), found.display());
+    }
+    Some(found)
+}
+
+/// Image files under `top` (`splines`/`sceneryobjects`) of every content root and mounted archive, by stem.
+fn texture_index(top: &str) -> HashMap<String, Vec<PathBuf>> {
+    let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut stack: Vec<PathBuf> = omsi_cfg::content_roots()
+        .into_iter()
+        .filter_map(|r| {
+            let (name, _) = omsi_cfg::vfs::list_dir(&r)?.into_iter().find(|(n, d)| *d && n.to_str().is_some_and(|n| n.eq_ignore_ascii_case(top)))?;
+            Some(r.join(name))
+        })
+        .collect();
+    while let Some(dir) = stack.pop() {
+        let Some(entries) = omsi_cfg::vfs::list_dir(&dir) else { continue };
+        for (name, is_dir) in entries {
+            let p = dir.join(name);
+            if is_dir {
+                stack.push(p);
+            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["dds", "bmp", "jpg", "png", "tga"].iter().any(|t| x.eq_ignore_ascii_case(t))) {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    out.entry(stem.to_ascii_lowercase()).or_default().push(p);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn find_texture_in_season(name: &str, dirs: &[&Path], season: Option<&str>) -> Option<PathBuf> {
@@ -284,7 +378,7 @@ fn find_texture_in_season(name: &str, dirs: &[&Path], season: Option<&str>) -> O
     // folder with it, so the season goes in front of the file name, not in front of the
     // whole path; both spellings are tried.
     let mut names: Vec<String> = Vec::new();
-    if let Some(f) = season {
+    for f in season.map(season_chain).unwrap_or_default() {
         match (stem_path.parent(), stem_path.file_name()) {
             (Some(par), Some(file)) if !par.as_os_str().is_empty() => names.push(format!("{}/{}/{}", par.display(), f, file.to_string_lossy())),
             (_, Some(file)) => names.push(format!("{}/{}", f, file.to_string_lossy())),
@@ -392,7 +486,7 @@ pub fn cfg_path(requested: &str, found: &Path) -> Option<PathBuf> {
         }
         for n in names {
             let c = d.join(&n);
-            if c.is_file() {
+            if omsi_cfg::vfs::is_file(&c) {
                 return Some(c);
             }
         }
@@ -590,6 +684,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// In snow a texture takes the variant Omsi.exe takes: the stock asphalt's snowy
+    /// picture (`WinterSnowfall`) only with snow on the road, a texture without a snow
+    /// picture its winter one, one without that its autumn one, else itself.
+    #[test]
+    fn a_texture_without_a_snow_picture_falls_back_as_omsi_does() {
+        let dir = std::env::temp_dir().join(format!("omsi-texture-snow-{}", std::process::id()));
+        let tex = dir.join("texture");
+        for f in ["WinterSnowfall", "WinterSnow", "Winter", "Fall"] {
+            std::fs::create_dir_all(tex.join(f)).unwrap();
+        }
+        for path in ["road.bmp", "WinterSnowfall/road.bmp", "walk.bmp", "WinterSnow/walk.bmp", "WinterSnowfall/walk.bmp", "hedge.bmp", "Winter/hedge.bmp", "Fall/hedge.bmp", "tree.bmp", "Fall/tree.bmp", "plain.bmp"] {
+            std::fs::write(tex.join(path), b"lookup-only fixture").unwrap();
+        }
+        let dirs = [tex.as_path()];
+        let find = |name: &str, season: &str| find_texture_in_season(name, &dirs, Some(season)).unwrap();
+        // snow on the road
+        assert_eq!(find("road.bmp", "WinterSnowfall"), tex.join("WinterSnowfall/road.bmp"));
+        assert_eq!(find("walk.bmp", "WinterSnowfall"), tex.join("WinterSnowfall/walk.bmp"));
+        assert_eq!(find("hedge.bmp", "WinterSnowfall"), tex.join("Winter/hedge.bmp"));
+        // snow, the roads clear
+        assert_eq!(find("road.bmp", "WinterSnow"), tex.join("road.bmp"));
+        assert_eq!(find("walk.bmp", "WinterSnow"), tex.join("WinterSnow/walk.bmp"));
+        assert_eq!(find("hedge.bmp", "WinterSnow"), tex.join("Winter/hedge.bmp"));
+        assert_eq!(find("tree.bmp", "WinterSnow"), tex.join("Fall/tree.bmp"));
+        assert_eq!(find("plain.bmp", "WinterSnow"), tex.join("plain.bmp"));
+        // winter: its own picture, else the autumn one
+        assert_eq!(find("hedge.bmp", "Winter"), tex.join("Winter/hedge.bmp"));
+        assert_eq!(find("tree.bmp", "Winter"), tex.join("Fall/tree.bmp"));
+        assert_eq!(find("walk.bmp", "Winter"), tex.join("walk.bmp"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn dds_precedes_exact_names_but_preserves_folder_priority() {
         let dir = std::env::temp_dir().join(format!("omsi-dds-priority-{}", std::process::id()));
@@ -601,18 +727,40 @@ mod tests {
             let stem = format!("sign_{ext}");
             std::fs::write(local.join(format!("{stem}.{ext}")), b"x").unwrap();
             std::fs::write(local.join(format!("{stem}.DDS")), b"x").unwrap();
-            let name = format!("{stem}.{ext}");
+        }
+        std::fs::write(local.join("local_only.png"), b"x").unwrap();
+        std::fs::write(global.join("local_only.dds"), b"x").unwrap();
+        std::fs::write(local.join("local_only.bmp"), b"x").unwrap();
+        // The case-insensitive directory listing is cached on Linux. Populate the
+        // fixture before the first lookup, as content loaded at game start is.
+        for ext in ["png", "jpg", "tga", "bmp"] {
+            let name = format!("sign_{ext}.{ext}");
             let found = find_texture_uncached(&name, &[&local]).unwrap();
             assert_eq!(found.extension().unwrap().to_string_lossy().to_ascii_lowercase(), "dds");
             assert_eq!(find_texture_uncached(local.join(&name).to_str().unwrap(), &[]), Some(found));
         }
-        std::fs::write(local.join("local_only.png"), b"x").unwrap();
-        std::fs::write(global.join("local_only.dds"), b"x").unwrap();
         assert_eq!(find_texture_uncached("local_only.png", &[&local, &global]), Some(local.join("local_only.png")));
         // Without DDS, the requested format wins over the other fallback formats.
-        std::fs::write(local.join("local_only.bmp"), b"x").unwrap();
         assert_eq!(find_texture_uncached("local_only.png", &[&local]), Some(local.join("local_only.png")));
         assert_eq!(find_texture_uncached("missing.png", &[&local]), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_spline_texture_missing_from_its_folders_comes_from_another_spline_folder() {
+        let dir = std::env::temp_dir().join(format!("omsi-elsewhere-{}", std::process::id()));
+        let (own, other) = (dir.join("Splines/Pack/Roads/texture"), dir.join("Splines/Pack/Paths/texture"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("gehweg.bmp"), b"x").unwrap();
+        std::fs::write(other.join("0.png"), b"x").unwrap();
+        omsi_cfg::add_content_root(dir.clone());
+        assert_eq!(find_texture_uncached("gehweg.bmp", &[&own]), Some(other.join("gehweg.bmp")));
+        assert_eq!(find_texture_uncached("0", &[&own]), None);
+        // content installed while the game runs is indexed again
+        std::fs::write(other.join("late.bmp"), b"x").unwrap();
+        omsi_cfg::content_changed();
+        assert_eq!(find_texture_uncached("late.bmp", &[&own]), Some(other.join("late.bmp")));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -627,6 +775,22 @@ mod tests {
         let upper = find_texture("ANZ-OBEN.JPG .", &[tex.as_path()]).map(|p| p.to_string_lossy().to_lowercase());
         assert_eq!(upper, Some(tex.join("anz-oben.jpg").to_string_lossy().to_lowercase()));
         assert_eq!(find_texture("texture.\\anz-oben.bmp", &[dir.as_path()]), Some(tex.join("anz-oben.jpg")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `[matl_freetex]` name of a bus stop sign (`\New Territories East\Freetex_Lolipop\x.bmp`)
+    /// is rooted at `texture\`, however its leading backslash reads as a path root.
+    #[test]
+    fn a_leading_backslash_names_a_texture_below_the_folder() {
+        let dir = std::env::temp_dir().join(format!("omsi-freetex-root-{}", std::process::id()));
+        let tex = dir.join("texture");
+        let sub = tex.join("New Territories East/Freetex_Lolipop");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("x.bmp"), b"x").unwrap();
+        assert_eq!(
+            find_texture("\\New Territories East\\Freetex_Lolipop\\x.bmp", &[tex.as_path()]),
+            Some(sub.join("x.bmp"))
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

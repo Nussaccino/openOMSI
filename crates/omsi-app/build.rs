@@ -19,6 +19,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
     windows_icon();
+    steam();
     // (the executable exports the two switchable-graphics hints of main.rs, see there)
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         for sym in ["NvOptimusEnablement", "AmdPowerXpressRequestHighPerformance"] {
@@ -27,8 +28,36 @@ fn main() {
     }
 }
 
+/// Steam's rich presence (`src/steam.rs`) on the targets `assets/steam_redist` has the library
+/// for: `cfg(steam)`, and the library copied beside the binary, where the game looks for it
+/// at its start (`@loader_path` on macOS, `$ORIGIN` on Linux, the exe's folder on Windows) -
+/// without it there the game does not start at all. Android, Windows on ARM and Linux on ARM
+/// have no Steam library and are built without it.
+fn steam() {
+    println!("cargo::rustc-check-cfg=cfg(steam)");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let lib = match (os.as_str(), arch.as_str()) {
+        ("windows", "x86_64") => "steam_api64.dll",
+        ("linux", "x86_64") => "libsteam_api.so",
+        ("macos", _) => "libsteam_api.dylib",
+        _ => return,
+    };
+    println!("cargo:rustc-cfg=steam");
+    if os == "linux" {
+        println!("cargo:rustc-link-arg-bin=openomsi=-Wl,-rpath,$ORIGIN");
+    }
+    let src = std::path::Path::new("../../assets/steam_redist").join(lib);
+    println!("cargo:rerun-if-changed={}", src.display());
+    // (OUT_DIR is <target>/<profile>/build/<crate>/out: the binary lies three folders up)
+    if let Some(dir) = std::env::var_os("OUT_DIR").map(std::path::PathBuf::from).and_then(|o| o.ancestors().nth(3).map(|d| d.to_path_buf())) {
+        let _ = std::fs::copy(&src, dir.join(lib));
+    }
+}
+
 /// `MAJOR.MINOR` from the VERSION file, then the number of commits since that file last
-/// changed (the CI passes the same number in `OPENOMSI_VERSION`).
+/// changed, not counting the never-released `[skip ci]` / `[skip actions]` ones (the CI
+/// passes the same number in `OPENOMSI_VERSION`).
 fn version(git: &dyn Fn(&[&str]) -> Option<String>) -> String {
     if let Ok(v) = std::env::var("OPENOMSI_VERSION") {
         if !v.trim().is_empty() {
@@ -36,12 +65,9 @@ fn version(git: &dyn Fn(&[&str]) -> Option<String>) -> String {
         }
     }
     let base = std::fs::read_to_string("../../VERSION").map(|s| s.trim().to_string()).unwrap_or_else(|_| "0.0".into());
-    // (the build script runs in crates/omsi-app: the path is the repository's VERSION file -
-    // as a bare "VERSION" git looked for crates/omsi-app/VERSION, found no commit, and every
-    // build outside the CI was 0.1.0, which the updater took for out of date)
-    let n = git(&["log", "-1", "--format=%H", "--", "../../VERSION"])
+    let n = git(&["log", "-1", "--format=%H", "--", "VERSION"])
         .filter(|h| !h.is_empty())
-        .and_then(|h| git(&["rev-list", "--count", &format!("{h}..HEAD")]))
+        .and_then(|h| git(&["rev-list", "--count", "--invert-grep", "--fixed-strings", "--grep=[skip ci]", "--grep=[skip actions]", &format!("{h}..HEAD")]))
         .unwrap_or_else(|| "0".into());
     format!("{base}.{n}")
 }

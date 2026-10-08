@@ -14,6 +14,39 @@ pub struct Terminus {
     pub strings: Vec<String>,
 }
 
+impl Terminus {
+    /// Name used for destination text while preserving the original HOF string indices.
+    pub fn display_name(&self) -> String {
+        let first = self.strings.iter().find(|s| !s.trim().is_empty()).map(String::as_str);
+        if first.is_some_and(|s| is_destination_image_path(s)) {
+            return self.texture_id.trim().to_string();
+        }
+        first.map(str::trim).filter(|s| !s.is_empty()).unwrap_or_else(|| self.texture_id.trim()).to_string()
+    }
+
+    /// Name used by the destination menu: the identifier on the second `[addterminus]` line.
+    pub fn menu_name(&self) -> String {
+        let first = self.strings.iter().find(|s| !s.trim().is_empty()).map(String::as_str).unwrap_or("").trim();
+        if !first.is_empty() && (first.eq_ignore_ascii_case("no") || is_destination_image_path(first) || has_route_label(&self.texture_id)) {
+            let id = self.texture_id.trim();
+            if !id.is_empty() {
+                return id.to_string();
+            }
+        }
+        self.display_name()
+    }
+}
+
+fn is_destination_image_path(s: &str) -> bool {
+    let s = s.trim().to_ascii_lowercase();
+    s.ends_with(".bmp") || s.ends_with(".tga") || s.ends_with(".png")
+}
+
+fn has_route_label(s: &str) -> bool {
+    let Some((prefix, _)) = s.trim().split_once(':') else { return false };
+    !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit() || c.is_ascii_alphabetic())
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BusStop {
     pub ident: String,
@@ -48,6 +81,27 @@ impl Hof {
     pub fn load(path: &Path) -> Result<Hof, omsi_cfg::CfgError> {
         let f = CfgFile::read(path)?;
         Ok(Self::parse(&f))
+    }
+
+    /// Whether the IBIS trips carry line `line` (a map's line name, "11-11s"): a trip coded
+    /// line x 100 + route, or one named after the line ("91.06A -> MASSY GARE").
+    pub fn has_line(&self, line: &str) -> bool {
+        let l = line.trim().to_ascii_lowercase();
+        if l.is_empty() {
+            return false;
+        }
+        let digits: String = l.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let number = digits.parse::<i32>().ok().filter(|n| *n > 0);
+        let boundary = |rest: &str| rest.chars().next().is_none_or(|c| !c.is_ascii_alphanumeric());
+        self.info_trips.iter().any(|t| {
+            let code = omsi_cfg::parse_i32(&t.code);
+            let head = t.name.split("->").next().unwrap_or("").trim().to_ascii_lowercase();
+            let named = !head.is_empty()
+                && (l.strip_prefix(head.as_str()).is_some_and(boundary)
+                    || (l.ends_with(|c: char| c.is_ascii_digit())
+                        && head.strip_prefix(l.as_str()).is_some_and(|r| r.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))));
+            named || number.is_some_and(|n| code >= 100 && code / 100 == n)
+        })
     }
 
     /// Only the `[name]` of a depot file ("" when it has none), kept for the session: the
@@ -111,7 +165,7 @@ impl Hof {
                     let code = r.i32();
                     let texture_id = r.str().to_string();
                     let terminus_stop = if all_exit { None } else { Some(texture_id.clone()) };
-                    let strings = (0..h.string_count_terminus).map(|_| r.str().to_string()).collect();
+                    let strings: Vec<String> = (0..h.string_count_terminus).map(|_| r.str().to_string()).collect();
                     h.termini.push(Terminus { code, texture_id, terminus_stop, all_exit, strings });
                 }
                 "addterminus_list" => {
@@ -185,24 +239,34 @@ impl Hof {
     }
 }
 
-/// The `.hof` files of a folder, sorted by name: every content root's copy of the folder
-/// together (a mod's depot next to the installation's; archives read in place too), a
-/// higher-priority root's file hiding the same name lower down.
+/// The `.hof` files available to a vehicle. Files next to the vehicle come first, merged
+/// over all content roots (a mod's depot beside the installation's; archives read in place
+/// too), followed by the shared top-level `HOFs/` folder. A vehicle-local file hides a
+/// shared file of the same name; within each group files are sorted by name.
 pub fn depot_files(dir: &Path) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
-    let mut files: Vec<PathBuf> = Vec::new();
+    let mut local: Vec<PathBuf> = Vec::new();
     for d in omsi_cfg::mirrored_dirs(dir) {
         for p in omsi_cfg::vfs::read_dir_paths(&d) {
             if !p.extension().map(|e| e.eq_ignore_ascii_case("hof")).unwrap_or(false) {
                 continue;
             }
             if seen.insert(p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase()) {
-                files.push(p);
+                local.push(p);
             }
         }
     }
-    files.sort_by_key(|f| f.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase());
-    files
+    local.sort_by_key(|f| f.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase());
+
+    let mut shared: Vec<PathBuf> = omsi_cfg::read_dir_merged("HOFs")
+        .into_iter()
+        .filter(|p| p.extension().map(|e| e.eq_ignore_ascii_case("hof")).unwrap_or(false))
+        .filter(|p| seen.insert(p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase()))
+        .collect();
+    shared.sort_by_key(|f| f.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase());
+
+    local.extend(shared);
+    local
 }
 
 /// The depot file of `dir` called `name`: by its file name (without `.hof`) or its `[name]`.
@@ -223,7 +287,56 @@ pub fn depot_in(dir: &Path, name: &str) -> Option<Hof> {
         .find_map(|f| Hof::load(f).ok())
 }
 
-/// The depot file called `name` in any vehicle folder of any content root (`Vehicles/*/`).
+/// The words of a depot or map name that tell one place from another: four letters or
+/// more, not a year or a number, not a word every depot file has ("Linie 20", "Hof").
+fn place_words(s: &str) -> Vec<String> {
+    const COMMON: [&str; 14] = ["linie", "line", "lines", "depot", "omsi", "maps", "version", "final", "neue", "update", "addon", "fixed", "standard", "default"];
+    s.split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.chars().count() >= 4 && !w.chars().all(|c| c.is_ascii_digit()) && !COMMON.contains(&w.as_str()))
+        .collect()
+}
+
+/// Of `names` (the depot files a bus has), the one that belongs to the place `hints` name
+/// (the map's depot names, its title, its folder): the one sharing the most of their
+/// words, the longer words counting more; the first of equals. None when none shares one.
+///
+/// OMSI asks the driver which of the bus's depot files to use; taking the first of them
+/// when none is called exactly as the map wants put a bus on Hamburg's Linie 20 with the
+/// Grundorf depot of its folder - no line and no destination its IBIS knew (#896).
+pub fn closest_name(names: &[&str], hints: &[&str]) -> Option<usize> {
+    let wanted: Vec<String> = hints.iter().flat_map(|h| place_words(h)).collect();
+    let mut best: Option<(usize, usize)> = None;
+    for (i, n) in names.iter().enumerate() {
+        let mut words = place_words(n);
+        words.dedup();
+        let score: usize = words.iter().filter(|w| wanted.contains(w)).map(|w| w.chars().count()).sum();
+        if score > 0 && best.is_none_or(|(_, b)| score > b) {
+            best = Some((i, score));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// The depot file of `dir` that belongs to the place `hints` name (see [`closest_name`]),
+/// by its file name or its `[name]`.
+pub fn depot_like(dir: &Path, hints: &[&str]) -> Option<Hof> {
+    let files = depot_files(dir);
+    let names: Vec<String> = files
+        .iter()
+        .map(|f| {
+            let stem = f.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            match Hof::read_name(f) {
+                Some(n) => format!("{stem} {n}"),
+                None => stem,
+            }
+        })
+        .collect();
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    closest_name(&refs, hints).and_then(|i| Hof::load(&files[i]).ok())
+}
+
+/// The depot file called `name` in the shared `HOFs/` folder or any vehicle folder of any content root (`Vehicles/*/`).
 ///
 /// A depot file belongs to a map, not to a bus model: it lists the map's termini, stops and
 /// IBIS codes. A mod bus brings only the depot of the map it was made on (the O530 Citaro
@@ -259,7 +372,63 @@ pub fn depot_anywhere(name: &str) -> Option<Hof> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_depot_file_carries_a_line_by_its_trip_codes_or_names() {
+        let trip = |code: &str, name: &str| InfoTrip { code: code.into(), name: name.into(), ..Default::default() };
+        let global = Hof { info_trips: vec![trip("1101", "11 -> PETIT VILTAIN"), trip("1401", "14 -> MOULON")], ..Default::default() };
+        let inter = Hof { info_trips: vec![trip("001", "91.06A -> MASSY GARE"), trip("005", "91.06C -> MASSY GARE")], ..Default::default() };
+        assert!(global.has_line("11-11s") && global.has_line("14"));
+        assert!(!global.has_line("1") && !global.has_line("91.06C") && !global.has_line(""));
+        assert!(inter.has_line("91.06C") && inter.has_line("91.06") && !inter.has_line("11-11s"));
+    }
+
     use super::*;
+
+    /// #896: the bus's own depot of the map's place, not the first of its folder.
+    #[test]
+    fn closest_depot_name_is_the_maps_place() {
+        let names = ["Grundorf", "Hamburg Linie 20", "Spandau 2019"];
+        assert_eq!(closest_name(&names, &["Hamburg_Linie_20", "Linie 20"]), Some(1));
+        assert_eq!(closest_name(&names, &["Spandau 1986"]), Some(2));
+        assert_eq!(closest_name(&names, &["Berlin-Spandau"]), Some(2));
+        assert_eq!(closest_name(&names, &["Thüringer Wald"]), None);
+        assert_eq!(closest_name(&["Berlin X10", "Spandau"], &["Berlin-Spandau"]), Some(1));
+        assert_eq!(closest_name(&["Linie 20"], &["Linie 7"]), None);
+    }
+
+    #[test]
+    fn shared_depots_are_available_but_vehicle_copy_wins() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("openomsi-shared-hof-{stamp}"));
+        let bus = root.join("Vehicles/TestBus");
+        let shared = root.join("HOFs");
+        std::fs::create_dir_all(&bus).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+
+        let local_name = format!("local-{stamp}.hof");
+        let shared_name = format!("shared-{stamp}.hof");
+        let same_name = format!("same-{stamp}.hof");
+        std::fs::write(bus.join(&local_name), "[name]\nLocal\n").unwrap();
+        std::fs::write(shared.join(&shared_name), "[name]\nShared\n").unwrap();
+        std::fs::write(bus.join(&same_name), "[name]\nLocal duplicate\n").unwrap();
+        std::fs::write(shared.join(&same_name), "[name]\nShared duplicate\n").unwrap();
+
+        omsi_cfg::add_content_root(root.clone());
+        let files = depot_files(&bus);
+        let named = |p: &Path, name: &str| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == name);
+        let local_i = files.iter().position(|p| named(p, &local_name)).unwrap();
+        let shared_i = files.iter().position(|p| named(p, &shared_name)).unwrap();
+        let duplicate = files.iter().find(|p| named(p, &same_name)).unwrap();
+        assert!(local_i < shared_i);
+        assert_eq!(duplicate, &bus.join(&same_name));
+        assert_eq!(depot_in(&bus, "Shared").map(|h| h.name), Some("Shared".into()));
+
+        omsi_cfg::remove_content_root(&root);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn terminus_list_columns() {
@@ -272,6 +441,30 @@ mod tests {
         assert_eq!(h.termini[1].terminus_stop.as_deref(), Some("U Ruhleben"));
         assert_eq!(h.termini[1].strings, vec!["RUHLEBEN", "U-BAHNHOF", "RUHLEBEN  "]);
         assert_eq!(h.terminus_by_code(282).map(|t| t.texture_id.as_str()), Some("U Ruhleben"));
+    }
+
+    #[test]
+    fn legacy_hof_destination_name_falls_back_to_ident() {
+        let text = "stringcount_terminus\n6\n[addterminus]\n71910\n71 Eden Tunnel\n\n\n\n\nLegacyRoute\\71Y_1.bmp\n71Y\n";
+        let h = Hof::parse(&CfgFile::from_str("legacy.hof", text));
+        let t = h.terminus_by_code(71910).unwrap();
+        assert_eq!(t.strings[0], "");
+        assert_eq!(t.strings[4], "LegacyRoute\\71Y_1.bmp");
+        assert_eq!(t.strings[5], "71Y");
+        assert_eq!(t.display_name(), "71 Eden Tunnel");
+        assert_eq!(t.menu_name(), "71 Eden Tunnel");
+    }
+
+    #[test]
+    fn normal_hof_menu_name_keeps_display_text() {
+        let t = Terminus { texture_id: "910".into(), strings: vec!["AEC".into()], ..Default::default() };
+        assert_eq!(t.menu_name(), "AEC");
+    }
+
+    #[test]
+    fn route_label_menu_name_uses_the_ident() {
+        let t = Terminus { texture_id: "66: South Valley Railway Station Circular".into(), strings: vec!["S.VALLEY STN CIR".into()], ..Default::default() };
+        assert_eq!(t.menu_name(), "66: South Valley Railway Station Circular");
     }
 
     /// #667: a trip without a stop list (an IVU data route) keeps the lists of the trips

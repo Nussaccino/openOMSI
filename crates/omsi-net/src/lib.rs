@@ -79,6 +79,7 @@ pub mod addrs;
 pub mod bridge;
 pub mod wire;
 pub mod world;
+pub mod vars;
 pub mod ws;
 pub mod tunnel;
 pub mod official;
@@ -103,6 +104,7 @@ pub use wire::{
 /// 6: up to 63 sound and moving-part values in a state (a 6-bit count: the AA-FR Agora's
 /// sound variables alone filled the 31 there was room for).
 pub const PROTOCOL: u32 = 6;
+/// (omsi-plugin's `MULTIPLAYER_PORTS` keeps `omsi.send` off this one and the `PORT_RANGE` after it.)
 pub const DEFAULT_PORT: u16 = 27015;
 /// Ports a host tries after the default one when that is taken (a second session on the
 /// same machine).
@@ -710,8 +712,10 @@ pub struct WorldInfo {
     pub time: f64,
     /// Weather file, empty for the map's default.
     pub weather: String,
-    /// The season the player chose (`spring`, `summer`, `autumn`, `winter`), empty when
-    /// the date decides as in OMSI.
+    /// The season the player chose (`spring`, `summer`, `autumn`, `winter`), with its
+    /// phase when not the middle (`autumn-late`, `spring-early`: an older version reads
+    /// no season in that and goes by the date, which is the host's phase date), empty
+    /// when the date decides as in OMSI.
     pub season: String,
 }
 
@@ -897,6 +901,8 @@ pub struct Pose {
     /// The sender's clock when the state left (ms, wrapping), for drawing the others'
     /// buses between two states as they were sent rather than as they arrived; 0 unknown.
     pub sent_ms: u32,
+    /// The driver is keying the map-wide bus radio (GreenTeaSpeak voice); see `voice`.
+    pub radio_keyed: bool,
 }
 
 /// A player on foot: where, facing where, how fast, and whether sitting in some bus.
@@ -1323,6 +1329,9 @@ pub struct LanSession {
     /// `JOIN_TIMEOUT`, `RECONNECT_TIMEOUT`).
     trying: f32,
     lost_at: Option<Instant>,
+    /// The client gave up (no answer / host lost) but keeps saying hello now and then: a
+    /// welcome brings it back without restarting the game (see `reconnect`).
+    timed_out: bool,
     join_timeout: Duration,
     /// "Port unreachable" answers to our hellos (a computer that is there, without a session
     /// on that port; Windows and Linux report them).
@@ -1353,6 +1362,10 @@ pub struct LanSession {
     pub connected: bool,
     /// The host turned us away (the reason), or the target cannot be reached at all.
     pub rejected: Option<String>,
+    /// The host's own word that we are not to play there: sent away (`KICK`, a ban too) or
+    /// turned away at the door (`REJECT`), with its message. Unlike a lost connection
+    /// (`rejected` alone, the game plays on and may `/reconnect`), the game ends on it.
+    pub turned_away: Option<String>,
     /// What the host said when it let us in (the latest welcome after a reconnect).
     pub welcome: Option<Welcome>,
     /// Counts the welcomes after which the connection was (re)made: the game takes the
@@ -1391,6 +1404,9 @@ pub struct LanSession {
     /// The shared world (see `world`): frames, descriptions and handed-over passengers
     /// the host sent (client), and what the clients asked for (host).
     world_in: Vec<(Instant, world::WorldFrame)>,
+    /// Every script variable of our vehicle going out (`vars.rs`), and the others' coming in.
+    var_sender: vars::VarSender,
+    vars_in: Vec<vars::VarsIn>,
     descs: Vec<world::Desc>,
     wants: Vec<(u32, Vec<world::EntityRef>)>,
     claims: Vec<(u32, Vec<u32>)>,
@@ -1417,7 +1433,7 @@ pub struct LanSession {
     /// keeps their number and is "back", not a newcomer.
     gone_lately: Vec<(Option<u64>, String, u32, Instant)>,
     /// Players the host sent away (host): their nonces, so they are not let in again.
-    banned: Vec<u64>,
+    banned: Vec<(u64, String)>,
     /// Commands for this game (`command`): (from, text).
     commands: Vec<(u32, String)>,
     /// How fast the session's clock runs (the host's time speed; a client: the host's as
@@ -1444,7 +1460,8 @@ impl LanSession {
             candidates: Vec::new(),
             trying: 0.0,
             lost_at: None,
-            join_timeout: std::env::var("OMSI_LAN_JOIN_TIMEOUT")
+            timed_out: false,
+            join_timeout: omsi_cfg::flags::OMSI_LAN_JOIN_TIMEOUT.live_var()
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| *v > 0.0)
@@ -1468,6 +1485,7 @@ impl LanSession {
             place_acc: 1.0,
             connected: role == Role::Host,
             rejected: None,
+            turned_away: None,
             welcome: None,
             welcomes: 0,
             warnings: Vec::new(),
@@ -1491,6 +1509,8 @@ impl LanSession {
             sent: Cell::new(0),
             received: 0,
             world_in: Vec::new(),
+            var_sender: vars::VarSender::default(),
+            vars_in: Vec::new(),
             descs: Vec::new(),
             wants: Vec::new(),
             claims: Vec::new(),
@@ -1567,7 +1587,7 @@ impl LanSession {
                 s.host = None;
                 // `OMSI_BRIDGE_ONLY`: forget the code's own addresses, so that only what the
                 // rendezvous tells is tried (to check that path)
-                if std::env::var_os("OMSI_BRIDGE_ONLY").is_some() {
+                if omsi_cfg::flags::OMSI_BRIDGE_ONLY.live_os().is_some() {
                     s.candidates.clear();
                 }
             }
@@ -1705,17 +1725,24 @@ impl LanSession {
         self.sent.get()
     }
 
-    /// The game's clock: what the host's welcomes and clock messages say.
-    /// The host's weather changed (the clients take it up with the next clock message).
-    pub fn set_weather(&mut self, weather: &str) {
-        self.world.weather = weather.to_string();
-    }
-
     /// The weather the session runs with.
     pub fn weather(&self) -> &str {
         &self.world.weather
     }
 
+    /// The host's weather changed: a host sends it with a clock message at once, not with the
+    /// next one of every five seconds.
+    pub fn set_weather(&mut self, weather: &str) {
+        let weather = clean_text(&weather.trim().replace('\\', "/"), 260);
+        if self.world.weather != weather {
+            self.world.weather = weather;
+            if self.role == Role::Host {
+                self.clock_acc = CLOCK_EVERY;
+            }
+        }
+    }
+
+    /// The game's clock: what the host's welcomes and clock messages say.
     pub fn set_clock(&mut self, date: &str, time: f64) {
         if self.world.date != date {
             self.world.date = date.to_string();
@@ -1847,18 +1874,20 @@ impl LanSession {
         }
     }
 
-    /// Host: send player `id` away (`ban`: for the rest of the session).
+    /// Host: send player `id` away (`ban`: for the rest of the session, the same reason given
+    /// at the door when it comes back).
     pub fn kick(&mut self, id: u32, reason: &str, ban: bool) {
         if self.role != Role::Host {
             return;
         }
         let Some(p) = self.peers.remove(&id) else { return };
+        let reason = clean_text(reason, 200);
         if let Some(a) = p.addr {
-            self.send(format!("KICK|{}", clean_text(reason, 200)).as_bytes(), a);
+            self.send(format!("KICK|{reason}").as_bytes(), a);
         }
         if ban {
             if let Some(n) = p.nonce {
-                self.banned.push(n);
+                self.banned.push((n, reason.clone()));
             }
         }
         self.broadcast(format!("BYE|{id}").as_bytes(), None);
@@ -2224,8 +2253,8 @@ impl LanSession {
         }
         if self.role == Role::Client
             && !self.connected
-            && self.rejected.is_none()
-            && self.hello_acc >= 1.0
+            && (self.rejected.is_none() && self.hello_acc >= 1.0
+                || self.timed_out && self.hello_acc >= 5.0)
         {
             self.hello_acc = 0.0;
             self.send_hello(mine);
@@ -2290,7 +2319,7 @@ impl LanSession {
                 self.no_answer(self.join_timeout)
             }
             (true, Some(at)) if at.elapsed() >= RECONNECT_TIMEOUT => format!(
-                "the host has not answered for {:.0} s - the session is over (playing on alone)",
+                "the host has not answered for {:.0} s - the session is over (playing on alone; still trying, or type /reconnect)",
                 RECONNECT_TIMEOUT.as_secs_f32()
             ),
             _ => return,
@@ -2298,6 +2327,38 @@ impl LanSession {
         log::warn!("LAN: {why}");
         self.events.push(LanEvent::Notice(why.clone()));
         self.rejected = Some(why);
+        self.timed_out = true;
+    }
+
+    /// Say hello once more at once (the way to the host was made again: a new connection
+    /// is a new address to it, which it only learns from a hello). Clients only.
+    pub fn rehello(&mut self) {
+        if self.role == Role::Client {
+            self.confirm = true;
+        }
+    }
+
+    /// Try the host again at once (a client that was turned away, timed out or sent away):
+    /// the game takes the host's world again when the welcome comes. False for a host.
+    pub fn reconnect(&mut self) -> bool {
+        if self.role != Role::Client {
+            return false;
+        }
+        self.rejected = None;
+        self.turned_away = None;
+        self.timed_out = false;
+        self.connected = false;
+        self.other_reject = None;
+        self.refused = 0;
+        self.trying = 0.0;
+        self.lost_at = Some(Instant::now());
+        self.hello_acc = 1.0;
+        if self.candidates.len() > 1 {
+            self.host = None;
+        }
+        log::info!("LAN: reconnecting");
+        self.events.push(LanEvent::Notice("reconnecting ...".into()));
+        true
     }
 
     /// Why nobody may have answered, for the player.
@@ -2482,6 +2543,10 @@ impl LanSession {
                 self.on_state(&data, from);
                 continue;
             }
+            if data[0] == vars::VARS_MAGIC {
+                self.on_vars(&data, from);
+                continue;
+            }
             let Ok(text) = std::str::from_utf8(&data) else {
                 continue;
             };
@@ -2516,6 +2581,12 @@ impl LanSession {
                         self.events.push(LanEvent::Notice(format!(
                             "the host turned us away: {reason}"
                         )));
+                    }
+                    // (the game ends on a door closed before it ever played there, or on a ban;
+                    // a reconnect refused for now - the session full, say - leaves it playing
+                    // on to `/reconnect` later)
+                    if self.welcomes == 0 || reason.contains("sent you away") {
+                        self.turned_away = Some(reason.clone());
                     }
                     self.rejected = Some(reason);
                     self.connected = false;
@@ -2555,6 +2626,7 @@ impl LanSession {
                     log::warn!("LAN: the host sent us away: {reason}");
                     self.events.push(LanEvent::Notice(format!("the host sent you away: {reason}")));
                     self.rejected = Some(format!("the host sent you away: {reason}"));
+                    self.turned_away = Some(reason);
                     self.connected = false;
                 }
                 ("WANT", Role::Host) | ("CLAIM", Role::Host) => {
@@ -2681,6 +2753,54 @@ impl LanSession {
         }
         peer.last_seen = Instant::now();
         Some(peer)
+    }
+
+    /// Every script variable of our vehicle (see `vars.rs`): `float_ids[k]` holds
+    /// `floats[k]`, the same for the strings, `table` names them (a hash of their names). Called
+    /// every frame; it sends what is due.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_vars(&mut self, table: u32, float_ids: &[u16], floats: &[f32], string_ids: &[u16], strings: &[String], dt: f32) {
+        let msgs = self.var_sender.tick(PROTOCOL as u8, self.my_id, table, float_ids, floats, string_ids, strings, dt);
+        for m in msgs {
+            match self.role {
+                Role::Host => self.broadcast(&m, None),
+                Role::Client => {
+                    if let Some(h) = self.host {
+                        self.send(&m, h);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The others' vehicle variables that came since the last call, oldest first.
+    pub fn take_vars(&mut self) -> Vec<vars::VarsIn> {
+        std::mem::take(&mut self.vars_in)
+    }
+
+    fn on_vars(&mut self, data: &[u8], from: SocketAddr) {
+        let Some(v) = vars::decode(data, PROTOCOL as u8) else { return };
+        if v.id == self.my_id || v.id == 0 {
+            return;
+        }
+        match self.role {
+            // (as a state: only a player we welcomed, from its address, within its rate)
+            Role::Host => {
+                if self.checked_peer(v.id, from, STATE_RATE, true).is_none() {
+                    return;
+                }
+                self.broadcast(data, Some(v.id));
+            }
+            Role::Client => {
+                if !self.peers.contains_key(&v.id) {
+                    return;
+                }
+            }
+        }
+        // (a game that stopped reading does not pile them up without end)
+        if self.vars_in.len() < 1024 {
+            self.vars_in.push(v);
+        }
     }
 
     fn on_state(&mut self, data: &[u8], from: SocketAddr) {
@@ -2920,8 +3040,9 @@ impl LanSession {
                 );
                 return;
             }
-            None if nonce.is_some_and(|n| self.banned.contains(&n)) => {
-                self.reject(from, "the host has sent you away from this session");
+            None if nonce.is_some_and(|n| self.banned.iter().any(|b| b.0 == n)) => {
+                let why = self.banned.iter().find(|b| Some(b.0) == nonce).map(|b| b.1.clone()).unwrap_or_default();
+                self.reject(from, &if why.is_empty() { "the host has sent you away from this session".to_string() } else { format!("the host has sent you away from this session: {why}") });
                 return;
             }
             None => {
@@ -3020,11 +3141,12 @@ impl LanSession {
     }
 
     fn on_welcome(&mut self, parts: &[&str], from: SocketAddr) {
+        let was_timed_out = self.timed_out;
         let proto = field(parts, 1).parse::<u32>().unwrap_or(1);
         if proto != PROTOCOL {
-            self.rejected = Some(format!(
-                "the host runs LAN protocol {proto}, this game protocol {PROTOCOL}"
-            ));
+            let why = format!("the host runs LAN protocol {proto}, this game protocol {PROTOCOL}");
+            self.turned_away = Some(why.clone());
+            self.rejected = Some(why);
             return;
         }
         let Some(id) = field(parts, 2)
@@ -3063,6 +3185,11 @@ impl LanSession {
         self.session = session;
         self.connected = true;
         self.lost_at = None;
+        if was_timed_out {
+            // the host is back after we had given up
+            self.timed_out = false;
+            self.rejected = None;
+        }
         self.host_seen = Instant::now();
         if first {
             log::info!("LAN: connected to '{host_name}' (session {}), we are player {id}; the host's world: {} {} {:02}:{:02} weather '{}' season '{}'", session_hex(session), world.map, world.date, (world.time / 3600.0) as i32, ((world.time % 3600.0) / 60.0) as i32, world.weather, world.season);

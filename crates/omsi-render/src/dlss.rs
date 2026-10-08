@@ -101,6 +101,9 @@ pub struct Inputs<'a> {
     pub depth: &'a wgpu::Texture,
     /// Motion vectors (Rg32Float, pixels towards the last frame) at the render size.
     pub motion: &'a wgpu::Texture,
+    /// The `BiasCurrentColor` mask (R8Unorm, 1: the current picture over the history) at
+    /// the render size.
+    pub bias: &'a wgpu::Texture,
     /// The result at the window's size (Rgba16Float, storage).
     pub output: &'a wgpu::Texture,
     pub render_size: (u32, u32),
@@ -207,6 +210,7 @@ mod imp {
     const BUFFER_MOTION_VECTORS: u32 = 1;
     const BUFFER_SCALING_INPUT_COLOR: u32 = 3;
     const BUFFER_SCALING_OUTPUT_COLOR: u32 = 4;
+    const BUFFER_BIAS_CURRENT_COLOR_HINT: u32 = 29;
     /// `ResourceLifecycle::eValidUntilEvaluate`
     const VALID_UNTIL_EVALUATE: u32 = 2;
     const FLAG_DISABLE_CL_STATE_TRACKING: u64 = 1 << 0;
@@ -469,6 +473,7 @@ mod imp {
             Tf::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
             Tf::Rg16Float => DXGI_FORMAT_R16G16_FLOAT,
             Tf::Rg32Float => DXGI_FORMAT_R32G32_FLOAT,
+            Tf::R8Unorm => DXGI_FORMAT_R8_UNORM,
             // (the depth is sampled too: wgpu makes it R32_TYPELESS, its view R32_FLOAT)
             Tf::Depth32Float => DXGI_FORMAT_R32_FLOAT,
             _ => DXGI_FORMAT_UNKNOWN,
@@ -591,7 +596,7 @@ mod imp {
     /// The folder Streamline's DLLs are looked for in: `OMSI_STREAMLINE_DIR`, else the
     /// game's own folder.
     fn runtime_dir() -> std::path::PathBuf {
-        if let Some(d) = omsi_cfg::env::var_os("OMSI_STREAMLINE_DIR") {
+        if let Some(d) = omsi_cfg::flags::OMSI_STREAMLINE_DIR.os() {
             return d.into();
         }
         std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())).unwrap_or_else(|| ".".into())
@@ -640,8 +645,8 @@ mod imp {
             let plugin_paths = vec![plugin_dir.as_ptr()];
             static FEATURES: [u32; 1] = [FEATURE_DLSS];
             let engine_version = concat!("openOMSI ", env!("CARGO_PKG_VERSION"), "\0");
-            let project_id = omsi_cfg::env::var("OMSI_DLSS_PROJECT_ID").ok().and_then(|s| std::ffi::CString::new(s).ok());
-            let verbose = omsi_cfg::env::var_os("OMSI_DLSS_VERBOSE").is_some();
+            let project_id = omsi_cfg::flags::OMSI_DLSS_PROJECT_ID.var().and_then(|s| std::ffi::CString::new(s).ok());
+            let verbose = omsi_cfg::flags::OMSI_DLSS_VERBOSE.is_set();
             let prefs = Preferences {
                 base: Base::new(PREFERENCES, 1),
                 show_console: false,
@@ -824,7 +829,7 @@ mod imp {
                 let h = unsafe { t.as_hal::<wgpu_hal::api::Dx12>() }.ok_or_else(|| anyhow!("a DLSS texture is not a DX12 one"))?;
                 Ok(unsafe { h.raw_resource() }.clone())
             };
-            let (color, depth, motion, output) = (raw(inputs.color)?, raw(inputs.depth)?, raw(inputs.motion)?, raw(inputs.output)?);
+            let (color, depth, motion, bias, output) = (raw(inputs.color)?, raw(inputs.depth)?, raw(inputs.motion)?, raw(inputs.bias)?, raw(inputs.output)?);
             let (rw, rh) = inputs.render_size;
             let (ow, oh) = inputs.output_size;
             // (the states of their last use in the scene's submit, see `render_inner`)
@@ -852,16 +857,18 @@ mod imp {
                 resource(&depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, inputs.depth.format(), (rw, rh)),
                 resource(&motion, D3D12_RESOURCE_STATE_RENDER_TARGET, inputs.motion.format(), (rw, rh)),
                 resource(&output, D3D12_RESOURCE_STATE_RENDER_TARGET, inputs.output.format(), (ow, oh)),
+                resource(&bias, D3D12_RESOURCE_STATE_RENDER_TARGET, inputs.bias.format(), (rw, rh)),
             ];
             let render_extent = Extent { top: 0, left: 0, width: rw, height: rh };
             let output_extent = Extent { top: 0, left: 0, width: ow, height: oh };
-            let [c0, c1, c2, c3] = &mut res;
+            let [c0, c1, c2, c3, c4] = &mut res;
             let tag = |r: &mut Resource, kind: u32, extent: Extent| ResourceTag { base: Base::new(RESOURCE_TAG, 1), resource: r, kind, lifecycle: VALID_UNTIL_EVALUATE, extent };
             let tags = [
                 tag(c0, BUFFER_SCALING_INPUT_COLOR, render_extent),
                 tag(c1, BUFFER_DEPTH, render_extent),
                 tag(c2, BUFFER_MOTION_VECTORS, render_extent),
                 tag(c3, BUFFER_SCALING_OUTPUT_COLOR, output_extent),
+                tag(c4, BUFFER_BIAS_CURRENT_COLOR_HINT, render_extent),
             ];
             let mut token: *const c_void = std::ptr::null();
             self.frame = self.frame.wrapping_add(1);

@@ -6,6 +6,10 @@ use glam::{DVec2, DVec3, Mat4, Quat, Vec2, Vec3};
 use omsi_map::{tile_size, MapSpline, Terrain};
 use omsi_scenery::Spline;
 
+mod hole_rims;
+mod terrain_walls;
+pub use terrain_walls::terrain_hole_walls;
+
 /// A renderable triangle mesh with one texture per material slot.
 #[derive(Debug, Clone, Default)]
 pub struct MeshData {
@@ -498,6 +502,7 @@ pub fn terrain_hole_profiles(def: &Spline) -> Vec<Vec<[f32; 3]>> {
         return def.terrain_hole_profiles.clone();
     }
     const JOIN: f32 = 0.01;
+    const INSET: f32 = 0.03;
     let profiles: Vec<Vec<(f32, f32)>> = def.profiles.iter().map(|p| p.points.iter().map(|q| (q.x, q.z)).collect()).collect();
     let mut used = vec![false; profiles.len()];
     let mut out = Vec::new();
@@ -533,6 +538,12 @@ pub fn terrain_hole_profiles(def: &Spline) -> Vec<Vec<[f32; 3]>> {
                 }
             }
         }
+        // An automatic trough needs positive width after both insets. Thin overhead
+        // wires otherwise produce an inverted cut with terrain walls up to the wire.
+        // Explicit terrainholeprofiles returned above keep their authored dimensions.
+        if xl + INSET >= xr - INSET {
+            continue;
+        }
         let points = || chain.iter().flat_map(|&j| profiles[j].iter().copied());
         let low = points().fold(zl.min(zr), |m, (_, z)| m.min(z));
         let bottom_left = if low < zl {
@@ -546,7 +557,7 @@ pub fn terrain_hole_profiles(def: &Spline) -> Vec<Vec<[f32; 3]>> {
             (xr - xl) * 3.0 / 4.0 + xl
         };
         let low = low - 0.1;
-        out.push(vec![[xl + 0.03, zl - 0.003, 0.0], [bottom_left, low, -0.5], [bottom_right, low, -0.5], [xr - 0.03, zr - 0.003, 0.0]]);
+        out.push(vec![[xl + INSET, zl - 0.003, 0.0], [bottom_left, low, -0.5], [bottom_right, low, -0.5], [xr - INSET, zr - 0.003, 0.0]]);
     }
     out
 }
@@ -561,6 +572,13 @@ pub fn terrain_hole_profiles(def: &Spline) -> Vec<Vec<[f32; 3]>> {
 /// 3 and 4 the near end at the start. A mirrored spline takes the profile backwards and
 /// turned across.
 pub fn spline_hole_outlines(def: &Spline, curve: &SplineCurve, mirror: bool, mode: u8) -> Vec<Vec<DVec2>> {
+    spline_hole_rims(def, curve, mirror, mode).into_iter()
+        .map(|ring| ring.into_iter().map(DVec3::truncate).collect()).collect()
+}
+
+/// The same boundary as [`spline_hole_outlines`], retaining each profile point's height
+/// (including gradient, cant and skew) for the ground's connection to the spline.
+pub fn spline_hole_rims(def: &Spline, curve: &SplineCurve, mirror: bool, mode: u8) -> Vec<Vec<DVec3>> {
     if mode == 0 || curve.length <= 0.0 {
         return Vec::new();
     }
@@ -569,7 +587,7 @@ pub fn spline_hole_outlines(def: &Spline, curve: &SplineCurve, mirror: bool, mod
     let n = n.max(1);
     let l = curve.length;
     let curve = &curve.with_sli(def);
-    let at = |x: f32, s: f64| skewed_point(curve, s, x as f64, 0.0).0.truncate();
+    let at = |q: &[f32; 3], s: f64| skewed_point(curve, s, q[0] as f64, q[1] as f64).0;
     terrain_hole_profiles(def)
         .into_iter()
         .filter(|p| !p.is_empty())
@@ -578,16 +596,16 @@ pub fn spline_hole_outlines(def: &Spline, curve: &SplineCurve, mirror: bool, mod
             let k = p.len();
             let mut ring = Vec::with_capacity(2 * (k + n - 1));
             for i in 1..n {
-                ring.push(at(p[k - 1][0], i as f64 * l / n as f64));
+                ring.push(at(&p[k - 1], i as f64 * l / n as f64));
             }
             for q in p.iter().rev() {
-                ring.push(at(q[0], if mode & 1 == 0 { l } else { l - q[2] as f64 }));
+                ring.push(at(q, if mode & 1 == 0 { l } else { l - q[2] as f64 }));
             }
             for i in (1..n).rev() {
-                ring.push(at(p[0][0], i as f64 * l / n as f64));
+                ring.push(at(&p[0], i as f64 * l / n as f64));
             }
             for q in &p {
-                ring.push(at(q[0], if mode > 2 { 0.0 } else { q[2] as f64 }));
+                ring.push(at(q, if mode > 2 { 0.0 } else { q[2] as f64 }));
             }
             ring
         })
@@ -624,39 +642,51 @@ pub fn outline_crosses_itself(ring: &[DVec2]) -> bool {
 /// The outlines of a `[terrainhole]` cutter, seen from above (world x, y): its open rims,
 /// the edges only one face uses, chained into closed rings. OMSI 2 cuts the ground along an
 /// object's cutter as exactly as along a spline's outline, so a junction's ground ends at its
-/// kerb, not a texel short of it. A closed cutter (no rim) or a rim that branches gives no
-/// ring.
+/// kerb, not a texel short of it. Rims that meet at a vertex are separated using their
+/// incident faces. A closed cutter (no rim) gives no ring.
 /// Positions are the mesh's after `transform`, relative to `origin`.
 pub fn hole_mesh_outlines(mesh: &MeshData, transform: &Mat4, origin: DVec3) -> Vec<Vec<DVec2>> {
+    hole_mesh_rims(mesh, transform, origin).into_iter()
+        .map(|ring| ring.into_iter().map(DVec3::truncate).collect()).collect()
+}
+
+/// The open rims of an object cutter, retaining their transformed world heights.
+/// Touching rims follow the mesh's face adjacency, not the angle of their projection:
+/// a vertical profile can share a corner with a road without joining their boundaries.
+/// Closed meshes still have no rim; no wall height is invented for them.
+pub fn hole_mesh_rims(mesh: &MeshData, transform: &Mat4, origin: DVec3) -> Vec<Vec<DVec3>> {
     use std::collections::HashMap;
     // (a model repeats a vertex for every face and UV seam: the corners by place, to the mm)
     let key = |v: Vec3| ((v.x * 1000.0).round() as i64, (v.y * 1000.0).round() as i64, (v.z * 1000.0).round() as i64);
-    let mut place: HashMap<(i64, i64, i64), DVec2> = HashMap::new();
-    let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), u32> = HashMap::new();
+    let mut place: HashMap<(i64, i64, i64), DVec3> = HashMap::new();
+    let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
+    let mut faces = Vec::new();
     for t in mesh.indices.chunks_exact(3) {
         let k = [0, 1, 2].map(|i| {
             let v = mesh.positions[t[i] as usize];
             let kv = key(v);
-            place.entry(kv).or_insert_with(|| origin.truncate() + transform.transform_point3(v).truncate().as_dvec2());
+            place.entry(kv).or_insert_with(|| origin + transform.transform_point3(v).as_dvec3());
             kv
         });
         if k[0] == k[1] || k[1] == k[2] || k[2] == k[0] {
             continue;
         }
+        let face = faces.len();
+        faces.push(k);
         for i in 0..3 {
             let (a, b) = (k[i], k[(i + 1) % 3]);
-            *edges.entry(if a < b { (a, b) } else { (b, a) }).or_insert(0) += 1;
+            edges.entry(if a < b { (a, b) } else { (b, a) }).or_default().push(face);
         }
     }
     let mut next: HashMap<(i64, i64, i64), Vec<(i64, i64, i64)>> = HashMap::new();
     for ((a, b), n) in &edges {
-        if *n == 1 {
+        if n.len() == 1 {
             next.entry(*a).or_default().push(*b);
             next.entry(*b).or_default().push(*a);
         }
     }
     if next.values().any(|v| v.len() != 2) {
-        return Vec::new();
+        return hole_rims::trace_faces(&faces, &edges, &place);
     }
     let mut starts: Vec<_> = next.keys().copied().collect();
     starts.sort_unstable();
@@ -971,7 +1001,17 @@ pub fn turns_round(m: &omsi_o3d::Mesh) -> bool {
     // face up with their normals down, faced the ground and left holes in the streets.)
     let linear = glam::Mat3::from_mat4(m.transform);
     let identity = linear.abs_diff_eq(glam::Mat3::IDENTITY, 1e-4);
-    let mirrored = m.has_transform && !identity && m.transform.determinant() > 0.0;
+    // Some exporters keep authored winding with a positive non-uniform scale or a small
+    // rotation. Those transforms are not mirrors, even when the stored normals face the
+    // other way. Ignore scale when checking whether the basis still follows the object axes.
+    let axis_aligned = {
+        let x = linear.x_axis.normalize_or_zero();
+        let y = linear.y_axis.normalize_or_zero();
+        let z = linear.z_axis.normalize_or_zero();
+        x.dot(Vec3::X) > 0.9 && y.dot(Vec3::Y) > 0.9 && z.dot(Vec3::Z) > 0.9
+    };
+    let mirrored =
+        m.has_transform && !identity && !axis_aligned && m.transform.determinant() > 0.0;
     let explained = against_turned * 10 <= counted;
     mirrored && !explained && counted >= 2 && against * 10 >= counted * 9
 }
@@ -1073,6 +1113,84 @@ mod tests {
         assert!(r.transform_vector3(Vec3::Y).x > 0.99);
     }
 
+    /// Two road segments whose seam vertices came out 3 mm apart: a wheel's point in
+    /// the sliver between them stands on the road (it fell through to the ground under it),
+    /// while a point a few centimetres past the road's edge still does not.
+    #[test]
+    fn a_wheel_does_not_fall_through_a_seam() {
+        let mut g = DriveGrid::default();
+        let quad = |g: &mut DriveGrid, y0: f32, y1: f32| {
+            g.push([Vec3::new(0.0, y0, 1.0), Vec3::new(8.0, y0, 1.0), Vec3::new(0.0, y1, 1.0)]);
+            g.push([Vec3::new(8.0, y0, 1.0), Vec3::new(8.0, y1, 1.0), Vec3::new(0.0, y1, 1.0)]);
+        };
+        quad(&mut g, 0.0, 10.0);
+        quad(&mut g, 10.003, 20.0);
+        g.build(300.0);
+        assert_eq!(g.probe(4.0, 10.0015, 2.0).below, Some(1.0));
+        assert_eq!(g.surface_below(4.0, 10.0015, 2.0).map(|(z, _)| z), Some(1.0));
+        assert_eq!(g.probe(8.03, 5.0, 2.0).below, None);
+        assert_eq!(g.probe(4.0, 20.03, 2.0).below, None);
+    }
+
+    #[test]
+    fn thin_triangle_queries_stay_on_the_finite_face() {
+        // An acute, sloping tip beside a road. Offset edge half-planes used to
+        // accept (13.8, 9.24), 1.8 m past the tip, and invent a height of 1.52 m.
+        let triangle = [Vec3::new(10.0, 10.0, 0.0), Vec3::new(12.0, 9.6, 0.8), Vec3::new(10.0, 9.999, 0.0)];
+        for reversed in [false, true] {
+            let mut face = triangle;
+            if reversed { face.swap(1, 2); }
+            for ridge in [false, true] {
+                let mut grid = DriveGrid::default();
+                assert!(grid.push_kind(face, ridge));
+                grid.build(300.0);
+                // The tip straddles a grid bucket boundary at x = 12: nearby
+                // points must still find it, but their heights stay on the tip.
+                for (x, y, expected) in [
+                    (11.0, 9.8, Some(0.4)),
+                    (12.002, 9.5996, Some(0.8)),
+                    (12.01, 9.598, None),
+                    (12.004, 9.596, None), // inside the expanded AABB, outside the radius
+                    (13.8, 9.24, None),
+                ] {
+                    let near = grid.probe(x, y, 0.5);
+                    let wall = grid.probe_walls(x, y, 1.0);
+                    let surface = grid.surface_below(x, y, 1.0).map(|(z, _)| z);
+                    let mut heights = [0.0; 4];
+                    let mut top = None;
+                    let count = grid.heights(x, y, &mut heights, &mut top);
+                    let actual = if ridge { wall.below } else { near.below.or(near.above) };
+                    match expected {
+                        Some(z) => {
+                            assert!((actual.unwrap() - z).abs() < 1e-4, "({x}, {y}): {actual:?}");
+                            assert!((0.0..=0.8).contains(&actual.unwrap()));
+                            if ridge {
+                                assert_eq!(near, Probe::default());
+                                assert_eq!(count, 0);
+                                assert_eq!(surface, None);
+                                assert_eq!(top, actual);
+                            } else {
+                                assert_eq!(wall, Probe::default());
+                                assert_eq!(count, 1);
+                                assert_eq!(heights[0], actual.unwrap());
+                                assert_eq!(surface, actual);
+                                assert_eq!(top, None);
+                                assert_eq!(near.below.is_some(), z <= 0.5);
+                            }
+                        }
+                        None => {
+                            assert_eq!(near, Probe::default(), "({x}, {y})");
+                            assert_eq!(wall, Probe::default());
+                            assert_eq!(surface, None);
+                            assert_eq!(count, 0);
+                            assert_eq!(top, None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A kerb: road at 0, pavement at 0.15 from x = 10 on, a bridge deck at 6 m over it all.
     #[test]
     fn drive_grid_probes_the_face_under_the_axle() {
@@ -1117,6 +1235,46 @@ mod tests {
         assert!(normal.distance(Vec3::new(-0.1, 0.05, 1.0).normalize()) < 1e-5);
         assert!(grid.surface_below(4.0, 5.0, 11.0).is_none());
         assert!(grid.surface_below(290.0, 290.0, 30.0).is_none());
+    }
+
+    #[test]
+    fn surf_maps_lift_the_faces_drawn_with_their_texture() {
+        // red 0, 1, 0.5 and 1 along u: down 2 cm, up 2 cm, level, up 2 cm
+        let rgba: Vec<u8> = [0u8, 255, 128, 255].iter().flat_map(|&r| [r, 0, 0, 255]).collect();
+        let map = std::sync::Arc::new(HeightMap::from_rgba(4, 1, &rgba).unwrap());
+        assert!((map.lift(Vec2::new(0.0, 0.3)) + 0.02).abs() < 1e-6);
+        assert!((map.lift(Vec2::new(0.25, 0.0)) - 0.02).abs() < 1e-6);
+        assert!(map.lift(Vec2::new(0.5, 0.0)).abs() < 1e-3);
+        // tiled: 1.25 is 0.25; past the last texel's start the position stops there and
+        // the second last texel (0.5) is read, not the next tile's first one
+        assert!((map.lift(Vec2::new(1.25, 0.0)) - 0.02).abs() < 1e-6);
+        assert!(map.lift(Vec2::new(0.875, 0.0)).abs() < 1e-3);
+        // a spline's two faces: the one in the slot of a texture with a map is lifted, the
+        // other one not; u runs 0..1 over 10 m in x
+        let mesh = MeshData {
+            positions: vec![
+                Vec3::new(0.0, 0.0, 1.0), Vec3::new(10.0, 0.0, 1.0), Vec3::new(0.0, 10.0, 1.0),
+                Vec3::new(20.0, 0.0, 1.0), Vec3::new(30.0, 0.0, 1.0), Vec3::new(20.0, 10.0, 1.0),
+            ],
+            uvs: vec![
+                Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0),
+                Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0),
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5],
+            ranges: vec![(0, 3, 1), (3, 3, 0)],
+            ..Default::default()
+        };
+        let surf = SurfFaces::of(&mesh, &[None, Some(map)]).unwrap();
+        assert!(SurfFaces::of(&mesh, &[None, None]).is_none());
+        // (the drive mesh keeps only the shape, as the tile loader stages it)
+        let shape = MeshData { positions: mesh.positions.clone(), indices: mesh.indices.clone(), ..Default::default() };
+        let mut ts = TileSurface::new(64);
+        ts.add_spline_drive(&shape, Some(&surf), DVec3::ZERO, 0, 0);
+        ts.finish();
+        let at = |x: f32| ts.drive.probe(x, 1.0, 2.0).below.unwrap();
+        assert!((at(2.5) - 1.02).abs() < 1e-4);
+        assert!((at(0.1) - 0.98).abs() < 2e-3);
+        assert!((at(22.5) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1736,6 +1894,135 @@ impl Probe {
     }
 }
 
+/// How far outside a road face a wheel's point may lie and still stand on it (m). Two spline
+/// segments meeting end to end each work out their seam's vertices for themselves, and the
+/// two edges come out a fraction of a millimetre apart: a point that fell into that sliver met
+/// neither face and dropped through to whatever lay under the road (a car's wheel fell 18 cm
+/// onto the ground for a frame where Spandau's Falkenseer Chaussee joins its next segment, and
+/// the cars bounced at the seam). Omsi.exe's own meshes are drawn without such gaps showing;
+/// a few millimetres closes them and is lost in a tyre's footprint.
+pub const SEAM_TOLERANCE: f32 = 0.005;
+
+/// The barycentric weights of (x, y) in the plan view of triangle `a b c`, when the point
+/// lies inside it or no farther than `tol` metres from the finite triangle. Outside
+/// points use the nearest point on its boundary, so heights and UVs are not extrapolated.
+fn plan_weights(a: Vec3, b: Vec3, c: Vec3, x: f32, y: f32, tol: f32) -> Option<(f32, f32, f32)> {
+    let [a, b, c] = [a, b, c].map(|v| v.truncate().as_dvec2());
+    let p = DVec2::new(x as f64, y as f64);
+    let d = (b - a).perp_dot(c - a);
+    if d.abs() < 1e-9 {
+        return None;
+    }
+    let l2 = (p - a).perp_dot(c - a) / d;
+    let l3 = (b - a).perp_dot(p - a) / d;
+    let l1 = 1.0 - l2 - l3;
+    if l1 >= 0.0 && l2 >= 0.0 && l3 >= 0.0 {
+        return Some((l1 as f32, l2 as f32, l3 as f32));
+    }
+
+    // Offsetting infinite edge lines creates a long wedge beyond an acute tip.
+    // Measure against the three finite segments instead, retaining the 5 mm seam.
+    let mut best_distance = f64::MAX;
+    let mut weights = (0.0, 0.0, 0.0);
+    for (u, v, edge) in [(a, b, 0), (b, c, 1), (c, a, 2)] {
+        let e = v - u;
+        let t = ((p - u).dot(e) / e.length_squared()).clamp(0.0, 1.0);
+        let distance = p.distance_squared(u + e * t);
+        if distance < best_distance {
+            best_distance = distance;
+            weights = match edge {
+                0 => (1.0 - t, t, 0.0),
+                1 => (0.0, 1.0 - t, t),
+                _ => (t, 0.0, 1.0 - t),
+            };
+        }
+    }
+    (best_distance <= (tol as f64).powi(2)).then_some((weights.0 as f32, weights.1 as f32, weights.2 as f32))
+}
+
+/// The box outside which [`plan_weights`] accepts no point of `abc`, matching the
+/// seam-expanded bounds used to bucket the triangle in [`DriveGrid::build`].
+fn plan_reach(a: Vec3, b: Vec3, c: Vec3, tol: f32) -> [f32; 4] {
+    let (lo, hi) = (a.min(b).min(c), a.max(b).max(c));
+    [lo.x - tol, lo.y - tol, hi.x + tol, hi.y + tol]
+}
+
+/// A `.surf` map: a picture beside a road texture (`str_kopfgr01.bmp.surf`) whose red
+/// channel lies over that texture's own coordinates. Where a wheel stands on a face drawn
+/// with the texture, OMSI 2 moves the ground by [`HeightMap::AMPLITUDE`] × (2·red − 1):
+/// cobbles, slabs and broken asphalt shake the bus over a face that is flat (#886).
+#[derive(Debug, Clone, Default)]
+pub struct HeightMap {
+    pub width: usize,
+    pub height: usize,
+    /// The red channel, row by row from the top (v = 0).
+    pub red: Vec<u8>,
+}
+
+impl HeightMap {
+    /// How far the ground moves at full red or black (m).
+    pub const AMPLITUDE: f32 = 0.02;
+
+    /// From an RGBA picture (row by row from the top).
+    pub fn from_rgba(width: usize, height: usize, rgba: &[u8]) -> Option<HeightMap> {
+        (width > 0 && height > 0 && rgba.len() >= width * height * 4)
+            .then(|| HeightMap { width, height, red: rgba.chunks_exact(4).take(width * height).map(|p| p[0]).collect() })
+    }
+
+    /// The ground's lift (m) at texture coordinates `uv`, tiled and filtered between four
+    /// texels as OMSI 2 reads it: no wrap at the picture's edge - the position stops at the
+    /// last texel, and there the second last is read (a strip one texel wide, level).
+    pub fn lift(&self, uv: Vec2) -> f32 {
+        let at = |t: f32, n: usize| {
+            let p = (t.rem_euclid(1.0) * n as f32).min(n as f32 - 1.0);
+            let f = p - p.floor();
+            let i = (p as usize).min(n.saturating_sub(2));
+            (i, (i + 1).min(n - 1), f)
+        };
+        let (x0, x1, fx) = at(uv.x, self.width);
+        let (y0, y1, fy) = at(uv.y, self.height);
+        let r = |x: usize, y: usize| self.red[y * self.width + x] as f32 / 255.0;
+        let top = r(x0, y0) * (1.0 - fx) + r(x1, y0) * fx;
+        let bottom = r(x0, y1) * (1.0 - fx) + r(x1, y1) * fx;
+        Self::AMPLITUDE * (2.0 * (top * (1.0 - fy) + bottom * fy) - 1.0)
+    }
+}
+
+/// The `.surf` maps a mesh's faces are drawn with: its texture coordinates and material
+/// ranges (as in its [`MeshData`]) and the map of each material slot's texture (none past
+/// the end). Kept beside a mesh whose own ranges mean something else (a spline's drive mesh).
+#[derive(Debug, Clone, Default)]
+pub struct SurfFaces {
+    pub uvs: Vec<Vec2>,
+    pub ranges: Vec<(u32, u32, u32)>,
+    pub maps: Vec<Option<std::sync::Arc<HeightMap>>>,
+}
+
+impl SurfFaces {
+    /// Only where a texture has a map, and the mesh texture coordinates to lay it on.
+    pub fn of(mesh: &MeshData, maps: &[Option<std::sync::Arc<HeightMap>>]) -> Option<SurfFaces> {
+        (maps.iter().any(Option::is_some) && mesh.uvs.len() == mesh.positions.len())
+            .then(|| SurfFaces { uvs: mesh.uvs.clone(), ranges: mesh.ranges.clone(), maps: maps.to_vec() })
+    }
+
+    /// The map and corner texture coordinates of face `j` (indices `tri`).
+    fn face(&self, j: usize, tri: &[u32]) -> Option<(&std::sync::Arc<HeightMap>, [Vec2; 3])> {
+        let first = (j * 3) as u32;
+        let r = self.ranges.iter().find(|r| first >= r.0 && first < r.0 + r.1)?;
+        let m = self.maps.get(r.2 as usize)?.as_ref()?;
+        let uv = [0, 1, 2].map(|k| self.uvs.get(tri[k] as usize).copied());
+        Some((m, [uv[0]?, uv[1]?, uv[2]?]))
+    }
+
+    /// Bytes held on the heap (the maps are shared).
+    pub fn heap_bytes(&self) -> usize {
+        self.uvs.capacity() * 8 + self.ranges.capacity() * 12 + self.maps.capacity() * 8
+    }
+}
+
+/// A triangle without a `.surf` map in [`DriveGrid`].
+const NO_BUMP: u32 = u32::MAX;
+
 /// Upward-facing triangles of one tile (tile-local x/y in metres, absolute z), bucketed on a
 /// coarse grid so that a wheel asks only the few faces around it.
 #[derive(Debug, Clone, Default)]
@@ -1744,11 +2031,18 @@ pub struct DriveGrid {
     /// Per triangle: a wall top ([`is_wall_top`]), never stood on - a wall where it stands
     /// over the ground (see [`DriveGrid::probe_walls`]).
     pub ridge: Vec<bool>,
+    /// Per triangle: its entry in `bumps`, or `NO_BUMP` where its texture has no `.surf`.
+    bump_of: Vec<u32>,
+    /// The `.surf` map (index into `maps`) and the texture coordinates of the corners.
+    bumps: Vec<(u32, [Vec2; 3])>,
+    maps: Vec<std::sync::Arc<HeightMap>>,
     cells: usize,
     cell: f32,
     /// Per cell, the range of `items` that lists its triangles (`cells² + 1` offsets).
     start: Vec<u32>,
     items: Vec<u32>,
+    /// Per triangle, the box (min x, min y, max x, max y) outside which [`plan_weights`] never accepts a point.
+    reach: Vec<[f32; 4]>,
 }
 
 impl DriveGrid {
@@ -1757,7 +2051,7 @@ impl DriveGrid {
 
     /// Bytes the grid holds on the heap.
     pub fn heap_bytes(&self) -> usize {
-        self.tris.capacity() * std::mem::size_of::<[Vec3; 3]>() + self.ridge.capacity() + self.start.capacity() * 4 + self.items.capacity() * 4
+        self.tris.capacity() * std::mem::size_of::<[Vec3; 3]>() + self.ridge.capacity() + self.bump_of.capacity() * 4 + self.bumps.capacity() * std::mem::size_of::<(u32, [Vec2; 3])>() + self.start.capacity() * 4 + self.items.capacity() * 4 + self.reach.capacity() * 16
     }
 
     /// Add a triangle; walls (faces steeper than about 70°) are left out, they are nothing
@@ -1767,14 +2061,35 @@ impl DriveGrid {
     }
 
     /// Add a triangle, a wall top or not.
-    pub fn push_kind(&mut self, p: [Vec3; 3], ridge: bool) {
+    pub fn push_kind(&mut self, p: [Vec3; 3], ridge: bool) -> bool {
         let nrm = (p[1] - p[0]).cross(p[2] - p[0]);
         let len = nrm.length();
         if len < 1e-6 || nrm.z.abs() / len < 0.3 {
-            return;
+            return false;
         }
         self.tris.push(p);
         self.ridge.push(ridge);
+        self.bump_of.push(NO_BUMP);
+        true
+    }
+
+    /// Add a triangle drawn with a texture that has a `.surf` map, with the texture
+    /// coordinates of its corners.
+    pub fn push_surf(&mut self, p: [Vec3; 3], uv: [Vec2; 3], map: &std::sync::Arc<HeightMap>) {
+        if !self.push_kind(p, false) {
+            return;
+        }
+        let m = match self.maps.iter().position(|m| std::sync::Arc::ptr_eq(m, map)) {
+            Some(m) => m,
+            None => {
+                self.maps.push(map.clone());
+                self.maps.len() - 1
+            }
+        };
+        if let Some(b) = self.bump_of.last_mut() {
+            *b = self.bumps.len() as u32;
+        }
+        self.bumps.push((m as u32, uv));
     }
 
     /// Bucket the triangles of a tile `tile` metres wide; those entirely outside are dropped.
@@ -1785,10 +2100,14 @@ impl DriveGrid {
         let mut ranges: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(self.tris.len());
         let mut keep = Vec::with_capacity(self.tris.len());
         let mut keep_ridge = Vec::with_capacity(self.tris.len());
+        let mut keep_bump = Vec::with_capacity(self.tris.len());
         self.ridge.resize(self.tris.len(), false);
-        for (t, r) in self.tris.iter().zip(self.ridge.iter()) {
-            let (lo_x, hi_x) = (t[0].x.min(t[1].x).min(t[2].x), t[0].x.max(t[1].x).max(t[2].x));
-            let (lo_y, hi_y) = (t[0].y.min(t[1].y).min(t[2].y), t[0].y.max(t[1].y).max(t[2].y));
+        self.bump_of.resize(self.tris.len(), NO_BUMP);
+        for ((t, r), b) in self.tris.iter().zip(self.ridge.iter()).zip(self.bump_of.iter()) {
+            // (bucketed with the seam tolerance round it: a point that close is on it)
+            let e = SEAM_TOLERANCE;
+            let (lo_x, hi_x) = (t[0].x.min(t[1].x).min(t[2].x) - e, t[0].x.max(t[1].x).max(t[2].x) + e);
+            let (lo_y, hi_y) = (t[0].y.min(t[1].y).min(t[2].y) - e, t[0].y.max(t[1].y).max(t[2].y) + e);
             if hi_x < 0.0 || hi_y < 0.0 || lo_x > tile || lo_y > tile {
                 continue;
             }
@@ -1796,9 +2115,12 @@ impl DriveGrid {
             ranges.push((c(lo_x), c(hi_x), c(lo_y), c(hi_y)));
             keep.push(*t);
             keep_ridge.push(*r);
+            keep_bump.push(*b);
         }
+        self.reach = keep.iter().map(|t| plan_reach(t[0], t[1], t[2], SEAM_TOLERANCE)).collect();
         self.tris = keep;
         self.ridge = keep_ridge;
+        self.bump_of = keep_bump;
         let mut count = vec![0u32; n * n + 1];
         for &(x0, x1, y0, y1) in &ranges {
             for y in y0..=y1 {
@@ -1841,14 +2163,9 @@ impl DriveGrid {
         let k = cy * self.cells + cx;
         let mut best: Option<(f32, Vec3)> = None;
         for &i in &self.items[self.start[k] as usize..self.start[k + 1] as usize] {
-            if self.ridge.get(i as usize).copied().unwrap_or(false) { continue; }
+            if self.ridge.get(i as usize).copied().unwrap_or(false) || !self.reaches(i, x, y) { continue; }
             let [a, b, c] = self.tris[i as usize];
-            let d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
-            if d.abs() < 1e-9 { continue; }
-            let l1 = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / d;
-            let l2 = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / d;
-            let l3 = 1.0 - l1 - l2;
-            if l1.min(l2).min(l3) < -1e-4 { continue; }
+            let Some((l1, l2, l3)) = plan_weights(a, b, c, x, y, SEAM_TOLERANCE) else { continue };
             let z = l1 * a.z + l2 * b.z + l3 * c.z;
             if z <= top && best.is_none_or(|(old, _)| z > old) {
                 let n = (b - a).cross(c - a).normalize();
@@ -1863,6 +2180,44 @@ impl DriveGrid {
         self.probe_kind(x, y, z_top, true)
     }
 
+    /// The road heights over (x, y) into `road` (their count), the highest wall top into `walls`.
+    pub fn heights(&self, x: f32, y: f32, road: &mut [f32], walls: &mut Option<f32>) -> usize {
+        if self.cells == 0 || x < 0.0 || y < 0.0 {
+            return 0;
+        }
+        let (cx, cy) = ((x / self.cell) as usize, (y / self.cell) as usize);
+        if cx >= self.cells || cy >= self.cells {
+            return 0;
+        }
+        let k = cy * self.cells + cx;
+        let mut n = 0;
+        for &i in &self.items[self.start[k] as usize..self.start[k + 1] as usize] {
+            if !self.reaches(i, x, y) {
+                continue;
+            }
+            let [a, b, c] = self.tris[i as usize];
+            let Some((l1, l2, l3)) = plan_weights(a, b, c, x, y, SEAM_TOLERANCE) else { continue };
+            let mut z = l1 * a.z + l2 * b.z + l3 * c.z;
+            if let Some(&(m, uv)) = self.bump_of.get(i as usize).and_then(|&b| self.bumps.get(b as usize)) {
+                z += self.maps[m as usize].lift(uv[0] * l1 + uv[1] * l2 + uv[2] * l3);
+            }
+            if self.ridge.get(i as usize).copied().unwrap_or(false) {
+                *walls = Probe { below: *walls, above: None }.merge(Probe::of(z, f32::MAX)).below;
+            } else {
+                if let Some(slot) = road.get_mut(n) {
+                    *slot = z;
+                }
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[inline]
+    fn reaches(&self, i: u32, x: f32, y: f32) -> bool {
+        self.reach.get(i as usize).is_none_or(|r| x >= r[0] && y >= r[1] && x <= r[2] && y <= r[3])
+    }
+
     fn probe_kind(&self, x: f32, y: f32, z_top: f32, ridges: bool) -> Probe {
         let mut out = Probe::default();
         if self.cells == 0 || x < 0.0 || y < 0.0 {
@@ -1874,23 +2229,16 @@ impl DriveGrid {
         }
         let k = cy * self.cells + cx;
         for &i in &self.items[self.start[k] as usize..self.start[k + 1] as usize] {
-            if self.ridge.get(i as usize).copied().unwrap_or(false) != ridges {
+            if self.ridge.get(i as usize).copied().unwrap_or(false) != ridges || !self.reaches(i, x, y) {
                 continue;
             }
             let [a, b, c] = self.tris[i as usize];
-            let d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
-            if d.abs() < 1e-9 {
-                continue;
+            let Some((l1, l2, l3)) = plan_weights(a, b, c, x, y, SEAM_TOLERANCE) else { continue };
+            let mut z = l1 * a.z + l2 * b.z + l3 * c.z;
+            if let Some(&(m, uv)) = self.bump_of.get(i as usize).and_then(|&b| self.bumps.get(b as usize)) {
+                z += self.maps[m as usize].lift(uv[0] * l1 + uv[1] * l2 + uv[2] * l3);
             }
-            let l1 = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / d;
-            let l2 = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / d;
-            let l3 = 1.0 - l1 - l2;
-            // a hair of tolerance so that a point on a shared edge is never missed
-            const EPS: f32 = -1e-4;
-            if l1 < EPS || l2 < EPS || l3 < EPS {
-                continue;
-            }
-            out = out.merge(Probe::of(l1 * a.z + l2 * b.z + l3 * c.z, z_top));
+            out = out.merge(Probe::of(z, z_top));
         }
         out
     }
@@ -1907,7 +2255,7 @@ impl DriveGrid {
 /// the road's edge too, and the sky showed through along kerbs and car parks.
 pub fn road_cut() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("OMSI_ROAD_CUT").is_some())
+    *ON.get_or_init(|| omsi_cfg::flags::OMSI_ROAD_CUT.live_os().is_some())
 }
 
 /// How far below the ground a surface may lie and still take the ground away: enough for a
@@ -2112,26 +2460,46 @@ impl TileSurface {
     /// object with a `[collision_mesh]` (a traffic island) that cuts no ground. The probe
     /// takes the highest face below the axle, so a bridge deck overhead is never picked.
     pub fn add_drive_mesh(&mut self, mesh: &MeshData, transform: &Mat4, origin: DVec3, tx: i32, ty: i32) {
+        self.add_drive_mesh_surf(mesh, transform, origin, tx, ty, None);
+    }
+
+    /// [`TileSurface::add_drive_mesh`] with the `.surf` maps of the mesh's textures: the
+    /// faces drawn with one carry it.
+    pub fn add_drive_mesh_surf(&mut self, mesh: &MeshData, transform: &Mat4, origin: DVec3, tx: i32, ty: i32, surf: Option<&SurfFaces>) {
         let ident = *transform == Mat4::IDENTITY;
         let off = (origin - DVec3::new(tx as f64 * tile_size(), ty as f64 * tile_size(), 0.0)).as_vec3();
-        for tri in mesh.indices.chunks_exact(3) {
+        for (j, tri) in mesh.indices.chunks_exact(3).enumerate() {
             let mut p = [Vec3::ZERO; 3];
             for k in 0..3 {
                 let v = mesh.positions[tri[k] as usize];
                 p[k] = (if ident { v } else { transform.transform_point3(v) }) + off;
             }
-            self.drive.push(p);
+            match surf.and_then(|s| s.face(j, tri)) {
+                Some((m, uv)) => self.drive.push_surf(p, uv, m),
+                None => self.drive.push(p),
+            }
         }
     }
 
     /// Add a spline's height profiles ([`build_height_profile_mesh`]): its wall tops (the
     /// range of material 1) go in as walls.
     pub fn add_height_profiles(&mut self, mesh: &MeshData, origin: DVec3, tx: i32, ty: i32) {
+        self.add_spline_drive(mesh, None, origin, tx, ty);
+    }
+
+    /// [`TileSurface::add_height_profiles`] for a spline's drawn mesh, with the `.surf` maps
+    /// of its textures where it has any.
+    pub fn add_spline_drive(&mut self, mesh: &MeshData, surf: Option<&SurfFaces>, origin: DVec3, tx: i32, ty: i32) {
         let off = (origin - DVec3::new(tx as f64 * tile_size(), ty as f64 * tile_size(), 0.0)).as_vec3();
         let ridge_from = mesh.ranges.iter().find(|r| r.2 == 1).map(|r| r.0 as usize).unwrap_or(usize::MAX);
         for (j, tri) in mesh.indices.chunks_exact(3).enumerate() {
             let p = [0, 1, 2].map(|k| mesh.positions[tri[k] as usize] + off);
-            self.drive.push_kind(p, j * 3 >= ridge_from);
+            match surf.and_then(|s| s.face(j, tri)) {
+                Some((m, uv)) => self.drive.push_surf(p, uv, m),
+                None => {
+                    self.drive.push_kind(p, j * 3 >= ridge_from);
+                }
+            }
         }
     }
 
@@ -2598,5 +2966,40 @@ mod ray_hit_tests {
         assert!((h.t - 3.0).abs() < 1e-4);
         assert!((h.uv - Vec2::new(0.75, 0.375)).length() < 1e-4, "{:?}", h.uv);
         assert_eq!(ray_mesh_hit(Vec3::new(11.0, -3.0, 0.5), Vec3::Y, &m, &xf).map(|h| h.t), ray_mesh(Vec3::new(11.0, -3.0, 0.5), Vec3::Y, &m, &xf));
+    }
+}
+
+
+#[cfg(test)]
+mod winding_transform_tests {
+    use super::*;
+
+    #[test]
+    fn positive_near_identity_scale_keeps_authored_winding() {
+        let v = |x: f32, y: f32| omsi_o3d::Vertex {
+            position: Vec3::new(x, y, 1.0),
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            uv: Vec2::ZERO,
+        };
+        let mesh = omsi_o3d::Mesh {
+            vertices: vec![v(0.0, 0.0), v(0.0, 1.0), v(1.0, 0.0), v(1.0, 1.0)],
+            triangles: vec![
+                omsi_o3d::Triangle {
+                    indices: [0, 1, 2],
+                    material: 0,
+                },
+                omsi_o3d::Triangle {
+                    indices: [2, 1, 3],
+                    material: 0,
+                },
+            ],
+            materials: vec![omsi_o3d::Material::default()],
+            transform: glam::Mat4::from_scale(Vec3::new(0.918_948, 0.951_776, 1.0)),
+            has_transform: true,
+            ..Default::default()
+        };
+        assert_eq!(positive_det_faces_forward(&mesh), Some(false));
+        assert!(!turns_round(&mesh));
+        assert_eq!(mesh_from_o3d(&mesh).indices[..3], [0, 1, 2]);
     }
 }

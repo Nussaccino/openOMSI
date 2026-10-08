@@ -7,6 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/openOMSI-Project/openOMSI/releases/latest"><img alt="Version" src="https://img.shields.io/github/v/release/openOMSI-Project/openOMSI?label=version&color=f47f30&style=for-the-badge"></a>
+  <a href="https://openomsi-project.github.io/openOMSI/"><img alt="Playing now" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fopenomsi.savvabestbrother.workers.dev%2Fbadge&label=playing%20now&style=for-the-badge&logo=steam&logoColor=white"></a>
   <a href="https://github.com/openOMSI-Project/openOMSI/actions/workflows/release.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/openOMSI-Project/openOMSI/release.yml?branch=main&style=for-the-badge&label=build"></a>
   <a href="https://openomsi-project.github.io/openOMSI/"><img alt="Docs" src="https://img.shields.io/badge/docs-website-2d3138?style=for-the-badge"></a>
   <a href="https://discord.gg/VG2EKVafYG"><img alt="Discord" src="https://img.shields.io/badge/discord-join%20us-5865F2?style=for-the-badge&logo=discord&logoColor=white"></a>
@@ -102,7 +103,11 @@ to.
   a key you change there takes effect at once.
 * **Anything else:** when the game ends on an error, the launcher shows it with *Copy report*
   and *Report on GitHub*. The logs are in `~/.openomsi` (Windows: `C:\Users\<you>\.openomsi`),
-  `game.log` for the last game.
+  `game.log` for the last game. Setup → *Export diagnostics* (or `openomsi --export-diagnostics
+  <file.zip>`) saves a support package for an issue on this computer: the program, the system,
+  the graphics card, driver and settings, the controllers and the last game's map and bus, but
+  no folder paths, names, chat, LAN codes or addresses, and of the logs only which events
+  happened. Nothing is sent; look inside before you attach it.
 
 ## Goals
 
@@ -146,7 +151,7 @@ scripts/build-android.sh      # Android → dist/android/openOMSI-<version>.apk
 scripts/build-server.sh       # server  → dist/server
 ```
 
-Needs [Rust stable](https://rustup.rs) (1.85+) and the platform's C toolchain; details in
+Needs the latest [Rust stable](https://rustup.rs) and the platform's C toolchain; details in
 [docs/BUILDING.md](docs/BUILDING.md).
 
 ## Repository layout

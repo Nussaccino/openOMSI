@@ -31,6 +31,17 @@ pub struct IndexedSpline {
     pub next: i64,
 }
 
+impl IndexedSpline {
+    fn from_map(spline: &MapSpline) -> Self {
+        Self {
+            length: spline.length,
+            map_chain_offset: spline.map_chain_offset,
+            prev: spline.prev_id,
+            next: spline.next_id,
+        }
+    }
+}
+
 /// What the map holds outside the loaded tiles: its splines (lengths, chain offsets and links),
 /// the spline every `[splineAttachement]` row starts on, and where every object stands.
 #[derive(Default)]
@@ -154,8 +165,14 @@ impl MapIndex {
     /// a tile by that index, which a missing tile file must not shift.
     pub fn build(tiles: &[(usize, i32, i32, PathBuf)], chrono_dirs: &[PathBuf], root: &Path) -> MapIndex {
         /// What one tile adds besides its own index part: its rows (key, spline, start
-        /// distance, interval) and its repeaters (master key, spline, first object index).
-        type RowParts = (Vec<((usize, i64), i64, f64, f64)>, Vec<((usize, i64), i64, usize)>);
+        /// distance, interval), its repeaters (master key, spline, first object index),
+        /// and parent attachments to place after the spline rows.
+        type RowParts = (
+            Vec<((usize, i64), i64, f64, f64, IndexedSpline)>,
+            Vec<((usize, i64), i64, usize)>,
+            Vec<((i32, i32), MapSpline, SplineAttachment)>,
+            Vec<omsi_map::MapObject>,
+        );
         let t0 = std::time::Instant::now();
         let signal_types = parking_lot::Mutex::new(HashMap::new());
         // (per tile: the parents its children name a light of, and its objects' files - the
@@ -196,31 +213,30 @@ impl MapIndex {
                 };
                 let mut rows: RowParts = Default::default();
                 for s in tile.splines.iter().filter(|s| !s.deleted) {
-                    let map_chain_offset = if tile.version >= 11 || tile.version == 0 {
-                        let offset = if s.tex_offset.is_finite() && s.tex_offset > 0.0 {
-                            s.tex_offset
-                        } else {
-                            0.0
-                        };
-                        Some(offset)
-                    } else {
-                        None
-                    };
-                    part.splines.insert(s.id, IndexedSpline {
-                        length: s.length,
-                        map_chain_offset,
-                        prev: s.prev_id,
-                        next: s.next_id,
-                    });
+                    part.splines.insert(s.id, IndexedSpline::from_map(s));
                 }
                 for a in &tile.spline_attachments {
                     let Some(s) = tile.splines.get(a.spline_index.max(0) as usize) else { continue };
                     match a.repeater {
-                        None => rows.0.push(((*gi, a.id), s.id, a.offset[2], a.interval)),
+                        None => {
+                            rows.0.push(((*gi, a.id), s.id, a.offset[2], a.interval, IndexedSpline::from_map(s)));
+                            if !s.deleted {
+                                rows.2.push(((*tx, *ty), s.clone(), SplineAttachment {
+                                    file: a.file.clone(),
+                                    id: a.id,
+                                    offset: a.offset,
+                                    rot: a.rot,
+                                    interval: a.interval,
+                                    range: a.range,
+                                    tilt: a.tilt,
+                                    ..Default::default()
+                                }));
+                            }
+                        }
                         Some((master_tile, first)) => rows.1.push(((master_tile, a.id), s.id, first)),
                     }
                 }
-                let terrain = omsi_map::Terrain::load(&crate::scene::tile_companion(path, ".terrain")).ok();
+                let terrain = omsi_map::Terrain::load(&terrain_file(&tile, path)).ok();
                 let origin = DVec2::new(*tx as f64 * tile_size(), *ty as f64 * tile_size());
                 part.covers.insert((*tx, *ty), spline_cover(&tile, origin));
                 let mut name = |f: &str| {
@@ -249,21 +265,43 @@ impl MapIndex {
                     part.stop_side.insert(a.id, stop_side(&a.strings));
                     part.stop_length.insert(a.id, stop_length(&a.strings));
                 }
-                // an object put on a spline (`[splineAttachement]`: an entry point or a stop
-                // on the road): where the row's first object stands on its own spline - enough
-                // to find it and load its tiles (the placed object gives the exact place; a
-                // Novi Sad entry point was "not in the map" before)
-                for a in tile.spline_attachments.iter().filter(|a| a.repeater.is_none()) {
-                    let Some(s) = tile.splines.get(a.spline_index.max(0) as usize) else { continue };
-                    let Some(first) = row_start(a, s, None).and_then(|st| place_on(a, s, origin, None, st).into_iter().next()) else { continue };
-                    part.objects.entry(a.id).or_insert(((*tx, *ty), first.pose.pos, [first.pose.heading(), 0.0, 0.0]));
-                }
+                rows.3 = tile.attach_objects;
                 part.tiles_read = 1;
                 Some((part, rows, lights))
             })
             .collect();
         let mut index = MapIndex::default();
         let mut rows: RowParts = Default::default();
+        // A stop's distance counts from the chain's start, often beyond the length of
+        // its own segment. All predecessors must be known before indexing row poses,
+        // including those on other tiles in maps without an authored chain offset.
+        let mut parts = parts;
+        for (part, _, _) in parts.iter_mut().flatten() {
+            index.splines.extend(std::mem::take(&mut part.splines));
+        }
+        parts.par_iter_mut().flatten().for_each(|(part, rows, _)| {
+            for (tile, spline, attachment) in std::mem::take(&mut rows.2) {
+                let origin = DVec2::new(tile.0 as f64 * tile_size(), tile.1 as f64 * tile_size());
+                let Some(first) = row_start(&attachment, &spline, Some(&index))
+                    .and_then(|start| place_on(&attachment, &spline, origin, Some(&index), start).into_iter().next()) else { continue };
+                part.objects.entry(attachment.id).or_insert((tile, first.pose.pos, [first.pose.heading(), 0.0, 0.0]));
+            }
+            // an object hung on another (`[attachObj]`: the stops of Ahlheim and many
+            // other maps hang on their shelters): at its parent's place - a few metres
+            // off at most, and the placed object gives the exact place once its tile is
+            // loaded. They were in no index at all: a duty's stop beyond the loaded tiles
+            // had no place, never showed on the map and was never reached (#1014, #975).
+            for o in std::mem::take(&mut rows.3) {
+                let Some(parent) = o.parent_id.and_then(|id| part.objects.get(&id).copied()) else { continue };
+                part.objects.entry(o.id).or_insert((parent.0, parent.1, [parent.2[0] + o.rot[0], 0.0, 0.0]));
+                if o.extra.len() >= 2 {
+                    part.stop_weights.insert(o.id, stop_exit_weight(&o.extra));
+                    part.stop_enter.insert(o.id, stop_enter(&o.extra));
+                    part.stop_side.insert(o.id, stop_side(&o.extra));
+                    part.stop_length.insert(o.id, stop_length(&o.extra));
+                }
+            }
+        });
         let named: HashSet<i64> = parts.iter().flatten().flat_map(|p| p.2 .0.iter().copied()).collect();
         let mut programs: HashMap<String, bool> = HashMap::new();
         for (_, ids, names) in parts.iter().flatten().map(|p| &p.2) {
@@ -285,8 +323,7 @@ impl MapIndex {
         }
         for p in parts {
             match p {
-                Some((p, (r, q), _)) => {
-                    index.splines.extend(p.splines);
+                Some((p, (r, q, _, _), _)) => {
                     for (id, v) in p.objects {
                         if let Some(prev) = index.objects.get(&id).filter(|prev| prev.0 != v.0) {
                             index.duplicates.insert((prev.0, id), (prev.1, prev.2));
@@ -311,8 +348,9 @@ impl MapIndex {
             }
         }
         let mut intervals: HashMap<(usize, i64), f64> = HashMap::new();
-        for (key, spline, d, interval) in rows.0 {
-            index.masters.insert(key, (spline, d - chain_offset(&index, spline)));
+        for (key, spline, d, interval, local) in rows.0 {
+            let offset = chain_offset_from(&index, spline, local);
+            index.masters.insert(key, (spline, d - offset));
             intervals.insert(key, interval);
         }
         // how well the chain model matches the editor: a repeater names the first object of
@@ -327,7 +365,7 @@ impl MapIndex {
                 checked += 1;
                 let ours = ((acc - d) / interval + 1e-6).ceil().max(0.0) as usize;
                 agree += (ours == *first) as usize;
-                if ours != *first && omsi_cfg::env::var_os("OMSI_DEBUG_REPEATERS").is_some() {
+                if ours != *first && omsi_cfg::flags::OMSI_DEBUG_REPEATERS.is_set() {
                     log::info!("repeater {:?} on spline {spline}: the map says object {first}, the chain {ours} (chain {acc:.2} m, start {d:.2} m, interval {interval} m: the map's first at {:.2} m, ours at {:.2} m)", key, d + *first as f64 * interval - acc, d + ours as f64 * interval - acc);
                 }
             }
@@ -400,6 +438,18 @@ pub fn read_tile(path: &Path, chrono_dirs: &[PathBuf]) -> Option<Tile> {
             }
             match Tile::load(&p) {
                 Ok(patch) => {
+                    // (a chrono event that reshapes the ground - a cutting, a tunnel's
+                    // portal, a lake let down for a new road - saves the tile's terrain and
+                    // water with its patch: read from the map's own files, the old ground
+                    // filled the new tunnel and the old water stood over the new road,
+                    // #923, #925)
+                    if patch.has_terrain && omsi_cfg::vfs::is_file(&crate::scene::tile_companion(&p, ".terrain")) {
+                        tile.terrain_from = Some(p.clone());
+                    }
+                    if patch.has_water && omsi_cfg::vfs::is_file(&crate::scene::tile_companion(&p, ".water")) {
+                        tile.water_from = Some(p.clone());
+                        tile.has_water = true;
+                    }
                     let unmatched = tile.apply_chrono(&patch);
                     if unmatched > 0 {
                         log::debug!("chrono {}: {unmatched} selections name nothing in the tile", p.display());
@@ -414,6 +464,17 @@ pub fn read_tile(path: &Path, chrono_dirs: &[PathBuf]) -> Option<Tile> {
         }
     }
     Some(tile)
+}
+
+/// The `.terrain` file of a tile read by [`read_tile`] from `path`: an active chrono
+/// patch's own where it brings one (see `Tile::terrain_from`).
+pub fn terrain_file(tile: &Tile, path: &Path) -> PathBuf {
+    crate::scene::tile_companion(tile.terrain_from.as_deref().unwrap_or(path), ".terrain")
+}
+
+/// The `.water` file of a tile read by [`read_tile`] from `path` (see `Tile::water_from`).
+pub fn water_file(tile: &Tile, path: &Path) -> PathBuf {
+    crate::scene::tile_companion(tile.water_from.as_deref().unwrap_or(path), ".water")
 }
 
 /// The transform of `[new_attachment]` point `a` in its parent's frame (x right, y forward,
@@ -508,16 +569,23 @@ pub fn chain_distance(index: &MapIndex, from: i64, to: i64, limit: f64) -> Optio
 /// last `[spline]` field in tile version 11 and newer; that value is authoritative because
 /// `prev`/`next` links can be stale. Older tiles do not store it, so reconstruct it by walking
 /// the links (flipping direction where two splines meet end to end).
+#[cfg(test)]
 pub fn chain_offset(index: &MapIndex, id: i64) -> f64 {
-    if let Some(offset) = index.splines.get(&id).and_then(|s| s.map_chain_offset) {
+    index.splines.get(&id).map(|s| chain_offset_from(index, id, *s)).unwrap_or(0.0)
+}
+
+/// Start with this record, not a foreign spline sharing its id. After the first step
+/// the legacy chain follows the same predecessor links and loop guards as before.
+fn chain_offset_from(index: &MapIndex, id: i64, mut spline: IndexedSpline) -> f64 {
+    if let Some(offset) = spline.map_chain_offset {
         return offset;
     }
     let mut cur = id;
     let mut forward = true;
     let mut acc = 0.0;
     let mut seen: Vec<i64> = vec![id];
-    while let Some(s) = index.splines.get(&cur) {
-        let prev_id = if forward { s.prev } else { s.next };
+    loop {
+        let prev_id = if forward { spline.prev } else { spline.next };
         let Some(p) = index.splines.get(&prev_id) else { break };
         if seen.contains(&prev_id) || seen.len() > 500 {
             break;
@@ -530,6 +598,7 @@ pub fn chain_offset(index: &MapIndex, id: i64) -> f64 {
         acc += p.length;
         seen.push(prev_id);
         cur = prev_id;
+        spline = *p;
     }
     acc
 }
@@ -574,7 +643,12 @@ fn row_start(att: &SplineAttachment, spline: &MapSpline, index: Option<&MapIndex
     let d = att.offset[2];
     let Some((master_tile, first)) = att.repeater else {
         // the start distance counts from the start of the chain
-        let d0 = index.map(|ix| d - chain_offset(ix, spline.id)).unwrap_or(d);
+        // Separate towns in a merged map can reuse spline ids. The record's authored
+        // offset or legacy links belong to this record; a global id may name another.
+        let offset = spline.map_chain_offset
+            .or_else(|| index.map(|ix| chain_offset_from(ix, spline.id, IndexedSpline::from_map(spline))))
+            .unwrap_or(0.0);
+        let d0 = d - offset;
         return Some(RowStart { s: d0, j: 0, backwards: false, d0, acc: 0.0 });
     };
     let master = index.and_then(|ix| ix.masters.get(&(master_tile, att.id)).copied());
@@ -609,7 +683,11 @@ fn place_on(att: &SplineAttachment, spline: &MapSpline, origin: DVec2, index: Op
     // past the end stands at the end
     let far = if backwards { spline.prev_id } else { spline.next_id };
     let chain_ends = index.map(|ix| !ix.splines.contains_key(&far)).unwrap_or(far == 0);
-    let end = len + if chain_ends { CHAIN_END_TOLERANCE } else { 1e-6 };
+    // (only an object on its own - a buffer stop - stands at the end from a little past it:
+    // a row's next post due 0.75 m past a dead end was put at the end, in the carriageway
+    // of Thüringer Wald's road to Haselbach, #1693)
+    let single = interval <= 0.0 || range < interval;
+    let end = len + if chain_ends && single { CHAIN_END_TOLERANCE } else { 1e-6 };
     let mut out = Vec::new();
     loop {
         if interval > 0.0 && j as f64 * interval > range + 1e-6 {
@@ -635,8 +713,11 @@ fn place_on(att: &SplineAttachment, spline: &MapSpline, origin: DVec2, index: Op
             // spline's pitch/bank to the object's Euler angles instead tilts a
             // sideways railing across the road, and a reversed object downhill.
             // The half turn of a backwards chain belongs to that same local frame.
+            // The row's own matrix uses bank, then pitch, then heading (Omsi.exe
+            // 0x79dd20..0x79de02), unlike a plain map object's pitch-first matrix.
+            // Two quarter turns otherwise laid retaining blocks across the street.
             let rot = omsi_geometry::object_rotation([curve.heading_at(u), pitch, bank])
-                * omsi_geometry::object_rotation(own);
+                * omsi_geometry::object_rotation_ypr(own);
             out.push(RowObject { index: j, pose: Pose { pos, rot } });
         }
         if interval <= 0.0 {
@@ -745,6 +826,17 @@ fn tile_candidates(
     candidates
 }
 
+fn initial_stall_due(
+    stalled_for: std::time::Duration,
+    since_last_stall: Option<std::time::Duration>,
+) -> bool {
+    stalled_for >= std::time::Duration::from_secs(15)
+        && match since_last_stall {
+            Some(age) => age >= std::time::Duration::from_secs(30),
+            None => true,
+        }
+}
+
 /// Loads the tiles around a few points as they move (the camera, and the player's bus,
 /// which must not lose the ground under it when the free camera flies off), like OMSI's
 /// tile streaming: the tiles within `load_radius` of any of them are read, tessellated and
@@ -780,6 +872,15 @@ pub struct Streamer {
     pub slow_frames: usize,
     started: std::time::Instant,
     last_summary: std::time::Instant,
+    /// First-area diagnostics are deliberately tiny: one progress line per tile and a
+    /// rate-limited stall line. They exist only while the loading screen is up.
+    initial_last_done: usize,
+    initial_last_progress: std::time::Instant,
+    initial_last_stall_log: Option<std::time::Instant>,
+    /// The worker batch currently being prepared, for a useful stall message.
+    inflight_batch: Option<(Vec<(i32, i32)>, std::time::Instant)>,
+    /// One initial tile may take several frames to upload/place; time it across those frames.
+    initial_upload: Option<((i32, i32), std::time::Instant)>,
     /// Tiles loaded and unloaded when the heap's free pages were last given back, and when.
     relieved_at: (usize, usize, std::time::Instant),
 }
@@ -816,6 +917,11 @@ impl Streamer {
             slow_frames: 0,
             started: std::time::Instant::now(),
             last_summary: std::time::Instant::now(),
+            initial_last_done: 0,
+            initial_last_progress: std::time::Instant::now(),
+            initial_last_stall_log: None,
+            inflight_batch: None,
+            initial_upload: None,
             relieved_at: (0, 0, std::time::Instant::now()),
         };
         let first: hashbrown::HashSet<(i32, i32)> = s.tiles.iter().filter(|t| Self::nearest(centers, t.0, t.1) <= initial_radius.min(load_radius)).map(|t| (t.0, t.1)).collect();
@@ -889,6 +995,14 @@ impl Streamer {
         let mut changed = false;
         while let Ok((asked, prepared, stats, secs)) = self.rx.try_recv() {
             self.inflight = false;
+            if let Some((keys, started)) = self.inflight_batch.take() {
+                let elapsed = started.elapsed().as_secs_f64();
+                if elapsed >= 2.0 {
+                    log::warn!("tile loading: first-area worker batch {:?} returned after {:.2} s", keys, elapsed);
+                } else {
+                    log::info!("tile loading: first-area worker batch {:?} returned in {:.2} s", keys, elapsed);
+                }
+            }
             // a tile the worker could not make is let go (else it stayed "requested" for
             // ever: never retried, never unloaded, and the loading screen waited for it)
             let made: hashbrown::HashSet<(i32, i32)> = prepared.iter().map(|p| (p.tx, p.ty)).collect();
@@ -912,6 +1026,9 @@ impl Streamer {
         while let Some(mut p) = self.queue.pop_front() {
             let key = p.key();
             let initial = self.initial.as_ref().map(|(set, _)| set.contains(&key)).unwrap_or(false);
+            if initial && self.initial_upload.as_ref().map(|(k, _)| *k) != Some(key) {
+                self.initial_upload = Some((key, std::time::Instant::now()));
+            }
             if !initial && Self::nearest(centers, key.0, key.1) > self.unload_radius {
                 // gone out of range while it was being prepared: what it already holds on
                 // the GPU goes back with it
@@ -932,6 +1049,19 @@ impl Streamer {
                 break;
             }
             self.requested.remove(&key);
+            if initial {
+                let secs = self
+                    .initial_upload
+                    .take()
+                    .filter(|(k, _)| *k == key)
+                    .map(|(_, started)| started.elapsed().as_secs_f64())
+                    .unwrap_or(ms / 1000.0);
+                if secs >= 2.0 {
+                    log::warn!("tile loading: slow upload/place tile {},{} took {:.2} s", key.0, key.1, secs);
+                } else {
+                    log::info!("tile loading: uploaded/placed tile {},{} in {:.2} s", key.0, key.1, secs);
+                }
+            }
             let mut stats = crate::scene::LoadStats::default();
             self.world.commit_upload(p, &mut stats);
             self.stats.objects += stats.objects;
@@ -952,6 +1082,8 @@ impl Streamer {
         let mut unloaded = 0usize;
         if self.initial.as_ref().map(|(set, done)| *done >= set.len()).unwrap_or(false) {
             let (set, _) = self.initial.take().unwrap();
+            self.inflight_batch = None;
+            self.initial_upload = None;
             log::info!("tile streaming: first area of {} tiles loaded in {:.2} s", set.len(), self.started.elapsed().as_secs_f64());
         }
         // Far tiles go (never the ones on their way in), the farthest first and only as many
@@ -992,24 +1124,67 @@ impl Streamer {
             self.world.compact_slots(renderer, scene);
             crate::release_free_memory();
         }
-        if self.last_summary.elapsed().as_secs_f32() >= 10.0 && omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
+        if self.last_summary.elapsed().as_secs_f32() >= 10.0 && omsi_cfg::flags::OMSI_PROFILE.is_set() {
             self.last_summary = std::time::Instant::now();
             let at: Vec<String> = centers.iter().map(|c| format!("({:.0}, {:.0})", c.x, c.y)).collect();
             log::info!("tile streaming at {}: {} loaded / {} unloaded so far; {}", at.join(" "), self.loaded_total, self.unloaded_total, self.world.gpu_summary(scene));
-            if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
+            if omsi_cfg::flags::OMSI_PROFILE.is_set() {
                 log::info!("  {}", self.world.cpu_summary());
             }
         }
         let total = t0.elapsed();
         if self.initial.is_none() && total.as_secs_f64() * 1000.0 > 16.0 {
             self.slow_frames += 1;
-            if omsi_cfg::env::var_os("OMSI_PROFILE").is_some() {
+            if omsi_cfg::flags::OMSI_PROFILE.is_set() {
                 log::info!("tile streaming: {:.0} ms this frame ({uploaded} uploaded in {:.0} ms, {unloaded} unloaded in {:.0} ms, lists {:.0} ms)", total.as_secs_f64() * 1000.0, t_upload.as_secs_f64() * 1000.0, (t_unload - t_upload).as_secs_f64() * 1000.0, (total - t_unload).as_secs_f64() * 1000.0);
             }
         }
         if self.initial.is_none() {
             self.worst_frame_ms = self.worst_frame_ms.max(total.as_secs_f64() * 1000.0);
         }
+
+        // While the loading screen is up, make a stuck worker visible without writing once
+        // per frame. Progress is at most one line per initial tile; a genuine stall is one
+        // warning after 15 s and then at most one every 30 s.
+        if let Some((done, total_initial)) = self.initial.as_ref().map(|(set, done)| (*done, set.len())) {
+            let now = std::time::Instant::now();
+            if done != self.initial_last_done {
+                self.initial_last_done = done;
+                self.initial_last_progress = now;
+                self.initial_last_stall_log = None;
+                log::info!(
+                    "tile loading: first area progress {}/{} after {:.1} s",
+                    done,
+                    total_initial,
+                    self.started.elapsed().as_secs_f64()
+                );
+            } else {
+                let stalled_for = now.duration_since(self.initial_last_progress);
+                let since_last = self.initial_last_stall_log.map(|t| now.duration_since(t));
+                if initial_stall_due(stalled_for, since_last) {
+                    let worker = self
+                        .inflight_batch
+                        .as_ref()
+                        .map(|(keys, t)| format!("worker {:?} running {:.1} s", keys, t.elapsed().as_secs_f64()))
+                        .unwrap_or_else(|| "worker idle".to_string());
+                    let upload = self
+                        .initial_upload
+                        .as_ref()
+                        .map(|(key, t)| format!("upload/place {},{} running {:.1} s", key.0, key.1, t.elapsed().as_secs_f64()))
+                        .unwrap_or_else(|| format!("{} prepared tile(s) waiting for upload", self.queue.len()));
+                    log::warn!(
+                        "tile loading: first area stalled at {}/{} for {:.1} s; {}; {}",
+                        done,
+                        total_initial,
+                        stalled_for.as_secs_f64(),
+                        worker,
+                        upload
+                    );
+                    self.initial_last_stall_log = Some(now);
+                }
+            }
+        }
+
         if !self.inflight {
             let missing = self.missing(centers);
             if !missing.is_empty() {
@@ -1024,11 +1199,15 @@ impl Streamer {
                 let tx = self.tx.clone();
                 // the first area gets every core; later tiles only the loader's own threads
                 let first = self.initial.is_some();
+                if first {
+                    log::info!("tile loading: first-area worker batch {:?} started", keys);
+                    self.inflight_batch = Some((keys.clone(), std::time::Instant::now()));
+                }
                 let spawned = std::thread::Builder::new().name("tile loader".into()).spawn(move || {
                     let t = std::time::Instant::now();
                     // (a panic on a damaged file must not end the streaming: the batch comes
                     // back empty and its tiles are let go)
-                    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if first { world.prepare_tiles(&batch) } else { loader_pool().install(|| world.prepare_tiles(&batch)) }));
+                    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if first { world.prepare_tiles_initial(&batch) } else { loader_pool().install(|| world.prepare_tiles(&batch)) }));
                     let (prepared, stats) = made.unwrap_or_else(|_| {
                         log::error!("tile streaming: loading tiles {:?} failed", batch.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>());
                         Default::default()
@@ -1038,6 +1217,7 @@ impl Streamer {
                 if let Err(e) = spawned {
                     log::warn!("tile loader thread: {e}");
                     self.inflight = false;
+                    self.inflight_batch = None;
                     for k in keys {
                         self.requested.remove(&k);
                     }
@@ -1051,6 +1231,168 @@ impl Streamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("../../../tools/test-support/original_root.rs");
+
+    #[test]
+    fn first_area_stall_log_is_delayed_and_rate_limited() {
+        use std::time::Duration;
+
+        assert!(!initial_stall_due(Duration::from_secs(14), None));
+        assert!(initial_stall_due(Duration::from_secs(15), None));
+        assert!(!initial_stall_due(
+            Duration::from_secs(60),
+            Some(Duration::from_secs(29))
+        ));
+        assert!(initial_stall_due(
+            Duration::from_secs(60),
+            Some(Duration::from_secs(30))
+        ));
+    }
+
+    fn synthetic_spline_stop(version: i32, stop: i64, offset: f64, distance: f64, spline_index: usize) -> String {
+        let links = if version >= 11 { "0\n0\n" } else { "-1\n" };
+        let chain = if version >= 11 { format!("0\n0\n{offset}\n") } else { String::new() };
+        let turn = if version >= 12 { "0\n0\n0\n10\n0\n0\n" } else { "0\n10\n0\n" };
+        format!("[version]\n{version}\n\n[spline]\n0\nsynthetic.sli\n10\n{links}0\n0\n0\n0\n50\n0\n0\n0\n0\n0\n{chain}\n[splineAttachement]\n0\nsynthetic-stop.sco\n{stop}\n{spline_index}\n0\n0\n{distance}\n{turn}0\n")
+    }
+
+    #[test]
+    fn cold_child_stop_keeps_its_spline_attached_parent_and_metadata() {
+        let dir = std::env::temp_dir().join(format!("omsi-index-child-spline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tile_3_-2.map");
+        // The parent's 625 m distance includes 600 m before its own 50 m segment.
+        // Its child can be indexed only after that parent's row pose is resolved.
+        let contents = synthetic_spline_stop(14, 100, 600.0, 625.0, 0)
+            + "\n[attachObj]\n0\nsynthetic-child.sco\n200\n100\n0\n0\n30\n0\n0\n6\nChild stop\n7\n2\n11\n22.5\n1\n";
+        std::fs::write(&path, contents).unwrap();
+        let index = MapIndex::build(&[(0, 3, -2, path)], &[], &dir);
+        let expected = DVec3::new(3.0 * tile_size(), -2.0 * tile_size() + 25.0, 0.0);
+        for id in [100, 200] {
+            let (tile, pos, _) = index.objects.get(&id).expect("both parent and child must be indexed cold");
+            assert_eq!(*tile, (3, -2));
+            assert!((*pos - expected).length() < 1e-8);
+        }
+        assert_eq!(index.objects[&200].2, [30.0, 0.0, 0.0]);
+        assert_eq!(index.stop_enter[&200], (7.0, 2.0));
+        assert_eq!(index.stop_weights[&200], 11.0);
+        assert_eq!(index.stop_length[&200], 22.5);
+        assert_eq!(index.stop_side[&200], 1.0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn authored_offsets_keep_stops_on_tiles_with_duplicate_spline_ids() {
+        let dir = std::env::temp_dir().join(format!("omsi-index-duplicate-spline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (first, second) = (dir.join("tile_0_0.map"), dir.join("tile_2_-1.map"));
+        for version in [10, 14] {
+            // A legacy root has no authored offset; a modern root explicitly owns zero.
+            // Neither must inherit the unrelated town's offset from the same spline id.
+            std::fs::write(&first, synthetic_spline_stop(version, 100, 0.0, 25.0, 0)).unwrap();
+            std::fs::write(&second, synthetic_spline_stop(14, 200, 600.0, 625.0, 0)).unwrap();
+            let index = MapIndex::build(&[(0, 0, 0, first.clone()), (1, 2, -1, second.clone())], &[], &dir);
+            assert_eq!(index.splines[&10].map_chain_offset, Some(600.0));
+            for (tile_index, stop, x, y, path) in [(0, 100, 0, 0, &first), (1, 200, 2, -1, &second)] {
+                let origin = DVec2::new(x as f64 * tile_size(), y as f64 * tile_size());
+                let pos = index.objects.get(&stop).expect("both towns must keep their stop").1;
+                assert!((pos - origin.extend(0.0) - DVec3::new(0.0, 25.0, 0.0)).length() < 1e-8);
+                assert_eq!(index.masters[&(tile_index, stop)].1, 25.0);
+                let tile = read_tile(path, &[]).unwrap();
+                let placed = tile_row_objects(&tile.spline_attachments[0], &tile.splines, origin, Some(&index));
+                assert_eq!(placed.len(), 1);
+                assert!((placed[0].1.pose.pos - pos).length() < 1e-8, "streamed placement also uses the local record's offset");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_stops_survive_modern_chrono_with_reused_spline_id() {
+        let dir = std::env::temp_dir().join(format!("omsi-index-chrono-spline-{}", std::process::id()));
+        let chrono = dir.join("Chrono/addition");
+        std::fs::create_dir_all(&chrono).unwrap();
+        let path = dir.join("tile_0_0.map");
+        std::fs::write(&path, synthetic_spline_stop(10, 100, 0.0, 25.0, 0)).unwrap();
+        // Chrono attachment indices count in the combined spline list.
+        std::fs::write(chrono.join("tile_0_0.map"), synthetic_spline_stop(14, 200, 600.0, 625.0, 1)).unwrap();
+        let index = MapIndex::build(&[(0, 0, 0, path.clone())], &[chrono.clone()], &dir);
+        let tile = read_tile(&path, &[chrono]).unwrap();
+        assert_eq!(tile.splines[0].map_chain_offset, None);
+        assert_eq!(tile.splines[1].map_chain_offset, Some(600.0));
+        for attachment in &tile.spline_attachments {
+            let pos = index.objects.get(&attachment.id).expect("chrono must preserve both stops").1;
+            assert!((pos - DVec3::new(0.0, 25.0, 0.0)).length() < 1e-8);
+            assert_eq!(index.masters[&(0, attachment.id)].1, 25.0);
+            let placed = tile_row_objects(attachment, &tile.splines, DVec2::ZERO, Some(&index));
+            assert_eq!(placed.len(), 1);
+            assert!((placed[0].1.pose.pos - pos).length() < 1e-8);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cold_index_resolves_chained_spline_stops() {
+        let dir = std::env::temp_dir().join(format!("omsi-index-stop-chain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for version in [10, 14] {
+            // Entirely synthetic: the stop lies 25 m into the second segment, but its
+            // authored distance (625 m) includes the 600 m before that segment.
+            let spline = |id: i64, y: f64, length: f64, offset: f64| {
+                let links = if version >= 11 {
+                    // Stale predecessor links must not override the authored offset.
+                    format!("0\n{}\n", if id == 1 { 2 } else { 0 })
+                } else {
+                    format!("{}\n", if id == 1 { -1 } else { 0 })
+                };
+                let chain = if version >= 11 { format!("0\n0\n{offset}\n") } else { String::new() };
+                format!("[spline]\n0\nsynthetic.sli\n{id}\n{links}0\n0\n{y}\n0\n{length}\n0\n0\n0\n0\n0\n{chain}\n")
+            };
+            let turn = if version >= 12 { "180\n0\n0\n10\n0\n1\n" } else { "180\n10\n0\n" };
+            let contents = format!("[version]\n{version}\n\n{}{}[splineAttachement]\n0\nsynthetic-stop.sco\n100\n1\n-3\n2\n625\n{turn}0\n",
+                spline(1, 0.0, 600.0, 0.0), spline(2, 600.0, 50.0, 600.0));
+            let path = dir.join(format!("tile_3_-2_v{version}.map"));
+            std::fs::write(&path, contents).unwrap();
+            let index = MapIndex::build(&[(0, 3, -2, path.clone())], &[], &dir);
+            let (_, pos, rot) = index.objects.get(&100).expect("the cold index must know the stop");
+            assert!((*pos - DVec3::new(3.0 * tile_size() - 3.0, -2.0 * tile_size() + 625.0, 2.0)).length() < 1e-8);
+            let tile = read_tile(&path, &[]).unwrap();
+            let placed = tile_row_objects(&tile.spline_attachments[0], &tile.splines,
+                DVec2::new(3.0 * tile_size(), -2.0 * tile_size()), Some(&index));
+            assert_eq!(placed.len(), 1);
+            assert!((*pos - placed[0].1.pose.pos).length() < 1e-8, "cold and streamed placement must agree");
+            assert!((rot[0] - placed[0].1.pose.heading()).abs() < 1e-6);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An active chrono patch with `[terrain]`/`[water]` and their files beside it gives the
+    /// tile its ground and water (#923, #925); one without them leaves the map's own.
+    #[test]
+    fn a_chrono_patch_with_its_own_terrain_and_water_replaces_the_tiles() {
+        let dir = std::env::temp_dir().join(format!("omsi-chrono-terrain-{}", std::process::id()));
+        let (base, c1, c2) = (dir.join("map"), dir.join("map/Chrono/a"), dir.join("map/Chrono/b"));
+        for d in [&base, &c1, &c2] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let name = "tile_0_0.map";
+        std::fs::write(base.join(name), "[version]\n14\n\n[terrain]\n0\n\n[water]\n0\n").unwrap();
+        std::fs::write(base.join(format!("{name}.terrain")), b"x").unwrap();
+        std::fs::write(base.join(format!("{name}.water")), b"x").unwrap();
+        // a: reshapes the ground and the water; b (later): only objects
+        std::fs::write(c1.join(name), "[version]\n14\n\n[terrain]\n0\n\n[water]\n0\n").unwrap();
+        std::fs::write(c1.join(format!("{name}.terrain")), b"x").unwrap();
+        std::fs::write(c1.join(format!("{name}.water")), b"x").unwrap();
+        std::fs::write(c2.join(name), "[version]\n14\n").unwrap();
+        let path = base.join(name);
+        let t = read_tile(&path, &[c1.clone(), c2.clone()]).unwrap();
+        assert_eq!(terrain_file(&t, &path), c1.join(format!("{name}.terrain")));
+        assert_eq!(water_file(&t, &path), c1.join(format!("{name}.water")));
+        let t = read_tile(&path, &[c2.clone()]).unwrap();
+        assert_eq!(terrain_file(&t, &path), base.join(format!("{name}.terrain")));
+        assert_eq!(water_file(&t, &path), base.join(format!("{name}.water")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn traffic_light_parents_follow_placed_signals_not_other_children() {
@@ -1106,9 +1448,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires OMSI_ROOT with the stock Grundorf map"]
+    #[ignore = "needs the original OMSI 2 install (OMSI_ROOT)"]
     fn grundorf_traffic_light_parents_exclude_gaussdorf() {
-        let root = PathBuf::from(std::env::var_os("OMSI_ROOT").expect("OMSI_ROOT"));
+        let root = original_root();
         let map_dir = root.join("maps/Grundorf");
         let global = omsi_map::GlobalCfg::load(&map_dir.join("global.cfg")).expect("Grundorf");
         let tiles = global.tiles.iter().map(|t| (t.index, t.x, t.y, map_dir.join(&t.file))).collect::<Vec<_>>();
@@ -1210,6 +1552,21 @@ mod tests {
     }
 
     #[test]
+    fn compound_row_rotation_keeps_retaining_posts_out_of_the_street() {
+        // A mod uses a 5 m fence post laid on its side as a retaining block.
+        // Its two quarter turns must send the post's long axis to the right of
+        // the spline, rather than along the road as the reversed order did.
+        let s = MapSpline { heading: 26.0, ..spline(1, 0, 0, 10.0) };
+        let att = SplineAttachment { rot: [0.0, 90.0, -90.0], ..row(0.0, 0.0, 2.0, None) };
+        let pose = row_objects(&att, &s, DVec2::ZERO, None)[0].pose;
+        let right = SplineCurve::dir(s.heading + 90.0).as_vec2().extend(0.0);
+        let tip = pose.rot.transform_vector3(Vec3::Z * 5.0);
+        assert!((tip - right * 5.0).length() < 1e-5,
+            "a horizontal retaining post must extend into the bank, not the carriageway: {tip:?}");
+        assert!(tip.z.abs() < 1e-5);
+    }
+
+    #[test]
     fn tangential_row_keeps_its_frame_when_the_spline_runs_backwards() {
         let s = MapSpline { heading: 31.0, grad_start: 12.0, grad_end: 12.0,
             cant_start: 5.0, cant_end: 5.0, ..spline(1, 0, 0, 80.0) };
@@ -1234,7 +1591,7 @@ mod tests {
             cant_start: 20.0, cant_end: 20.0, ..spline(1, 0, 0, 80.0) };
         let att = SplineAttachment { rot: [90.0, 3.0, -2.0], ..row(0.0, 0.0, 20.0, None) };
         let upright = row_objects(&att, &s, DVec2::ZERO, None)[0].pose;
-        let expected = omsi_geometry::object_rotation([155.0, -3.0, 2.0]);
+        let expected = omsi_geometry::object_rotation_ypr([155.0, -3.0, 2.0]);
         for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
             assert!((upright.rot.transform_vector3(axis) - expected.transform_vector3(axis)).length() < 1e-6);
         }
@@ -1252,7 +1609,7 @@ mod tests {
         // Its mesh runs along local X, so the map turns it 90 degrees to the road.
         let s = MapSpline { id: 24096, pos: [163.9941, 44.16156, 270.8004],
             heading: -90.15699, length: 46.00197, grad_start: -0.5, grad_end: -0.5,
-            tex_offset: 771.2027, ..Default::default() };
+            tex_offset: 771.2027, map_chain_offset: Some(771.2027), ..Default::default() };
         let att = SplineAttachment { id: 26386, offset: [-0.0584662628010295, 0.279999999041864, 785.154450166645],
             rot: [90.0000020235813, 0.0, 0.0], tilt: true, ..Default::default() };
         let mut index = MapIndex::default();
@@ -1297,6 +1654,22 @@ mod tests {
         ring.splines.insert(2, IndexedSpline { length: 20.0, map_chain_offset: None, prev: 1, next: 3 });
         ring.splines.insert(3, IndexedSpline { length: 30.0, map_chain_offset: None, prev: 2, next: 1 });
         assert_eq!(chain_offset(&ring, 1), 50.0);
+    }
+
+    /// A row's post due 0.75 m past a dead end is not put at the end (Thüringer Wald's
+    /// fence post in the carriageway, #1693); a single object a little past it still is.
+    #[test]
+    fn a_row_stops_at_a_dead_end_a_single_object_stands_there() {
+        let mut ix = MapIndex::default();
+        ix.splines.insert(5, IndexedSpline { length: 12.0, map_chain_offset: Some(91.01), prev: 0, next: 0 });
+        let end = MapSpline { map_chain_offset: Some(91.01), ..spline(5, 0, 0, 12.0) };
+        // posts every 3 m from 100.76 m of the chain over 7 m: 100.76 (9.75 m along) fits,
+        // 103.76 is 0.75 m past the chain's end at 103.01
+        let posts = row_objects(&row(3.0, 7.0, 100.7586, None), &end, DVec2::ZERO, Some(&ix));
+        assert_eq!(posts.len(), 1, "{:?}", posts.iter().map(|o| o.pose.pos.y).collect::<Vec<_>>());
+        let stop = row_objects(&row(10.0, 0.0, 103.5, None), &end, DVec2::ZERO, Some(&ix));
+        assert_eq!(stop.len(), 1);
+        assert!((stop[0].pose.pos.y - 12.0).abs() < 1e-6, "{:?}", stop[0].pose.pos);
     }
 
     #[test]

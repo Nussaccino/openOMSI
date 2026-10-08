@@ -9,11 +9,13 @@
 //! functions `omsi-launcher --cli` offers a terminal.
 
 pub(crate) mod drive;
+pub(crate) mod mapview;
 pub mod mobile;
 pub mod phone;
 mod multiplayer;
-mod pages;
+pub(crate) mod pages;
 mod showroom;
+mod season;
 mod state;
 #[cfg_attr(not(target_os = "android"), allow(unused_imports))]
 pub(crate) use state::crash_of;
@@ -34,7 +36,7 @@ use ui::{Key, Ui};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,13 +115,15 @@ pub struct Launcher {
     pub icons: std::collections::HashMap<String, usize>,
     pub icons_pending: Vec<(String, image::RgbaImage)>,
     last: Instant,
-    modifiers: ModifiersState,
+    modifiers: ui::Modifiers,
     /// Right or left drag over the showroom.
     dragging: Option<Vec2>,
     clipboard: Option<Clipboard>,
     exit_after: Option<f32>,
     shot: Option<(f32, std::path::PathBuf)>,
     started: Instant,
+    /// Until the first frame is on the screen: the preview loads no bus before it.
+    first_frame: bool,
     /// `OMSI_LAUNCHER_INPUT="t=2 click 400,300; t=3 type Bauern; t=4 key Enter; t=5 shot a.png;
     /// t=6 wheel -3; t=7 move 900,400"`: the window worked by a script (logical pixels).
     script: Vec<(f32, String)>,
@@ -129,6 +133,11 @@ pub struct Launcher {
     preview_rect: Option<Rect>,
     preview_tex: Option<usize>,
     preview_gen: u64,
+    /// The chosen map's picture (see `mapview`): where it is this frame and its texture.
+    pub mapview: mapview::MapView,
+    map_rect: Option<Rect>,
+    map_tex: Option<usize>,
+    map_gen: u64,
     /// The window has the keyboard / is hidden: without focus it is drawn ten times a
     /// second, hidden not at all (a game started from it is being played).
     focused: bool,
@@ -153,6 +162,9 @@ pub struct Launcher {
     discord: Option<crate::discord::Discord>,
     #[cfg(not(target_os = "android"))]
     discord_next_try: Instant,
+    /// Background drop of the graphics device given up while a game runs (see `frame`).
+    /// Joined before a new device is opened so the two do not meet on the card.
+    gpu_rest_drop: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Run the launcher window until it is closed.
@@ -166,6 +178,7 @@ pub fn run(instance: wgpu::Instance) -> anyhow::Result<()> {
 impl Launcher {
     /// The launcher, not yet in a window (that comes with `resumed`).
     pub fn new(instance: wgpu::Instance) -> Launcher {
+    let started = Instant::now();
     core::cleanup();
     let mut app = Launcher {
         instance,
@@ -185,15 +198,16 @@ impl Launcher {
         icons: Default::default(),
         icons_pending: Vec::new(),
         last: Instant::now(),
-        modifiers: ModifiersState::empty(),
+        modifiers: ui::Modifiers::default(),
         dragging: None,
         clipboard: Clipboard::new().ok(),
         // OMSI_LAUNCHER_EXIT=secs, OMSI_LAUNCHER_SHOT=secs:file.png, OMSI_LAUNCHER_PAGE=mods:
         // looking at the window without a person at it
-        exit_after: omsi_cfg::env::var("OMSI_LAUNCHER_EXIT").ok().and_then(|v| v.parse().ok()),
-        shot: omsi_cfg::env::var("OMSI_LAUNCHER_SHOT").ok().and_then(|v| v.split_once(':').map(|(t, f)| (t.parse().unwrap_or(5.0), std::path::PathBuf::from(f)))),
-        started: Instant::now(),
-        script: omsi_cfg::env::var("OMSI_LAUNCHER_INPUT")
+        exit_after: omsi_cfg::flags::OMSI_LAUNCHER_EXIT.parse(),
+        shot: omsi_cfg::flags::OMSI_LAUNCHER_SHOT.var().and_then(|v| v.split_once(':').map(|(t, f)| (t.parse().unwrap_or(5.0), std::path::PathBuf::from(f)))),
+        started,
+        first_frame: true,
+        script: omsi_cfg::flags::OMSI_LAUNCHER_INPUT.var()
             .map(|v| {
                 v.split(';')
                     .filter_map(|c| {
@@ -208,6 +222,10 @@ impl Launcher {
         preview_rect: None,
         preview_tex: None,
         preview_gen: 0,
+        mapview: mapview::MapView::new(),
+        map_rect: None,
+        map_tex: None,
+        map_gen: 0,
         focused: true,
         occluded: false,
         awake_in_game: false,
@@ -222,6 +240,7 @@ impl Launcher {
         discord: None,
         #[cfg(not(target_os = "android"))]
         discord_next_try: Instant::now(),
+        gpu_rest_drop: None,
     };
     // after an update: the files it set aside go, and the launcher says what happened
     #[cfg(not(target_os = "android"))]
@@ -237,7 +256,7 @@ impl Launcher {
         let why = state::root_problem(&app.state.config.root);
         app.state.set_status(why, true);
     }
-    if let Ok(p) = omsi_cfg::env::var("OMSI_LAUNCHER_PAGE") {
+    if let Some(p) = omsi_cfg::flags::OMSI_LAUNCHER_PAGE.var().map(str::to_string) {
         if let Some((pg, _, _)) = PAGES.iter().find(|(_, n, _)| n.eq_ignore_ascii_case(p.split(':').next().unwrap_or(""))) {
             app.page = *pg;
             // (the phone's tab for it)
@@ -261,8 +280,9 @@ impl Launcher {
             "sheet-livery" => app.phone.sheet = Some(phone::Sheet::Livery),
             _ => {}
         }
-        if let Some(step) = p.split(':').nth(1).and_then(|s| s.parse().ok()) {
-            app.drive.step = step;
+        if let Some(step) = p.split(':').nth(1).and_then(|s| s.parse::<usize>().ok()) {
+            // (the Drive page's second part is which of its three steps: drive:2 the map)
+            app.drive.tab = step.min(2);
             // (the Controls and Settings pages' second part is their tab: controls:1 the game
             // controllers, settings:3 Sound)
             app.pages.controls_tab = step;
@@ -272,16 +292,33 @@ impl Launcher {
     app
     }
 
-    /// The window, its surface and the renderer, given up for the game (a phone plays in the
-    /// launcher's window).
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    pub fn release_window(&mut self) -> Option<Arc<Window>> {
-        self.pages.pads.cancel_feedback_test();
-        self.surface = None;
+    /// Everything made on the graphics device goes with it: the interface's textures and every
+    /// number kept for one of them - the bus preview, the map picture (and the map's own
+    /// drawing), the servers' icons. A number kept over a device made anew pointed past the
+    /// new device's textures, and the map was drawn with the font atlas instead: the Drive
+    /// page's map full of the interface's words after a game (the launcher gives its device
+    /// up while one runs) or a lost device.
+    fn drop_gpu(&mut self) {
         self.gpu = None;
         self.preview_tex = None;
         self.showroom = showroom::Showroom::new();
         self.preview_gen = 0;
+        self.map_tex = None;
+        self.map_gen = 0;
+        self.mapview.drop_gpu();
+        self.icons.clear();
+    }
+
+    /// The window, its surface and the renderer, given up for the game (a phone plays in the
+    /// launcher's window).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn release_window(&mut self) -> Option<Arc<Window>> {
+        self.pages.pads.release_io();
+        self.surface = None;
+        self.drop_gpu();
+        if let Some(h) = self.gpu_rest_drop.take() {
+            let _ = h.join();
+        }
         self.renderer = None;
         self.ime = false;
         self.window.take()
@@ -302,6 +339,10 @@ impl Launcher {
     fn make_surface(&mut self) {
         let Some(window) = self.window.clone() else { return };
         if self.renderer.is_none() {
+            // Finish dropping the device given up for a game before opening another one.
+            if let Some(h) = self.gpu_rest_drop.take() {
+                let _ = h.join();
+            }
             let settings = crate::settings::Settings::load();
             let renderer = match crate::startup::window_renderer(&mut self.instance, &window, showroom_options(&settings)) {
                 Ok(r) => r,
@@ -343,7 +384,7 @@ impl ApplicationHandler for Launcher {
             return;
         }
         // (`OMSI_LAUNCHER_SIZE=WxH`: another window size, for looking at the layout)
-        let asked = omsi_cfg::env::var("OMSI_LAUNCHER_SIZE").ok().and_then(|v| v.split_once('x').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?))));
+        let asked = omsi_cfg::flags::OMSI_LAUNCHER_SIZE.var().and_then(|v| v.split_once('x').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?))));
         let (fit, at) = match asked {
             Some((iw, ih)) => (winit::dpi::LogicalSize::new(iw, ih), None),
             None => crate::startup::fit_window(event_loop, 1440.0, 880.0),
@@ -356,7 +397,7 @@ impl ApplicationHandler for Launcher {
                 attrs = attrs.with_position(at);
             }
         }
-        if omsi_cfg::env::var_os("OMSI_BACKGROUND").is_some() {
+        if omsi_cfg::flags::OMSI_BACKGROUND.is_set() {
             attrs = attrs.with_active(false);
         }
         let window = match event_loop.create_window(attrs) {
@@ -407,7 +448,16 @@ impl ApplicationHandler for Launcher {
             WindowEvent::Focused(f) => self.set_focus(f),
             WindowEvent::Occluded(o) => {
                 self.occluded = o;
-                if o { self.pages.pads.cancel_feedback_test(); }
+                if o {
+                    self.pages.pads.cancel_feedback_test();
+                } else if self.renderer.is_none() {
+                    // Back in view without a graphics device (a game just ended, or the
+                    // window was covered while resting): draw again so the device is opened
+                    // without waiting for the next slow occluded tick.
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                }
             }
             WindowEvent::Resized(s) => {
                 if let (Some(sf), Some(r)) = (self.surface.as_mut(), self.renderer.as_ref()) {
@@ -415,10 +465,8 @@ impl ApplicationHandler for Launcher {
                 }
             }
             WindowEvent::ModifiersChanged(m) => {
-                self.modifiers = m.state();
-                self.ui.input.shift = self.modifiers.shift_key();
-                self.ui.input.ctrl = self.modifiers.control_key() || self.modifiers.super_key();
-                self.ui.input.alt = self.modifiers.alt_key();
+                self.modifiers.told(m.state());
+                self.modifiers.apply(&mut self.ui.input);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = Vec2::new(position.x as f32, position.y as f32) / scale;
@@ -435,8 +483,9 @@ impl ApplicationHandler for Launcher {
                     MouseButton::Left => {
                         if down {
                             self.ui.input.pressed = true;
-                            // a drag on the preview turns the bus
-                            if self.preview_rect.map(|r| r.contains(self.ui.input.mouse)).unwrap_or(false) {
+                            // a drag on the preview turns the bus (the panels lie over it:
+                            // what the mouse is over is theirs, not the bus's)
+                            if !self.ui.over_ui && self.preview_rect.map(|r| r.contains(self.ui.input.mouse)).unwrap_or(false) {
                                 self.dragging = Some(self.ui.input.mouse);
                             }
                         } else {
@@ -467,10 +516,16 @@ impl ApplicationHandler for Launcher {
                 self.ui.input.wheel += d;
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // (Shift, Ctrl, Alt from their keys where the window never says: Android)
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if self.modifiers.key(code, event.state == ElementState::Pressed) {
+                        self.modifiers.apply(&mut self.ui.input);
+                    }
+                }
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                let cmd = self.modifiers.control_key() || self.modifiers.super_key();
+                let cmd = self.modifiers.command();
                 // a phone's back key: out of the storage browser, else like Escape
                 if event.physical_key == PhysicalKey::Code(KeyCode::BrowserBack) {
                     if self.browser.is_some() {
@@ -481,7 +536,7 @@ impl ApplicationHandler for Launcher {
                     return;
                 }
                 if let PhysicalKey::Code(code) = event.physical_key {
-                    self.ui.input.raw_key = Some(code);
+                    self.ui.input.capture_key(code);
                     let k = match code {
                         KeyCode::ArrowLeft => Some(Key::Left),
                         KeyCode::ArrowRight => Some(Key::Right),
@@ -535,10 +590,14 @@ impl ApplicationHandler for Launcher {
         // (likewise the frame that opens it again for a window brought forward)
         let resting = !mobile::mobile() && self.renderer.is_some() && self.state.in_game() && !self.awake();
         let waking = !mobile::mobile() && self.renderer.is_none() && self.state.in_game() && self.awake();
-        let occluded = self.occluded && self.shot.is_none() && !resting && !waking && !self.script.iter().any(|(_, c)| c.starts_with("shot"));
+        // Device given up while a game runs: still need a redraw when the game ends so the
+        // device is opened again (Occluded alone used to leave the resting picture forever).
+        let resume_needed = !mobile::mobile() && self.renderer.is_none() && !self.state.in_game();
+        let occluded = self.occluded && self.shot.is_none() && !resting && !waking && !resume_needed
+            && !self.script.iter().any(|(_, c)| c.starts_with("shot"));
         let interval = if occluded {
             0.5
-        } else if !self.focused && omsi_cfg::env::var_os("OMSI_BACKGROUND").is_none() {
+        } else if !self.focused && !omsi_cfg::flags::OMSI_BACKGROUND.is_set() {
             0.1
         } else if self.last_input.elapsed().as_secs_f32() > 3.0 && self.dragging.is_none() && self.script.is_empty() {
             // idle: 20 frames a second keep the preview and the progress bars moving
@@ -562,6 +621,12 @@ impl ApplicationHandler for Launcher {
             self.update_discord();
             self.update_tick(event_loop);
             self.check_exit(event_loop);
+            // A game may have ended on this tick: wake so `frame` opens the device again.
+            if !mobile::mobile() && self.renderer.is_none() && !self.state.in_game() {
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
         } else if let Some(w) = self.window.as_ref() {
             w.request_redraw();
         }
@@ -613,10 +678,10 @@ impl Launcher {
             self.state.settings_dirty = 0.3;
         }
         self.surface = None;
-        self.gpu = None;
-        self.preview_tex = None;
-        self.showroom = showroom::Showroom::new();
-        self.preview_gen = 0;
+        self.drop_gpu();
+        if let Some(h) = self.gpu_rest_drop.take() {
+            let _ = h.join();
+        }
         self.renderer = None;
         self.make_surface();
         true
@@ -668,6 +733,8 @@ impl Launcher {
         self.focused = f;
         if !f {
             self.pages.pads.cancel_feedback_test();
+            self.modifiers.release_keys();
+            self.modifiers.apply(&mut self.ui.input);
         }
         // (only once the game is on its way: the launcher has the focus while Start is
         // pressed, and gives the device up then as before)
@@ -718,7 +785,11 @@ impl Launcher {
                 self.ui.discard_input();
                 #[cfg(not(target_os = "android"))]
                 self.update_discord();
-                return;
+                // `update` may have seen the game end: open the device this frame instead of
+                // returning with the resting picture until another redraw happens to notice.
+                if self.state.in_game() && !self.awake() {
+                    return;
+                }
             }
             if self.state.in_game() {
                 log::info!("launcher: its window is looked at while a game runs, the graphics device is opened again");
@@ -741,17 +812,27 @@ impl Launcher {
         {
             log::info!("launcher: a game starts or runs, the graphics device is given up until it ends");
             self.surface = None;
-            self.gpu = None;
-            self.preview_tex = None;
-            self.showroom = showroom::Showroom::new();
-            self.preview_gen = 0;
-            self.renderer = None;
+            self.drop_gpu();
+            // Dropping a wgpu device can wait on the GPU for seconds (especially while the
+            // game is opening the same card). Do it off the UI thread so Windows does not
+            // mark the launcher "Not Responding" over the resting picture.
+            if let Some(r) = self.renderer.take() {
+                if let Some(prev) = self.gpu_rest_drop.take() {
+                    let _ = prev.join();
+                }
+                self.gpu_rest_drop = std::thread::Builder::new()
+                    .name("launcher-gpu-rest".into())
+                    .spawn(move || drop(r))
+                    .ok();
+            }
         }
         if let Some(d) = presence_released.then(|| self.state.queued_launch.take()).flatten() {
             // Finish the Discord handoff in the background before starting the child.
             #[cfg(not(target_os = "android"))]
             drop(self.discord.take());
-            self.pages.pads.cancel_feedback_test();
+            // The Controls page may still own the same DirectInput wheel non-exclusively.
+            // Drop it before the child asks for exclusive foreground access for force feedback.
+            self.pages.pads.release_io();
             self.state.spawn_launch(d);
         }
     }
@@ -775,8 +856,9 @@ impl Launcher {
         // the preview shows the chosen bus in the chosen light
         let c = &self.state.choice;
         let look = showroom::Look { root: std::path::PathBuf::from(&self.state.config.root), map: c.map.clone(), bus: c.bus.clone(), paint: c.paint.clone(), weather: c.weather.clone(), time: c.time, date: c.date.clone() };
-        // (not while a game runs: the launcher looked at meanwhile loads no bus onto the card)
-        if !look.bus.is_empty() && !look.map.is_empty() && !self.state.in_game() {
+        // (not while a game runs: the launcher looked at meanwhile loads no bus onto the card;
+        // nor before the first frame is shown, which the bus's loading would hold up)
+        if !self.first_frame && !look.bus.is_empty() && !look.map.is_empty() && !self.state.in_game() {
             self.showroom.want(look);
         }
         if let Some(r) = self.renderer.as_ref() {
@@ -785,6 +867,7 @@ impl Launcher {
 
         // --- the interface
         self.preview_rect = None;
+        self.map_rect = None;
         self.ui.begin(size, scale, dt);
         self.draw_ui();
         if mobile::mobile() {
@@ -818,6 +901,22 @@ impl Launcher {
                     match self.preview_tex {
                         Some(id) => gpu.set_view(&renderer.device, id, &view, (w, h)),
                         None => self.preview_tex = Some(gpu.add_view(&renderer.device, &view, (w, h))),
+                    }
+                }
+            }
+        }
+        // the map picture, drawn again when what it shows, where it looks or the zoom's own
+        // thinness changed
+        if self.map_rect.is_some() {
+            if let Some(view) = self.mapview.picture(renderer) {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    if self.map_gen != self.mapview.generation {
+                        self.map_gen = self.mapview.generation;
+                        let size = self.mapview.pixels();
+                        match self.map_tex {
+                            Some(id) => gpu.set_view(&renderer.device, id, &view, size),
+                            None => self.map_tex = Some(gpu.add_view(&renderer.device, &view, size)),
+                        }
                     }
                 }
             }
@@ -869,6 +968,9 @@ impl Launcher {
         }
         window.pre_present_notify();
         frame.present();
+        if std::mem::take(&mut self.first_frame) {
+            log::info!("launcher: first frame presented in {:.2} s", self.started.elapsed().as_secs_f64());
+        }
         self.check_exit(event_loop);
     }
 
@@ -905,6 +1007,17 @@ impl Launcher {
                     self.release_next = true;
                 }
                 "wheel" => self.ui.input.wheel.y += arg.trim().parse::<f32>().unwrap_or(0.0),
+                // a drag: down at a place, `move` with the button still held, `up` at the end
+                "down" => {
+                    self.ui.input.mouse = xy();
+                    self.ui.input.pressed = true;
+                    self.ui.input.down = true;
+                    self.release_next = false;
+                }
+                "up" => {
+                    self.ui.input.released = true;
+                    self.ui.input.down = false;
+                }
                 "type" => self.ui.input.text.push_str(arg),
                 "key" => {
                     let k = match arg.trim() {
@@ -966,12 +1079,13 @@ impl Launcher {
         // the storage browser (or the update dialog) lies over the page: the page sees no
         // finger meanwhile
         let dialog = self.update_dialog_open();
-        let crash = !dialog && self.state.crash.is_some();
-        let reset = !dialog && !crash && self.pages.confirm_reset;
-        if self.browser.is_some() || dialog || crash || reset {
+        let disconnected = !dialog && self.state.disconnected.is_some();
+        let crash = !dialog && !disconnected && self.state.crash.is_some();
+        let reset = !dialog && !crash && !disconnected && self.pages.confirm_reset;
+        if self.browser.is_some() || dialog || crash || reset || disconnected {
             self.pages.pads.cancel_feedback_test();
         }
-        let saved = (self.browser.is_some() || dialog || crash || reset).then(|| {
+        let saved = (self.browser.is_some() || dialog || crash || reset || disconnected).then(|| {
             let i = self.ui.input.clone();
             self.ui.input.mouse = Vec2::new(-1e4, -1e4);
             self.ui.input.pressed = false;
@@ -1025,6 +1139,8 @@ impl Launcher {
             self.ui.input = i;
             if dialog {
                 self.draw_update_dialog();
+            } else if disconnected {
+                self.draw_disconnect_dialog();
             } else if crash {
                 self.draw_crash_dialog();
             } else if reset {
@@ -1082,6 +1198,77 @@ impl Launcher {
         if self.ui.hover(r) {
             self.ui.cursor = winit::window::CursorIcon::Grab;
         }
+    }
+
+    /// The chosen map across `r`, the whole page behind the panels: every road the map has,
+    /// its entry points and the chosen trip's route, read from the tile files (see
+    /// `mapview`), or a word while it is read. `map_interact` gives it the mouse afterwards.
+    pub fn map_background(&mut self, r: Rect) {
+        self.map_rect = Some(r);
+        let status = self.mapview.status();
+        match (self.map_tex, status.is_empty()) {
+            (Some(tex), true) => self.ui.image(r, tex, RADIUS),
+            _ => {
+                self.ui.solid(r);
+                self.ui.p().rounded(r, RADIUS, omsi_ui::Color::rgba(13, 13, 13, 1.0));
+                let t = if status.is_empty() { "Loading…" } else { status };
+                self.ui.text_in(t, Rect::new(r.x, r.y + r.h * 0.5 - 12.0, r.w, 24.0), 13.5, Weight::Regular, TEXT_FAINT, Align::Center);
+            }
+        }
+        if self.mapview.busy() {
+            // (out of the way of the panels: the map is being read, the page is not)
+            let c = Vec2::new(r.right() - 26.0, r.y + r.h - 26.0);
+            let a = self.ui.time * 5.0;
+            self.ui.p().arc(c, 6.0, 8.0, a, a + 4.2, TEXT_SOFT);
+        }
+    }
+
+    /// The mouse over the map: what it drags, where it zooms, and the entry point a click
+    /// takes. Called once the page's panels are drawn - they have the first claim on it.
+    pub fn map_interact(&mut self, r: Rect, window: Rect) {
+        let p = mapview::Pointer {
+            at: self.ui.input.mouse,
+            pressed: self.ui.input.pressed,
+            released: self.ui.input.released,
+            down: self.ui.input.down,
+            wheel: self.ui.input.wheel.y,
+            blocked: self.ui.over_ui || !r.contains(self.ui.input.mouse),
+        };
+        self.mapview.think(r, window, self.ui.scale, p);
+        if let Some(i) = self.mapview.take_clicked() {
+            if self.state.choice.entry != i as i32 {
+                log::info!("launcher map: entry point {} of the map's list taken from the map", i + 1);
+                self.state.choice.entry = i as i32;
+                self.state.touched();
+            }
+        }
+    }
+
+    /// The bus across `r`, the whole page behind the panels. `focus` is where the panels end,
+    /// as a share of the window: the showroom frames the bus in what is left of it.
+    pub fn preview_full(&mut self, r: Rect, focus: f32) {
+        self.preview_rect = Some(r);
+        self.showroom.focus_x = focus.clamp(0.2, 0.95);
+        match (self.preview_tex, self.showroom.has_picture()) {
+            (Some(tex), true) => self.ui.image(r, tex, RADIUS),
+            _ => {
+                self.ui.solid(r);
+                self.ui.p().rounded(r, RADIUS, FIELD);
+                let t = if self.showroom.error.is_some() { "No preview" } else { "Loading…" };
+                self.ui.text_in(t, Rect::new(r.x, r.y + r.h * 0.5 - 12.0, r.w, 24.0), 13.0, Weight::Regular, TEXT_FAINT, Align::Center);
+            }
+        }
+    }
+
+    /// The wheel and the cursor over the showroom, once the panels have had the mouse.
+    pub fn showroom_pointer(&mut self, r: Rect) {
+        if self.ui.over_ui || !r.contains(self.ui.input.mouse) {
+            return;
+        }
+        if self.ui.input.wheel.y.abs() > 0.0 {
+            self.showroom.zoom_by((1.0 - self.ui.input.wheel.y * 0.08).clamp(0.8, 1.25));
+        }
+        self.ui.cursor = winit::window::CursorIcon::Grab;
     }
 
     pub fn go(&mut self, p: Page) {
@@ -1198,7 +1385,9 @@ impl Launcher {
 
 
 /// The showroom's renderer: a bus on a floor needs none of the game's costly passes - no
-/// ambient occlusion, a small shadow map, 4x MSAA for the edges whatever the game uses.
+/// ambient occlusion, a small shadow map, 4x MSAA for the edges whatever the game uses -
+/// and it draws Vanilla+ whatever the game does (`showroom::lighting_for`): no enhanced
+/// pipelines, reflection probe or cloud noise either (`RenderOptions::preview_only`).
 fn showroom_options(settings: &crate::settings::Settings) -> omsi_render::RenderOptions {
-    omsi_render::RenderOptions { msaa: 4, ssao: false, shadow_size: 1024, render_scale: 1.0, dlss: omsi_render::DlssMode::Off, ..settings.render_options() }
+    omsi_render::RenderOptions { msaa: 4, ssao: false, shadow_size: 1024, render_scale: 1.0, preview_only: true, no_enhanced: true, ray_tracing: false, dlss: omsi_render::DlssMode::Off, ..settings.render_options() }
 }

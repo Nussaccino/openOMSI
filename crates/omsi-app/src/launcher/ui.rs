@@ -64,10 +64,97 @@ pub struct Input {
     pub alt: bool,
     /// A key as it was pressed (for binding keys): winit's code name.
     pub raw_key: Option<winit::keyboard::KeyCode>,
+    /// Binding modifiers at key press, independent of later releases before redraw.
+    pub raw_chord: i32,
     pub double_click: bool,
     /// The wheel is a finger dragged over the screen: it scrolls, it never turns a slider or
     /// a time field under the finger.
     pub touch: bool,
+}
+
+impl Input {
+    pub fn capture_key(&mut self, code: winit::keyboard::KeyCode) {
+        // A modifier alone is not a binding. Do not let a later modifier event
+        // overwrite a letter already waiting for the controls page.
+        if Modifiers::bit(code).is_some() { return; }
+        self.raw_key = Some(code);
+        self.raw_chord = omsi_content::input::chord(self.shift, self.ctrl, self.alt);
+    }
+
+    pub fn binding_modifiers(&self) -> i32 {
+        self.raw_chord
+    }
+}
+
+/// Shift, Ctrl, Alt and the logo key as the launcher knows them. The window says when they
+/// change (`ModifiersChanged`) - except on Android, whose winit backend never does: Shift or
+/// Ctrl held on a phone's keyboard went unseen there, a key bound with Shift was saved as the
+/// letter alone and Ctrl+V typed a "v" (#634). Until the window has said it once, the
+/// modifier keys' own presses and releases tell what is held.
+#[derive(Default, Clone, Copy)]
+pub struct Modifiers {
+    /// The modifier keys held, a bit each (left and right apart: one let go of while the
+    /// other is still down keeps it held).
+    keys: u8,
+    /// What the window last said, once it has said anything.
+    told: Option<winit::keyboard::ModifiersState>,
+}
+
+impl Modifiers {
+    fn bit(code: winit::keyboard::KeyCode) -> Option<u8> {
+        use winit::keyboard::KeyCode as K;
+        let k = [K::ShiftLeft, K::ShiftRight, K::ControlLeft, K::ControlRight, K::AltLeft, K::AltRight, K::SuperLeft, K::SuperRight];
+        k.iter().position(|c| *c == code).map(|i| 1 << i)
+    }
+
+    /// A key went down or up; true when it was a modifier key.
+    pub fn key(&mut self, code: winit::keyboard::KeyCode, pressed: bool) -> bool {
+        let Some(b) = Self::bit(code) else { return false };
+        if pressed {
+            self.keys |= b;
+        } else {
+            self.keys &= !b;
+        }
+        true
+    }
+
+    /// The window's `ModifiersChanged`.
+    pub fn told(&mut self, m: winit::keyboard::ModifiersState) {
+        self.told = Some(m);
+    }
+
+    /// The keyboard went to another window: what is let go of there is not held here.
+    pub fn release_keys(&mut self) {
+        self.keys = 0;
+    }
+
+    pub fn state(&self) -> winit::keyboard::ModifiersState {
+        use winit::keyboard::ModifiersState as M;
+        if let Some(m) = self.told {
+            return m;
+        }
+        let mut m = M::empty();
+        for (bits, flag) in [(0b11, M::SHIFT), (0b1100, M::CONTROL), (0b11_0000, M::ALT), (0b1100_0000, M::SUPER)] {
+            if self.keys & bits != 0 {
+                m |= flag;
+            }
+        }
+        m
+    }
+
+    /// Ctrl, or the logo key (Cmd on a Mac): the one for copy and paste.
+    pub fn command(&self) -> bool {
+        let m = self.state();
+        m.control_key() || m.super_key()
+    }
+
+    /// Into the widgets' input.
+    pub fn apply(&self, input: &mut Input) {
+        let m = self.state();
+        input.shift = m.shift_key();
+        input.ctrl = self.command();
+        input.alt = m.alt_key();
+    }
 }
 
 /// An open dropdown: its options are drawn last, over everything.
@@ -92,8 +179,12 @@ impl Popup {
     /// The options shown (their places in `options`): those with the typed text in them.
     fn shown(&self) -> Vec<usize> {
         let q = self.query.to_lowercase();
-        (0..self.options.len()).filter(|&k| q.is_empty() || self.options[k].to_lowercase().contains(&q)).collect()
+        (0..self.options.len()).filter(|&k| q.is_empty() || matches(&self.options[k], &q)).collect()
     }
+}
+
+pub fn matches(text: &str, q: &str) -> bool {
+    text.to_lowercase().contains(q) || omsi_ui::tr(text).to_lowercase().contains(q)
 }
 
 /// A calendar dropdown for a date field.
@@ -932,6 +1023,14 @@ impl Ui {
         self.push_clip(r, 6.0);
         let content = body(self, Rect::new(r.x, r.y - off, r.w, r.h));
         self.pop_clip();
+        self.scroll_keep(name, r, content);
+    }
+
+    /// The scrolling of such a view: the bar, the wheel, and its own easing towards where it
+    /// was sent. `content` is what the rows came to, all of them.
+    pub fn scroll_keep(&mut self, name: &str, r: Rect, content: f32) {
+        let id = id_of(name);
+        let off = self.scroll.get(&id).copied().unwrap_or(0.0);
         let max = (content - r.h).max(0.0);
         let mut target = self.scroll.get(&(id ^ 0xabc)).copied().unwrap_or(off);
         if self.hover(r) && self.input.wheel.y.abs() > 0.0 && !self.wheel_taken {
@@ -1056,6 +1155,7 @@ impl Ui {
         self.input.text.clear();
         self.input.keys.clear();
         self.input.raw_key = None;
+        self.input.raw_chord = 0;
         self.input.double_click = false;
     }
 
@@ -1348,6 +1448,73 @@ mod tests {
         assert!(layers.len() < 128, "{} layers", layers.len());
     }
 
+    /// Where the window never says which modifiers are held (Android), their keys do: a key
+    /// bound with Shift or Ctrl held keeps them, and Ctrl+V is a paste (#634).
+    #[test]
+    fn modifier_keys_count_where_the_window_does_not_tell_them() {
+        use winit::keyboard::{KeyCode as K, ModifiersState as M};
+        let mut m = Modifiers::default();
+        let mut input = Input::default();
+        assert!(!m.key(K::KeyA, true));
+        assert!(m.key(K::ShiftLeft, true) && m.key(K::ControlRight, true));
+        m.apply(&mut input);
+        assert!(input.shift && input.ctrl && !input.alt && m.command());
+        assert_eq!(omsi_content::input::chord(input.shift, input.ctrl, input.alt), omsi_content::input::KEY_SHIFT | omsi_content::input::KEY_CTRL);
+        // (both Shift keys down, one let go of: still held)
+        m.key(K::ShiftRight, true);
+        m.key(K::ShiftLeft, false);
+        m.key(K::ControlRight, false);
+        assert_eq!(m.state(), M::SHIFT);
+        // (the keyboard taken away: nothing is held any more)
+        m.release_keys();
+        assert_eq!(m.state(), M::empty());
+        // where the window does tell them, its word holds
+        m.key(K::AltLeft, true);
+        m.told(M::CONTROL);
+        assert_eq!(m.state(), M::CONTROL);
+        m.apply(&mut input);
+        assert!(!input.shift && input.ctrl && !input.alt);
+    }
+
+    #[test]
+    fn binding_keeps_modifiers_when_released_before_redraw() {
+        use winit::keyboard::{KeyCode as K, ModifiersState as M};
+        for held in [M::SHIFT, M::CONTROL, M::ALT, M::SHIFT | M::CONTROL | M::ALT] {
+            let mut m = Modifiers::default();
+            let mut input = Input::default();
+            m.told(held);
+            m.apply(&mut input);
+            // KeyboardInput presses A; ModifiersChanged releases the chord before redraw.
+            input.capture_key(K::KeyA);
+            m.told(M::empty());
+            m.apply(&mut input);
+            assert_eq!(input.raw_key, Some(K::KeyA));
+            assert_eq!(input.binding_modifiers(), omsi_content::input::chord(
+                held.shift_key(), held.control_key(), held.alt_key()));
+        }
+    }
+
+    #[test]
+    fn binding_snapshot_uses_fallback_keys_and_does_not_leak_into_next_binding() {
+        use winit::keyboard::KeyCode as K;
+        let mut m = Modifiers::default();
+        let mut ui = Ui::new();
+        for key in [K::ShiftRight, K::ControlLeft, K::AltRight] { m.key(key, true); }
+        m.apply(&mut ui.input);
+        ui.input.capture_key(K::KeyA);
+        for key in [K::ShiftRight, K::ControlLeft, K::AltRight] { m.key(key, false); }
+        m.apply(&mut ui.input);
+        ui.input.capture_key(K::ShiftLeft);
+        assert_eq!(ui.input.raw_key, Some(K::KeyA));
+        assert_eq!(ui.input.binding_modifiers(), omsi_content::input::KEY_SHIFT |
+            omsi_content::input::KEY_CTRL | omsi_content::input::KEY_ALT);
+        ui.discard_input();
+        assert_eq!(ui.input.binding_modifiers(), 0);
+        ui.input.capture_key(K::KeyB);
+        assert_eq!(ui.input.raw_key, Some(K::KeyB));
+        assert_eq!(ui.input.binding_modifiers(), 0);
+    }
+
     /// What was clicked and typed while the launcher drew nothing (a game ran) is gone:
     /// the first frame drawn afterwards pressed the button under the mouse, Start again.
     #[test]
@@ -1376,7 +1543,7 @@ mod tests {
         let mut ui = Ui::new();
         let mut sel = 0;
         let field = Rect::new(20.0, 20.0, 240.0, 30.0);
-        let mut frame = |ui: &mut Ui, sel: &mut usize| {
+        let frame = |ui: &mut Ui, sel: &mut usize| {
             ui.begin(Vec2::new(800.0, 600.0), 1.0, 1.0 / 60.0);
             ui.select("n", field, sel, &options);
             ui.finish();
@@ -1452,7 +1619,7 @@ mod tests {
         let mut ui = Ui::new();
         let mut sel = 0;
         let field = Rect::new(20.0, 20.0, 240.0, 30.0);
-        let mut frame = |ui: &mut Ui, sel: &mut usize| {
+        let frame = |ui: &mut Ui, sel: &mut usize| {
             ui.begin(Vec2::new(800.0, 600.0), 1.0, 1.0 / 60.0);
             let changed = ui.select("n", field, sel, &options);
             ui.finish();

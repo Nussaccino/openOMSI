@@ -16,6 +16,19 @@ pub(crate) enum ListKind {
     Vehicle(usize),
     /// The clock, the weather and the traffic, on this page.
     World(usize),
+    /// Entry points for keyboard and game controller configuration.
+    Controls,
+    /// Vehicle bindings and game/camera bindings on separate pages.
+    Keyboard(usize),
+    ControllerDevices(usize),
+    Controller(String, usize),
+    ControllerAxis(String, usize),
+    ControllerButtons(String),
+    ControllerButtonSettings(String, usize),
+    ControllerButton(String, usize),
+    ControllerCapture(String),
+    /// OMSI's KY_ vehicle events that can be added to the keyboard.
+    Events,
     Lines,
     /// A line's tours; the stop chosen in the timetable beside them to start from: (the
     /// tour's number, the stop as `Schedule::tour_stops` lists them), none: the default.
@@ -39,6 +52,28 @@ pub(crate) enum ListKind {
     PlaceHof(String, String),
 }
 
+/// The lists with a search line on top: the vehicles to place, the depot files and the
+/// destinations.
+pub(crate) fn searchable(kind: &ListKind) -> bool {
+    matches!(kind, ListKind::Hofs | ListKind::Destinations | ListKind::PlaceMaker | ListKind::PlaceType(_) | ListKind::PlaceHof(..))
+}
+
+/// The search typed (while it is) or set for the open list.
+fn search_query(app: &App) -> &str {
+    if app.menus.menu_edit_search {
+        app.menus.menu_edit.as_deref().unwrap_or("")
+    } else {
+        &app.menus.menu_search
+    }
+}
+
+/// A line of a list matches a search when its label or its action (a file's path) holds
+/// every word of it, whatever the case.
+fn search_matches(label: &str, action: &str, query: &str) -> bool {
+    let haystack = format!("{label} {action}").to_lowercase();
+    query.split_whitespace().all(|word| haystack.contains(&word.to_lowercase()))
+}
+
 /// A vehicle file of the menu's list (`Vehicles/...`) as its definition.
 fn bus_def(app: &App, bus: &str) -> Option<omsi_vehicle::Vehicle> {
     let path = crate::spawn::player_bus_path(&app.args.root, bus).ok()?;
@@ -53,13 +88,15 @@ fn route_numbers(app: &App) -> Vec<String> {
         for t in &hof.info_trips {
             let code = t.code.trim();
             let l = if !t.line.trim().is_empty() { t.line.trim().to_string() } else if code.len() > 2 && code.chars().all(|c| c.is_ascii_digit()) { code[..code.len() - 2].trim_start_matches('0').to_string() } else { String::new() };
-            let l = l.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+            // A route number is display text, not necessarily an alphanumeric IBIS code:
+            // Brazilian matrices use values such as "-10". Keep the HOF spelling intact.
+            let l = l.trim().to_string();
             if !l.is_empty() && !out.contains(&l) {
                 out.push(l);
             }
         }
     }
-    if let Some(sch) = app.schedule.as_ref() {
+    if let Some(sch) = app.session.schedule.as_ref() {
         for l in &sch.data.lines {
             let n = l.name.trim().to_string();
             if !n.is_empty() && !out.contains(&n) {
@@ -71,23 +108,99 @@ fn route_numbers(app: &App) -> Vec<String> {
     out
 }
 
+/// Whether a line can be represented by the numeric IBIS line/suffix variables openOMSI
+/// already knows how to encode. Everything else must stay as display text: turning "-10"
+/// or "EXP" into a number loses information.
+fn numeric_ibis_line(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    if line.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    let mut chars = line.chars();
+    if let Some(first) = chars.next() {
+        let rest: String = chars.collect();
+        if matches!(first.to_ascii_uppercase(), 'E' | 'S' | 'A' | 'D' | 'C' | 'B' | 'U' | 'M' | 'N' | 'X')
+            && !rest.is_empty()
+            && rest.chars().all(|c| c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    let digits: String = line.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let suffix = &line[digits.len()..];
+    !digits.is_empty()
+        && suffix.chars().count() == 1
+        && matches!(suffix.chars().next().unwrap().to_ascii_uppercase(), 'E' | 'U' | 'N' | 'S' | 'M')
+}
+
 /// The route number on the bus's IBIS and display, as picked or typed in the destination
-/// list (the destination stays: the one on the display now, else the first).
+/// list (the destination stays: the one on the display now, else the first -
+/// `schedule::shown_destination`).
 pub(crate) fn set_route_by_hand(app: &mut App, line: &str) {
     let line = line.trim();
     if line.is_empty() {
         return;
     }
     if let Some(p) = app.player.as_mut() {
-        let hof = p.vehicle.host.hof.clone();
-        let code = p.vehicle.var("IBIS_TerminusCode").unwrap_or(-1.0) as i32;
-        let named = |t: &&omsi_vehicle::hof::Terminus| t.strings.first().is_some_and(|s| !s.trim().is_empty());
-        let term = hof.as_ref().and_then(|h| h.termini.iter().filter(named).find(|t| t.code == code).or_else(|| h.termini.iter().find(named)));
-        let name = term.and_then(|t| t.strings.first().cloned()).unwrap_or_default();
-        crate::schedule::set_player_destination_directly(&mut p.vehicle, hof.as_deref(), line, &name, &[]);
-        log::info!("route number set by hand: {line} (IBIS_LinieKurs {:?})", p.vehicle.var("IBIS_LinieKurs"));
+        if numeric_ibis_line(line) {
+            let hof = p.vehicle.host.hof.clone();
+            if let Some(hof) = hof.as_deref() {
+                if let Some(ti) = crate::schedule::shown_destination(&p.vehicle, hof, p.blind_pick.as_ref()) {
+                    p.set_destination_by_hand(hof, line, ti);
+                }
+            }
+        } else {
+            // OMSI's route-number field is also used as arbitrary display text. Do not
+            // force symbols/unknown letters through IBIS_LinieKurs: that would turn "-10"
+            // into line 0 (and matrix scripts would then blank or rewrite the rear sign).
+            for name in ["SetLineTo", "Matrix_Nr", "Linie"] {
+                if let Some(i) = p.vehicle.ty.program.str_var(name) {
+                    p.vehicle.state.str_vars[i as usize] = line.to_string();
+                }
+            }
+        }
+        log::info!(
+            "route number set by hand: {line} (IBIS_LinieKurs {:?}, Matrix_Nr {:?})",
+            p.vehicle.var("IBIS_LinieKurs"),
+            p.vehicle.str_var("Matrix_Nr")
+        );
         app.service_msg = Some((format!("Route {line}"), 3.0));
     }
+}
+
+/// The route number the bus shows: its matrix's (`Matrix_Nr`), else the one it was set to
+/// (`SetLineTo`), else its IBIS's line number.
+fn line_shown(v: &omsi_sim::VehicleInstance) -> Option<String> {
+    [v.str_var("Matrix_Nr"), v.str_var("SetLineTo")]
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .find(|s| !s.is_empty())
+        .or_else(|| ibis_line_number(v))
+}
+
+fn ibis_line_number(v: &omsi_sim::VehicleInstance) -> Option<String> {
+    v.var("IBIS_LinieKurs").filter(|l| *l > 0.0).map(|l| format!("{}", l as i64))
+}
+
+/// The line a destination picked from the list is set with: the route number the bus
+/// shows, when the IBIS can take it - its matrix's (`Matrix_Nr`), a roller blind's
+/// (`SetLineTo`, which its crank sets) - else the IBIS's own number. Taken from
+/// `IBIS_LinieKurs`, the IBIS's number without its letter, a pick made 92E into 92 on the
+/// IBIS and the matrix. Not `SetLineTo` on any other bus: no script of its own writes it,
+/// only an earlier pick, so a line typed on the IBIS since went back to that pick's.
+fn destination_line(v: &omsi_sim::VehicleInstance) -> String {
+    let blind = crate::schedule::has_roller_blind(v).then(|| v.str_var("SetLineTo"));
+    [Some(v.str_var("Matrix_Nr")), blind]
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .find(|s| !s.is_empty())
+        .filter(|l| numeric_ibis_line(l))
+        .or_else(|| ibis_line_number(v))
+        .unwrap_or_default()
 }
 
 /// Names in older packs often use underscores as spaces.
@@ -126,12 +239,15 @@ fn bus_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-/// The vehicles of the place list as (manufacturer's key, manufacturer, type, path).
+/// The vehicles of the place list as (manufacturer's key, manufacturer, type, path): on a
+/// server only those it offers (#1183).
 fn place_vehicles(app: &App, unknown: &str) -> Vec<(String, String, String, String)> {
-    app.vehicle_list
+    let offered = crate::lan::server_offers();
+    app.menus.vehicle_list
         .iter()
+        .filter(|(_, path)| offered.as_deref().is_none_or(|o| crate::lan::offers(o, path)))
         .map(|(name, path)| {
-            let (maker, ty) = app.vehicle_meta.get(path).cloned().unwrap_or_default();
+            let (maker, ty) = app.menus.vehicle_meta.get(path).cloned().unwrap_or_default();
             let maker = bus_label(&maker);
             let ty = if ty.trim().is_empty() { bus_label(name) } else { bus_label(&ty) };
             let shown = if maker.is_empty() { unknown.to_string() } else { maker.clone() };
@@ -162,6 +278,9 @@ fn hof_label(p: &std::path::Path) -> String {
 /// The time speeds, traffic amounts and passenger shares the options step through.
 const SPEEDS: [f64; 5] = [1.0, 2.0, 4.0, 8.0, 15.0];
 pub(crate) const TRAFFIC: [usize; 7] = [0, 10, 20, 30, 50, 80, 120];
+/// The most traffic anything may ask for: the menu's top step, the server's `traffic <n>`
+/// and server.cfg's `traffic` alike (#1327).
+pub(crate) const TRAFFIC_MAX: usize = TRAFFIC[TRAFFIC.len() - 1];
 const PAX: [f32; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
 const VOLUME: [f32; 6] = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
 /// The pedal strengths the options step through (see `settings::pedal_curve`).
@@ -179,6 +298,121 @@ pub(crate) const HEADING: &str = "#";
 /// it as it is on Enter (see `App::chooser_adjust`).
 pub(crate) const ADJUST: &str = " ±";
 
+pub(crate) fn keyboard_actions(app: &App) -> Vec<String> {
+    let cfg = keyboard_cfg(app);
+    cfg.vehicles.into_iter().chain(cfg.game).map(|b| b.action).collect()
+}
+
+fn keyboard_cfg(app: &App) -> omsi_content::KeyboardCfg {
+    omsi_content::KeyboardCfg::load(&crate::startup::keyboard_cfg(&app.args.root))
+        .unwrap_or_default()
+        .with_game_defaults()
+        .with_vr_defaults()
+}
+
+fn write_keyboard_cfg(_app: &App, cfg: &omsi_content::KeyboardCfg) -> Result<(), String> {
+    let dir = crate::startup::content_dir().ok_or_else(|| "No writable openOMSI content folder was found".to_string())?.join("Inputs");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("keyboard.cfg");
+    let tmp = path.with_extension("cfg.tmp");
+    cfg.save(&tmp).map_err(|e| e.to_string())?;
+    omsi_content::KeyboardCfg::load(&tmp).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+impl App {
+    fn install_keyboard_cfg(&mut self, cfg: omsi_content::KeyboardCfg) {
+        let runtime = cfg.with_game_defaults().with_vr_defaults();
+        self.input.game_keys = runtime.game.clone();
+        if let Some(p) = self.player.as_mut() {
+            p.bindings = runtime.vehicles;
+        }
+        self.input.own_keys = crate::startup::own_keys(&self.args.root);
+        self.input.own_shift = crate::startup::own_bindings(&self.args.root, omsi_content::input::KEY_SHIFT);
+        // A key changed by the player must win over the ready-made W/A/S/D or arrow
+        // presets just as a key changed on the launcher's Controls page does.
+        self.args.drive_keys = "omsi".into();
+        self.settings.drive_keys = "omsi".into();
+        remember_setting("drive_keys", "omsi");
+    }
+
+    pub(crate) fn begin_key_capture(&mut self, game: bool, index: usize) {
+        self.menus.key_capture = Some((game, index));
+        self.service_msg = Some(("Press a key for this action (Delete clears it, Esc cancels)".into(), 5.0));
+        self.refresh_list();
+    }
+
+    pub(crate) fn cancel_key_capture(&mut self) {
+        if self.menus.key_capture.take().is_some() {
+            self.service_msg = Some(("Key change cancelled".into(), 2.0));
+            self.refresh_list();
+        }
+    }
+
+    pub(crate) fn apply_key_capture(&mut self, scan: Option<i32>, chord: i32) {
+        let Some((game, index)) = self.menus.key_capture else { return };
+        let mut cfg = keyboard_cfg(self);
+        let list = if game { &mut cfg.game } else { &mut cfg.vehicles };
+        let Some(binding) = list.get_mut(index) else {
+            self.menus.key_capture = None;
+            self.service_msg = Some(("That key entry no longer exists".into(), 3.0));
+            self.refresh_list();
+            return;
+        };
+        let hold = binding.modifier & omsi_content::input::KEY_HOLD;
+        binding.scan_code = scan.unwrap_or(0);
+        binding.modifier = if scan.is_some() { hold | chord } else { hold };
+        let action = binding.action.clone();
+        match write_keyboard_cfg(self, &cfg) {
+            Ok(()) => {
+                self.menus.key_capture = None;
+                self.install_keyboard_cfg(cfg);
+                let key = scan.map(|s| crate::keys::key_name(s as i64, (hold | chord) as i64)).unwrap_or_else(|| "(unbound)".into());
+                self.service_msg = Some((format!("{}: {key}", crate::describe::names(&self.args.root, &self.settings.language).control(&action)), 3.0));
+                self.refresh_list();
+            }
+            Err(e) => self.service_msg = Some((format!("Key binding was not saved: {e}"), 5.0)),
+        }
+    }
+
+    pub(crate) fn add_key_event(&mut self, action: &str) {
+        let action = action.trim();
+        if action.is_empty() {
+            return;
+        }
+        let mut cfg = keyboard_cfg(self);
+        cfg.vehicles.push(omsi_content::KeyBinding { action: action.to_string(), scan_code: 0, modifier: 0 });
+        let index = cfg.vehicles.len() - 1;
+        match write_keyboard_cfg(self, &cfg) {
+            Ok(()) => {
+                self.install_keyboard_cfg(cfg);
+                self.menus.key_capture = Some((false, index));
+                self.service_msg = Some((format!("KY_{action} added. Press its key now."), 5.0));
+            }
+            Err(e) => self.service_msg = Some((format!("Event was not added: {e}"), 5.0)),
+        }
+    }
+}
+
+fn keyboard_pages(app: &App) -> Vec<Page> {
+    let cfg = keyboard_cfg(app);
+    let names = crate::describe::names(&app.args.root, &app.settings.language);
+    let mut vehicle = vec![opens("Add a vehicle event…", "Choose a control supplied by the bus or its mods", "key_events")];
+    let mut game = Vec::new();
+    for (is_game, bindings, rows) in [(false, &cfg.vehicles, &mut vehicle), (true, &cfg.game, &mut game)] {
+        let mut bindings: Vec<_> = bindings.iter().enumerate().collect();
+        bindings.sort_by_key(|(_, b)| names.control(&b.action).to_lowercase());
+        for (i, b) in bindings {
+            let key = if app.menus.key_capture == Some((is_game, i)) { "press a key…".into() }
+                else { crate::keys::key_name(b.scan_code as i64, b.modifier as i64) };
+            rows.push((row(&names.control(&b.action), 'a', &key, "Enter to change; Delete clears; Esc cancels", None),
+                format!("keybind {} {i}", if is_game { "g" } else { "v" })));
+        }
+    }
+    vec![("Driving and bus", vehicle), ("Game and camera", game)]
+}
+
 pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
     let tr = |t: &str| omsi_ui::tr(t).into_owned();
     let mut out: Vec<(String, String)> = Vec::new();
@@ -191,8 +425,37 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
             }
             return pages.swap_remove(tab).1;
         }
+        ListKind::ControllerDevices(_) | ListKind::Controller(..) | ListKind::ControllerAxis(..) | ListKind::ControllerButtons(_) | ListKind::ControllerButtonSettings(..) | ListKind::ControllerButton(..) | ListKind::ControllerCapture(_) => return crate::game_controller_menu::items(app, kind),
+        ListKind::Controls => {
+            return vec![
+                opens("Keyboard", "Change driving, vehicle, game and camera key bindings", "keyboard"),
+                opens("Game controllers", "Configure wheels, pedals, gamepads and force feedback", "controllers"),
+            ];
+        }
+        ListKind::Keyboard(tab) => {
+            return keyboard_pages(app).swap_remove((*tab).min(1)).1;
+        }
+        ListKind::Events => {
+            let names = crate::describe::names(&app.args.root, &app.settings.language);
+            let mut events = names.events();
+            if let Some(p) = app.player.as_ref() {
+                for action in p.vehicle.ty.program.trigger_names() {
+                    if !events.iter().any(|(a, _)| a.eq_ignore_ascii_case(&action)) {
+                        events.push((action.clone(), names.control(&action)));
+                    }
+                }
+            }
+            events.sort_by(|a, b| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()).then_with(|| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase())));
+            for (action, label) in events {
+                out.push((format!("{label}  ·  KY_{action}"), format!("key_event {action}")));
+            }
+            if out.is_empty() {
+                out.push(("No vehicle events were found".into(), "back".into()));
+            }
+            return out;
+        }
         ListKind::Lines => {
-            if let Some(sch) = app.schedule.as_ref() {
+            if let Some(sch) = app.session.schedule.as_ref() {
                 let mut lines: Vec<&omsi_timetable::Line> = sch.data.lines.iter().filter(|l| l.user_allowed && l.tours.iter().any(|t| tour_listed(sch, &l.name, t, app.clock.time))).collect();
                 lines.sort_by(|a, b| natural(&a.name, &b.name));
                 for l in lines {
@@ -204,8 +467,8 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
             }
         }
         ListKind::Tours(line, _) => {
-            if let Some(l) = app.schedule.as_ref().and_then(|s| s.data.lines.iter().find(|l| l.name == *line)) {
-                for t in sorted_tours(l).into_iter().filter(|t| app.schedule.as_ref().is_some_and(|s| tour_listed(s, line, t, app.clock.time))) {
+            if let Some(l) = app.session.schedule.as_ref().and_then(|s| s.data.lines.iter().find(|l| l.name == *line)) {
+                for t in sorted_tours(l).into_iter().filter(|t| app.session.schedule.as_ref().is_some_and(|s| tour_listed(s, line, t, app.clock.time))) {
                     // (the tours in order of the time they start)
                     out.push((format!("{} {}", tr("Tour"), t.number.trim()), format!("tour {}\u{1}{}", line, t.number)));
                 }
@@ -213,25 +476,26 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
         }
         ListKind::Drivers => {
             for name in driver_names(app) {
-                let mark = if app.career.path.as_ref().and_then(|p| p.file_stem()).is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(&name)) { format!("  {}", tr("(now)")) } else { String::new() };
+                let mark = if app.session.career.path.as_ref().and_then(|p| p.file_stem()).is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(&name)) { format!("  {}", tr("(now)")) } else { String::new() };
                 out.push((format!("{name}{mark}"), format!("driver {name}")));
             }
         }
         ListKind::Destinations => {
             if let Some(p) = app.player.as_ref().filter(|p| p.vehicle.host.hof.is_some()) {
-                let now = p.vehicle.var("IBIS_LinieKurs").filter(|l| *l > 0.0).map(|l| format!("{}", l as i64)).unwrap_or_else(|| "-".into());
+                let now = line_shown(&p.vehicle).unwrap_or_else(|| "-".into());
                 out.push((format!("{}: {now}...", tr("Route number")), "routes".into()));
             }
             if let Some(hof) = app.player.as_ref().and_then(|p| p.vehicle.host.hof.clone()) {
-                let mut termini: Vec<(String, String)> = hof
+                let mut termini: Vec<(String, i32, usize)> = hof
                     .termini
                     .iter()
-                    .map(|t| (t.strings.iter().find(|s| !s.trim().is_empty()).cloned().unwrap_or_else(|| t.code.to_string()), t.code.to_string()))
+                    .enumerate()
+                    .map(|(i, t)| (t.menu_name(), t.code, i))
                     .collect();
-                // (alphabetical, by name)
-                termini.sort_by_key(|(name, _)| name.trim().to_lowercase());
-                for (name, code) in termini {
-                    out.push((format!("{:>3}  {}", code, name.trim()), format!("dest {code}")));
+                // (alphabetical, by name; picked by its row: several may share a name or a code)
+                termini.sort_by_key(|(name, ..)| name.trim().to_lowercase());
+                for (name, code, i) in termini {
+                    out.push((format!("{:>3}  {}", code, name.trim()), format!("dest {i}")));
                 }
             }
             if out.is_empty() {
@@ -241,7 +505,7 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
         ListKind::RouteNumbers => {
             // any route number, typed as on OMSI's own field (#836): the scripts that read
             // it (a bus that switches its functions by route number) take what is typed
-            match app.menu_edit.as_ref() {
+            match app.menus.menu_edit.as_ref() {
                 Some(t) => out.push((format!("{}: {t}_  ({})", tr("Route number"), tr("Enter sets it, Esc cancels")), "route_type".into())),
                 None => out.push((format!("{}...", tr("Type a route number")), "route_type".into())),
             }
@@ -289,8 +553,14 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
                 }
             }
             groups.sort_by(|a, b| bus_cmp(&a.1, &b.1).then_with(|| a.0.cmp(&b.0)));
+            let searching = !search_query(app).trim().is_empty();
             for (key, name, vs) in groups {
-                if vs.len() == 1 {
+                if searching {
+                    // (searched for: every type, under its manufacturer's name)
+                    for v in vs {
+                        out.push((format!("{name}  ·  {}", v.2), format!("bus {}", v.3)));
+                    }
+                } else if vs.len() == 1 {
                     // (a manufacturer with one type: that type at once)
                     out.push((format!("{name}  ·  {}", vs[0].2), format!("bus {}", vs[0].3)));
                 } else {
@@ -354,6 +624,18 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
             }
         }
     }
+    if searchable(kind) {
+        let query = search_query(app);
+        out.retain(|(label, action)| search_matches(label, action, query));
+        let label = if app.menus.menu_edit_search {
+            format!("{}: {query}_  ({})", tr("Search…"), tr("Enter sets it, Esc cancels"))
+        } else if query.is_empty() {
+            tr("Search…")
+        } else {
+            format!("{}: {query}", tr("Search…"))
+        };
+        out.insert(0, (label, "search".into()));
+    }
     out.push((tr("Back"), "back".into()));
     out
 }
@@ -388,6 +670,16 @@ pub(crate) fn menu_extras(
         ListKind::Options(_) => (MenuKind::Options, head("Options..."), None),
         ListKind::Vehicle(_) => (MenuKind::Options, head("Vehicle options..."), None),
         ListKind::World(_) => (MenuKind::Options, head("World options..."), None),
+        ListKind::Controls => (MenuKind::Options, head("Controls..."), None),
+        ListKind::Keyboard(_) => (MenuKind::Options, head("Keyboard"), None),
+        ListKind::ControllerDevices(_) => (MenuKind::Options, head("Game controllers"), None),
+        ListKind::Controller(name, _) => (MenuKind::Options, Some((name.clone(), String::new())), None),
+        ListKind::ControllerAxis(name, a) => (MenuKind::Options, Some((format!("{} · Axis {}", name, a + 1), String::new())), None),
+        ListKind::ControllerButtons(name) => (MenuKind::List, Some(("Choose a button".into(), name.clone())), None),
+        ListKind::ControllerButtonSettings(name, b) => (MenuKind::Options, Some((crate::game_controller_menu::button_label(*b), name.clone())), None),
+        ListKind::ControllerButton(_, b) => (MenuKind::List, Some((format!("{}: choose an action", crate::game_controller_menu::button_label(*b)), String::new())), None),
+        ListKind::ControllerCapture(_) => (MenuKind::List, head("Assign a physical button"), None),
+        ListKind::Events => (MenuKind::List, Some((tr("Add event"), String::new())), None),
         ListKind::Lines => {
             let preview = action.strip_prefix("line ").and_then(|name| {
                 let line = schedule?.data.lines.iter().find(|l| l.name == name)?;
@@ -468,15 +760,26 @@ pub(crate) fn run(app: &mut App, kind: &ListKind, action: &str) -> Option<ListKi
 /// Do a line of the list, a setting changed as `mv` says (Enter and a click on a line are
 /// `Move::Next`; the arrows and a click on a slider or a stepper the others).
 pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -> Option<ListKind> {
+    if crate::game_controller_menu::is_controller_list(Some(kind)) {
+        return crate::game_controller_menu::run(app, kind, action, mv);
+    }
+    if action == "search" && searchable(kind) {
+        app.menus.menu_edit = Some(app.menus.menu_search.clone());
+        app.menus.menu_edit_search = true;
+        return Some(kind.clone());
+    }
     if action == "back" {
         return match kind {
             ListKind::Tours(..) => Some(ListKind::Lines),
+            ListKind::Events => Some(ListKind::Keyboard(0)),
+            ListKind::Keyboard(_) => Some(ListKind::Controls),
             ListKind::PlaceType(_) | ListKind::PlaceLivery(_) | ListKind::PlaceHof(..) => Some(ListKind::PlaceMaker),
             _ => None,
         };
     }
     let (verb, arg) = action.split_once(' ').unwrap_or((action, ""));
     match kind {
+        ListKind::ControllerDevices(_) | ListKind::Controller(..) | ListKind::ControllerAxis(..) | ListKind::ControllerButtons(_) | ListKind::ControllerButtonSettings(..) | ListKind::ControllerButton(..) | ListKind::ControllerCapture(_) => unreachable!("controller lists handled above"),
         ListKind::Admin => {
             crate::admin::run(app, action);
             Some(ListKind::Admin)
@@ -499,28 +802,28 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
                 // (the preset, the clouds and the precipitation are picked from a drop-down: `App::chooser_pick`)
                 "weather" | "cloudkind" | "precipkind" | "metar_src" | "sel" | "preset" | "gfxprofile" | "reset" => {}
                 "metar_icao_edit" if step => {
-                    if app.menu_edit_icao { app.apply_icao_edit(); } else { app.start_icao_edit(); }
+                    if app.menus.menu_edit_icao { app.apply_icao_edit(); } else { app.start_icao_edit(); }
                 }
                 // the exact time: Enter starts typing it, and sets it when typed
                 "time_edit" if step => {
-                    if app.menu_edit.is_some() {
+                    if app.menus.menu_edit.is_some() {
                         app.apply_time_edit();
-                    } else if app.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
+                    } else if app.net.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
                         app.service_msg = Some(("In a LAN session the host sets the clock".into(), 3.0));
                     } else if app.real_time_locked() {
                         app.service_msg = Some(("The time cannot be changed while the real-time sync is on".into(), 3.0));
                     } else {
-                        app.menu_edit = Some(String::new());
+                        app.menus.menu_edit = Some(String::new());
                     }
                 }
                 "seat_reset" if step => {
+                    // (this bus's views as its .bus file has them again)
                     app.settings.seat = [0.0; 3];
-                    for k in ["seat_x", "seat_y", "seat_z"] {
-                        remember_setting(k, "0");
-                    }
+                    app.settings.seat_pitch_deg = 0.0;
+                    remember_bus_seat(app);
                 }
                 "clock_ontime" if step => {
-                    if app.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
+                    if app.net.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
                         app.service_msg = Some(("In a LAN session the host sets the clock".into(), 3.0));
                     } else if let Some(d) = app.player.as_ref().map(|p| p.vehicle.host.tt_delay as f64).filter(|d| d.abs() >= 1.0) {
                         // (the delay as it is now, not as the button was drawn: a second click
@@ -532,12 +835,15 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
                     }
                 }
                 "clock_set" | "clock_shift" if step => {
-                    if app.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
+                    if app.net.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
                         app.service_msg = Some(("In a LAN session the host sets the clock".into(), 3.0));
                     } else if let Ok(secs) = arg.trim().parse::<f64>() {
                         let by = if verb == "clock_set" { secs - app.clock.time } else { secs };
                         app.shift_clock(by);
                     }
+                }
+                "traffic_clear" if step => {
+                    crate::admin::clear_ai_traffic(app);
                 }
                 other if step => {
                     app.page_action(other);
@@ -554,23 +860,43 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
             }
             Some(kind.clone())
         }
+        ListKind::Controls => {
+            if !matches!(mv, Move::Next) { return Some(kind.clone()); }
+            match verb {
+                "keyboard" => Some(ListKind::Keyboard(0)),
+                "controllers" => Some(ListKind::ControllerDevices(0)),
+                _ => Some(kind.clone()),
+            }
+        }
+        ListKind::Keyboard(_) => {
+            if !matches!(mv, Move::Next) { return Some(kind.clone()); }
+            match verb {
+                "key_events" => Some(ListKind::Events),
+                "keybind" => {
+                    let mut p = arg.split_whitespace();
+                    let game = p.next() == Some("g");
+                    if let Some(index) = p.next().and_then(|n| n.parse::<usize>().ok()) {
+                        app.begin_key_capture(game, index);
+                    }
+                    Some(kind.clone())
+                }
+                _ => Some(kind.clone()),
+            }
+        }
+        ListKind::Events => {
+            if matches!(mv, Move::Next) && verb == "key_event" {
+                app.add_key_event(arg);
+                Some(ListKind::Keyboard(0))
+            } else {
+                Some(ListKind::Events)
+            }
+        }
         ListKind::Lines => match verb {
             "line" => {
                 Some(ListKind::Tours(arg.to_string(), None))
             }
             "free" => {
-                app.duty = None;
-                // unscheduled: the GetTT* callbacks answer ""/0/-1 again, as in Omsi.exe
-                if let Some(p) = app.player.as_mut() {
-                    let h = &mut p.vehicle.host;
-                    h.tt_line.clear();
-                    h.tt_stops.clear();
-                    h.tt_stop_ids.clear();
-                    h.tt_busstop_index = -1;
-                    h.tt_terminus_index = -1;
-                    h.tt_delay = 0.0;
-                }
-                app.service_msg = Some(("Free drive: no duty".into(), 4.0));
+                end_duty(app);
                 None
             }
             _ => None,
@@ -578,7 +904,7 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
         ListKind::Tours(_, pick) => {
             if let Some((line, tour)) = arg.split_once('\u{1}') {
                 let chosen = pick.as_ref().filter(|p| p.0 == tour).map(|p| p.1).unwrap_or(0);
-                let trip = pick.as_ref().filter(|p| p.0 == tour).map(|p| p.2).unwrap_or_else(|| app.schedule.as_ref().map(|s| s.tour_trip_now(line, tour, app.clock.time)).unwrap_or(0));
+                let trip = pick.as_ref().filter(|p| p.0 == tour).map(|p| p.2).unwrap_or_else(|| app.session.schedule.as_ref().map(|s| s.tour_trip_now(line, tour, app.clock.time)).unwrap_or(0));
                 start_duty_at(app, line, tour, trip, chosen);
             }
             None
@@ -601,7 +927,7 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
             None
         }
         ListKind::Spots => {
-            if app.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
+            if app.net.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
                 app.service_msg = Some(("In a LAN session only the host moves vehicles on the map".into(), 4.0));
                 return None;
             }
@@ -632,13 +958,13 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
         ListKind::Destinations if verb == "routes" => Some(ListKind::RouteNumbers),
         ListKind::RouteNumbers if verb == "route_type" => {
             // the first press starts typing, the next one (Enter) sets what is typed
-            match app.menu_edit.take() {
+            match app.menus.menu_edit.take() {
                 Some(t) => {
                     set_route_by_hand(app, &t);
                     None
                 }
                 None => {
-                    app.menu_edit = Some(String::new());
+                    app.menus.menu_edit = Some(String::new());
                     Some(ListKind::RouteNumbers)
                 }
             }
@@ -650,13 +976,13 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
         ListKind::Destinations => {
             if let Some(p) = app.player.as_mut() {
                 let hof = p.vehicle.host.hof.clone();
-                let code: i32 = arg.trim().parse().unwrap_or(-1);
-                if let Some(t) = hof.as_ref().and_then(|h| h.termini.iter().find(|t| t.code == code)) {
+                let ti: usize = arg.trim().parse().unwrap_or(usize::MAX);
+                if let Some((hof, t)) = hof.as_ref().and_then(|h| h.termini.get(ti).map(|t| (h, t))) {
                     // (the line on the IBIS stays; only the destination changes)
-                    let line = p.vehicle.var("IBIS_LinieKurs").filter(|l| *l > 0.0).map(|l| format!("{}", l as i64)).unwrap_or_default();
-                    let name = t.strings.first().cloned().unwrap_or_default();
-                    crate::schedule::set_player_destination_directly(&mut p.vehicle, hof.as_deref(), &line, &name, &[]);
-                    log::info!("destination display set by hand: {code} {} (terminus code now {:?})", name.trim(), p.vehicle.var("IBIS_TerminusCode"));
+                    let line = destination_line(&p.vehicle);
+                    let name = t.menu_name();
+                    p.set_destination_by_hand(hof, &line, ti);
+                    log::info!("destination display set by hand: {} {} (terminus code now {:?})", t.code, name.trim(), p.vehicle.var("IBIS_TerminusCode"));
                     app.service_msg = Some((format!("Destination: {}", name.trim()), 3.0));
                 }
             }
@@ -700,28 +1026,53 @@ pub(crate) enum Move {
 type Page = (&'static str, Vec<(String, String)>);
 
 /// A row of a settings window (see `ui::MenuKind::Options` for the format).
-fn row(name: &str, kind: char, value: &str, desc: &str, frac: Option<f32>) -> String {
+pub(crate) fn row(name: &str, kind: char, value: &str, desc: &str, frac: Option<f32>) -> String {
     format!("{name}\u{1f}{kind}\u{1f}{value}\u{1f}{desc}\u{1f}{}", frac.map(|f| format!("{f:.3}")).unwrap_or_default())
 }
 
 /// A row that opens another list.
-fn opens(name: &str, desc: &str, id: &str) -> (String, String) {
+pub(crate) fn opens(name: &str, desc: &str, id: &str) -> (String, String) {
     (row(name, 'o', "", desc, None), id.to_string())
 }
 
 /// A row with a button that does something.
-fn button(name: &str, text: &str, desc: &str, id: &str) -> (String, String) {
+pub(crate) fn button(name: &str, text: &str, desc: &str, id: &str) -> (String, String) {
     (row(name, 'a', text, desc, None), id.to_string())
 }
 
 /// A switch row, if the setting `id` is one.
-fn switch_row(app: &App, id: &str, name: &str, desc: &str) -> Option<(String, String)> {
+/// The duty given up (the game menu's "End the duty", Free drive in the list of lines): the
+/// bus is unscheduled, and the `GetTT*` callbacks answer ""/0/-1 again as in Omsi.exe. "End
+/// the duty" dropped the duty alone, and the bus's own displays went on with the old trip -
+/// a paper sign with its line in the window, the IBIS's stop list (#1317).
+pub(crate) fn end_duty(app: &mut App) {
+    app.session.duty = None;
+    if let Some(p) = app.player.as_mut() {
+        clear_timetable(&mut p.vehicle);
+    }
+    app.service_msg = Some(("Free drive: no duty".into(), 4.0));
+}
+
+/// A vehicle's timetable for its scripts emptied (see `end_duty`).
+pub(crate) fn clear_timetable(v: &mut omsi_sim::VehicleInstance) {
+    let h = &mut v.host;
+    h.tt_line.clear();
+    h.tt_stops.clear();
+    h.tt_stop_ids.clear();
+    h.tt_busstop_index = -1;
+    h.tt_terminus_index = -1;
+    h.tt_delay = 0.0;
+    h.schedule_active = 0.0;
+    v.set_var("schedule_active", 0.0);
+}
+
+pub(crate) fn switch_row(app: &App, id: &str, name: &str, desc: &str) -> Option<(String, String)> {
     let on = toggle_now(app, id)?;
     Some((row(name, 's', if on { "on" } else { "off" }, desc, None), id.to_string()))
 }
 
 /// A slider row for the setting `id` ("verb" or "verb arg"); `fmt` writes its value.
-fn slider_row(app: &App, id: &str, name: &str, desc: &str, fmt: &dyn Fn(f32) -> String) -> Option<(String, String)> {
+pub(crate) fn slider_row(app: &App, id: &str, name: &str, desc: &str, fmt: &dyn Fn(f32) -> String) -> Option<(String, String)> {
     let (verb, arg) = id.split_once(' ').unwrap_or((id, ""));
     let steps = steps_of(verb)?;
     let now = option_now(app, verb, arg)?;
@@ -734,6 +1085,11 @@ fn slider_row(app: &App, id: &str, name: &str, desc: &str, fmt: &dyn Fn(f32) -> 
 fn steps_of(verb: &str) -> Option<Vec<f32>> {
     Some(match verb {
         "vr_nav_x" | "vr_nav_y" | "vr_nav_z" => (-100..=100).map(|v| v as f32 * 0.02).collect(),
+        "triple_width_mm" => (20..=200).map(|v| v as f32 * 10.0).collect(),
+        "triple_distance_mm" => (20..=300).map(|v| v as f32 * 10.0).collect(),
+        "triple_bezel_mm" => (0..=100).map(|v| v as f32).collect(),
+        "triple_left_angle_deg" | "triple_right_angle_deg" => (0..=90).map(|v| v as f32).collect(),
+        "triple_eye_height_mm" => (-100..=100).map(|v| v as f32 * 5.0).collect(),
         "vr_nav_width" => (12..=65).map(|v| v as f32 * 0.01).collect(),
         "vr_nav_yaw" | "vr_nav_roll" => (-90..=90).map(|v| v as f32 * 2.0).collect(),
         "vr_nav_tilt" => (-40..=40).map(|v| v as f32 * 2.0).collect(),
@@ -743,8 +1099,10 @@ fn steps_of(verb: &str) -> Option<Vec<f32>> {
         "pax" => PAX.to_vec(),
         "volume" => VOLUME.to_vec(),
         "led_glow" => (0..16).map(|v| v as f32).collect(),
+        "night_brightness" => (0..=12).map(|v| v as f32 * 0.25).collect(),
         "led_mips" => (0..=80).map(|v| v as f32 * 0.05).collect(),
         "ui_scale" => (10..=40).map(|v| v as f32 * 0.05).collect(),
+        "chat_size" => (5..=30).map(|v| v as f32 * 0.1).collect(),
         "ui_opacity" => (4..=20).map(|v| v as f32 * 0.05).collect(),
         "vol_ai" | "vol_scenery" => (0..=20).map(|v| v as f32 * 0.05).collect(),
         "wheel_range" => (6..=60).map(|v| v as f32 * 30.0).collect(),
@@ -752,10 +1110,18 @@ fn steps_of(verb: &str) -> Option<Vec<f32>> {
         "fov" => std::iter::once(0.0).chain((20..=120).map(|v| v as f32)).collect(),
         "steer_look_angle" => (0..=60).map(|v| v as f32).collect(),
         "steer_look_response" => (1..=20).map(|v| v as f32 * 0.05).collect(),
+        "head_idle" => (0..=20).map(|v| v as f32 * 0.05).collect(),
+        "head_idle_pace" => (10..=40).map(|v| v as f32 * 0.05).collect(),
+        "head_tracking_yaw_sens" | "head_tracking_pitch_sens" | "head_tracking_roll_sens" | "head_tracking_x_sens" | "head_tracking_y_sens" | "head_tracking_z_sens" => (0..=100).map(|v| v as f32).collect(),
         "pedal_t" | "pedal_b" => PEDAL.to_vec(),
+        "ctrl_deadzone" => (0..=30).map(|v| v as f32 * 0.01).collect(),
         "mouse_sens" => (10..=300).map(|v| v as f32 / 100.0).collect(),
+        "mouse_pedal_strength" => (10..=40).map(|v| v as f32 * 0.05).collect(),
         "look_sens" => (2..=40).map(|v| v as f32 * 0.05).collect(),
+        "look_smoothing_ms" => (0..=20).map(|v| v as f32 * 10.0).collect(),
+        "pad_steer_smooth" => (0..=30).map(|v| v as f32 * 10.0).collect(),
         "seat" => (-50..=50).map(|v| v as f32 / 100.0).collect(),
+        "seat_pitch" => (-45..=45).map(|v| v as f32).collect(),
         "hour" => (0..24).map(|v| v as f32).collect(),
         "minute" => (0..60).map(|v| v as f32).collect(),
         // the weather, made by hand
@@ -802,11 +1168,11 @@ fn custom_state(app:&App)->crate::weather_setup::CustomWeather{
     if let Some(mut c)=crate::weather_setup::custom_weather(app.args.weather.as_deref()){
         // Wetness keeps evolving while driving; never restore an old serialized value just
         // because another custom field (brightness, humidity, etc.) was edited.
-        c.road_wetness=app.wetness;
+        c.road_wetness=app.session.wetness;
         return c
     }
-    match app.weather.as_ref(){
-        Some(w)=>crate::weather_setup::CustomWeather::from_weather(w,1.0,app.wetness),
+    match app.session.weather.as_ref(){
+        Some(w)=>crate::weather_setup::CustomWeather::from_weather(w,1.0,app.session.wetness),
         None=>crate::weather_setup::CustomWeather::default(),
     }
 }
@@ -846,6 +1212,22 @@ fn step_move(steps: &[f32], now: f32, mv: Move) -> f32 {
     steps.get(to).copied().unwrap_or(now)
 }
 
+/// Keep the physical triple-screen calibration separate from the single-screen FOV.
+fn set_camera_fov(settings: &mut crate::settings::Settings, value: f32) -> (&'static str, String) {
+    let value = if value < 20.0 {
+        0.0
+    } else {
+        value.round().min(120.0)
+    };
+    if settings.triple.enabled && !settings.vr_requested() {
+        settings.triple.fov_deg = value;
+        ("triple_fov_deg", value.to_string())
+    } else {
+        settings.fov = value;
+        ("fov", value.to_string())
+    }
+}
+
 /// The value of the slider setting `verb` (`arg`: the seat's axis).
 fn option_now(app: &App, verb: &str, arg: &str) -> Option<f32> {
     if let Some(field) = verb.strip_prefix("vr_nav_") {
@@ -854,38 +1236,65 @@ fn option_now(app: &App, verb: &str, arg: &str) -> Option<f32> {
     let s = &app.settings;
     Some(match verb {
         "speed" => s.time_speed as f32,
-        "traffic" => app.traffic.as_ref()?.target as f32,
+        "traffic" => app.session.traffic.as_ref()?.target as f32,
         "pax" => s.pax_density,
         "volume" => s.volume,
         "led_glow" => s.led_glow as f32,
+        "night_brightness" => s.night_brightness,
         "led_mips" => s.led_mips,
+        "ctrl_deadzone" => s.ctrl_deadzone,
         "pedal_t" => s.pedal_throttle,
         "pedal_b" => s.pedal_brake,
         "mouse_sens" => s.mouse_sens,
+        "mouse_pedal_strength" => s.mouse_pedal_strength,
         "look_sens" => s.look_sens,
+        "look_smoothing_ms" => s.look_smoothing_ms,
+        "pad_steer_smooth" => s.pad_steer_smooth,
         "ui_scale" => s.ui_scale,
+        "chat_size" => s.chat_size,
         "ui_opacity" => s.ui_opacity,
         "vol_ai" => s.vol_ai,
         "vol_scenery" => s.vol_scenery,
         "wheel_range" => s.wheel_range,
         "wheel_lock" => s.wheel_lock,
-        "fov" => s.fov,
+        "triple_width_mm" => s.triple.width_mm,
+        "triple_distance_mm" => s.triple.distance_mm,
+        "triple_bezel_mm" => s.triple.bezel_mm,
+        "triple_left_angle_deg" => s.triple.left_angle_deg,
+        "triple_right_angle_deg" => s.triple.right_angle_deg,
+        "triple_eye_height_mm" => s.triple.eye_height_mm,
+        "fov" => {
+            if s.triple.enabled && !s.vr_requested() {
+                s.triple.fov_deg
+            } else {
+                s.fov
+            }
+        }
         "steer_look_angle" => s.steer_look_angle,
         "steer_look_response" => s.steer_look_response,
+        "head_idle" => s.head_idle,
+        "head_idle_pace" => s.head_idle_pace,
+        "head_tracking_yaw_sens" => s.head_tracking_yaw_sens,
+        "head_tracking_pitch_sens" => s.head_tracking_pitch_sens,
+        "head_tracking_roll_sens" => s.head_tracking_roll_sens,
+        "head_tracking_x_sens" => s.head_tracking_x_sens,
+        "head_tracking_y_sens" => s.head_tracking_y_sens,
+        "head_tracking_z_sens" => s.head_tracking_z_sens,
         "seat" => s.seat[arg.trim().parse::<usize>().unwrap_or(0).min(2)],
+        "seat_pitch" => s.seat_pitch_deg,
         "hour" => ((app.clock.time / 3600.0) as i64).rem_euclid(24) as f32,
         "minute" => (((app.clock.time / 60.0) as i64) % 60) as f32,
-        "visibility" => app.weather.as_ref()?.fog.0,
+        "visibility" => app.session.weather.as_ref()?.fog.0,
         "rain_amt" => {
-            let w = app.weather.as_ref()?;
+            let w = app.session.weather.as_ref()?;
             if w.precip.first().copied().unwrap_or(0.0) < 0.5 { 0.0 } else { (w.precip.get(1).copied().unwrap_or(0.0) / 255.0).clamp(0.0, 1.0) }
         }
-        "wet" => app.wetness,
+        "wet" => app.session.wetness,
         "brightness" => custom_state(app).brightness,
         "humidity" => custom_state(app).humidity,
-        "temp" => app.weather.as_ref()?.temp.0,
-        "wind_speed" => app.weather.as_ref()?.wind.1,
-        "wind_dir" => app.weather.as_ref()?.wind.0.rem_euclid(360.0),
+        "temp" => app.session.weather.as_ref()?.temp.0,
+        "wind_speed" => app.session.weather.as_ref()?.wind.1,
+        "wind_dir" => app.session.weather.as_ref()?.wind.0.rem_euclid(360.0),
         _ => return None,
     })
 }
@@ -902,7 +1311,7 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
             Some(("time_speed", app.settings.time_speed.to_string()))
         }
         "traffic" => {
-            if let Some(t) = app.traffic.as_mut() {
+            if let Some(t) = app.session.traffic.as_mut() {
                 t.target = v.round() as usize;
                 app.args.traffic = t.target;
             }
@@ -920,9 +1329,17 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
             app.settings.led_glow = v.round() as _;
             Some(("led_glow", app.settings.led_glow.to_string()))
         }
+        "night_brightness" => {
+            app.settings.night_brightness = v.clamp(0.0, 3.0);
+            Some(("night_brightness", app.settings.night_brightness.to_string()))
+        }
         "led_mips" => {
             app.settings.led_mips = v.clamp(0.0, 4.0);
             Some(("led_mips", app.settings.led_mips.to_string()))
+        }
+        "ctrl_deadzone" => {
+            app.settings.ctrl_deadzone = v.clamp(0.0, 0.3);
+            Some(("ctrl_deadzone", app.settings.ctrl_deadzone.to_string()))
         }
         "pedal_t" => {
             app.settings.pedal_throttle = v;
@@ -936,13 +1353,32 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
             app.settings.look_sens = (v * 100.0).round() / 100.0;
             Some(("look_sens", app.settings.look_sens.to_string()))
         }
+        "pad_steer_smooth" => {
+            app.settings.pad_steer_smooth = v.clamp(0.0, 300.0).round();
+            Some(("pad_steer_smooth", app.settings.pad_steer_smooth.to_string()))
+        }
+        "look_smoothing_ms" => {
+            app.settings.look_smoothing_ms = v.round();
+            Some(("look_smoothing_ms", app.settings.look_smoothing_ms.to_string()))
+        }
         "mouse_sens" => {
             app.settings.mouse_sens = (v * 100.0).round() / 100.0;
             Some(("mouse_sens", app.settings.mouse_sens.to_string()))
         }
+        "mouse_pedal_strength" => {
+            app.settings.mouse_pedal_strength = ((v * 100.0).round() / 100.0).clamp(0.5, 2.0);
+            Some((
+                "mouse_pedal_strength",
+                app.settings.mouse_pedal_strength.to_string(),
+            ))
+        }
         "ui_scale" => {
             app.settings.ui_scale = (v * 100.0).round() / 100.0;
             Some(("ui_scale", app.settings.ui_scale.to_string()))
+        }
+        "chat_size" => {
+            app.settings.chat_size = ((v * 10.0).round() / 10.0).clamp(0.5, 3.0);
+            Some(("chat_size", app.settings.chat_size.to_string()))
         }
         "ui_opacity" => {
             app.settings.ui_opacity = (v * 100.0).round() / 100.0;
@@ -964,10 +1400,45 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
             app.settings.wheel_lock = if v < 45.0 { 0.0 } else { v.round() };
             Some(("wheel_lock", app.settings.wheel_lock.to_string()))
         }
-        "fov" => {
-            app.settings.fov = if v < 20.0 { 0.0 } else { v.round() };
-            Some(("fov", app.settings.fov.to_string()))
+        "triple_width_mm" => {
+            app.settings.triple.width_mm = v.clamp(200.0, 2000.0);
+            Some(("triple_width_mm", app.settings.triple.width_mm.to_string()))
         }
+        "triple_distance_mm" => {
+            app.settings.triple.fov_deg = 0.0;
+            remember_setting("triple_fov_deg", "0");
+            app.settings.triple.distance_mm = v.clamp(200.0, 3000.0);
+            Some((
+                "triple_distance_mm",
+                app.settings.triple.distance_mm.to_string(),
+            ))
+        }
+        "triple_bezel_mm" => {
+            app.settings.triple.bezel_mm = v.clamp(0.0, 100.0);
+            Some(("triple_bezel_mm", app.settings.triple.bezel_mm.to_string()))
+        }
+        "triple_left_angle_deg" => {
+            app.settings.triple.left_angle_deg = v.clamp(0.0, 90.0);
+            Some((
+                "triple_left_angle_deg",
+                app.settings.triple.left_angle_deg.to_string(),
+            ))
+        }
+        "triple_right_angle_deg" => {
+            app.settings.triple.right_angle_deg = v.clamp(0.0, 90.0);
+            Some((
+                "triple_right_angle_deg",
+                app.settings.triple.right_angle_deg.to_string(),
+            ))
+        }
+        "triple_eye_height_mm" => {
+            app.settings.triple.eye_height_mm = v.clamp(-500.0, 500.0);
+            Some((
+                "triple_eye_height_mm",
+                app.settings.triple.eye_height_mm.to_string(),
+            ))
+        }
+        "fov" => Some(set_camera_fov(&mut app.settings, v)),
         "steer_look_angle" => {
             app.settings.steer_look_angle = v.round();
             Some(("steer_look_angle", app.settings.steer_look_angle.to_string()))
@@ -976,14 +1447,53 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
             app.settings.steer_look_response = (v * 100.0).round() / 100.0;
             Some(("steer_look_response", app.settings.steer_look_response.to_string()))
         }
+        "head_idle" => {
+            app.settings.head_idle = (v * 100.0).round() / 100.0;
+            Some(("head_idle", app.settings.head_idle.to_string()))
+        }
+        "head_idle_pace" => {
+            app.settings.head_idle_pace = (v * 100.0).round() / 100.0;
+            Some(("head_idle_pace", app.settings.head_idle_pace.to_string()))
+        }
+        // the seat: kept for this bus (`bus_seats`), not for every bus (#1355)
+        "head_tracking_yaw_sens" => {
+            app.settings.head_tracking_yaw_sens = v.round().clamp(0.0, 100.0);
+            Some(("head_tracking_yaw_sens", app.settings.head_tracking_yaw_sens.to_string()))
+        }
+        "head_tracking_pitch_sens" => {
+            app.settings.head_tracking_pitch_sens = v.round().clamp(0.0, 100.0);
+            Some(("head_tracking_pitch_sens", app.settings.head_tracking_pitch_sens.to_string()))
+        }
+        "head_tracking_roll_sens" => {
+            app.settings.head_tracking_roll_sens = v.round().clamp(0.0, 100.0);
+            Some(("head_tracking_roll_sens", app.settings.head_tracking_roll_sens.to_string()))
+        }
+        "head_tracking_x_sens" => {
+            app.settings.head_tracking_x_sens = v.round().clamp(0.0, 100.0);
+            Some(("head_tracking_x_sens", app.settings.head_tracking_x_sens.to_string()))
+        }
+        "head_tracking_y_sens" => {
+            app.settings.head_tracking_y_sens = v.round().clamp(0.0, 100.0);
+            Some(("head_tracking_y_sens", app.settings.head_tracking_y_sens.to_string()))
+        }
+        "head_tracking_z_sens" => {
+            app.settings.head_tracking_z_sens = v.round().clamp(0.0, 100.0);
+            Some(("head_tracking_z_sens", app.settings.head_tracking_z_sens.to_string()))
+        }
         "seat" => {
             let k: usize = arg.trim().parse().unwrap_or(0).min(2);
             app.settings.seat[k] = (v * 100.0).round() / 100.0;
-            Some((["seat_x", "seat_y", "seat_z"][k], app.settings.seat[k].to_string()))
+            remember_bus_seat(app);
+            None
+        }
+        "seat_pitch" => {
+            app.settings.seat_pitch_deg = v.clamp(-45.0, 45.0).round();
+            remember_bus_seat(app);
+            None
         }
         // the clock set directly: the hour or the minute (the seconds stay)
         "hour" | "minute" => {
-            if app.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
+            if app.net.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
                 app.service_msg = Some(("In a LAN session the host sets the clock".into(), 3.0));
                 return None;
             }
@@ -1037,22 +1547,23 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
 fn toggle_now(app: &App, id: &str) -> Option<bool> {
     let s = &app.settings;
     Some(match id {
-        "navigator" => if app.vr_active() { app.vr_nav_profile().enabled } else { app.navigator.as_ref().is_some_and(|n| n.enabled) },
-        "nav_ai" => app.navigator.as_ref().map_or(s.nav_ai, |n| n.show_ai),
+        "navigator" => if app.vr_active() { app.vr_nav_profile().enabled } else { app.menus.navigator.as_ref().is_some_and(|n| n.enabled) },
+        "nav_ai" => app.menus.navigator.as_ref().map_or(s.nav_ai, |n| n.show_ai),
         "shadows" => s.shadows,
         "head" => s.head_movement,
         "cam_smooth" => s.driverview_smooth,
         "coll_objects" => s.collision_objects,
         "coll_vehicles" => s.collision_vehicles,
-        "mouse" => app.mouse_drive,
+        "mouse" => app.input.mouse_drive,
         "mouse_right" => s.mouse_right_off,
+        "mouse_smooth" => s.mouse_smooth,
         "blinker_cancel" => s.blinker_cancel,
         "fps" => s.show_fps,
         "get_up" => s.get_up,
         "time_sync" => s.time_sync,
         "metar_sync" => s.metar_sync,
-        "snow_cover" => app.weather.as_ref().is_some_and(|w|w.snow),
-        "snow_road" => app.weather.as_ref().is_some_and(|w|w.snow_on_road),
+        "snow_cover" => app.session.weather.as_ref().is_some_and(|w|w.snow),
+        "snow_road" => app.session.weather.as_ref().is_some_and(|w|w.snow_on_road),
         "camcoll" => s.camera_collision,
         "steer_look" => s.steer_look,
         "hands_in_cab" => s.hands_in_cab,
@@ -1060,24 +1571,37 @@ fn toggle_now(app: &App, id: &str) -> Option<bool> {
         "brake_hold" => s.brake_hold,
         "auto_clutch" => s.auto_clutch,
         "headtrack" => s.head_tracking,
-        "timetable_win" => app.timetable,
-        "info_bar" => app.info_bar,
-        "nav_arrows" => app.navigator.as_ref().map_or(s.nav_arrows, |n| n.arrows),
+        "head_tracking_invert_yaw" => s.head_tracking_invert_yaw,
+        "head_tracking_invert_pitch" => s.head_tracking_invert_pitch,
+        "head_tracking_invert_roll" => s.head_tracking_invert_roll,
+        "head_tracking_invert_x" => s.head_tracking_invert_x,
+        "head_tracking_invert_y" => s.head_tracking_invert_y,
+        "head_tracking_invert_z" => s.head_tracking_invert_z,
+        "timetable_win" => app.menus.timetable,
+        "info_bar" => app.menus.info_bar,
+        "nav_arrows" => app.menus.navigator.as_ref().map_or(s.nav_arrows, |n| n.arrows),
         "exact_fare" => s.exact_fare,
         "collision_pedestrians" => s.collision_pedestrians,
         "ssao" => s.ssao,
         "detail_textures" => s.detail_textures,
         "reflections" => s.reflections,
         "clouds" => s.clouds,
+        "windy_trees" => s.windy_trees,
         "fullscreen" => s.fullscreen,
         "vsync" => s.vsync,
         "texture_compression" => s.texture_compression,
         "driver" => s.driver,
         "alt_view" => s.alt_view,
+        "precision_zoom" => s.precision_zoom,
+        "triple_screen" => s.triple.enabled,
+        "triple_hud_center" => s.triple_hud_center,
+        "triple_span" => s.triple_span,
         "vr" => s.vr,
         "vr_desktop_mirror" => s.vr_desktop_mirror,
         "doppler" => s.doppler,
         "steering_linear" => s.steering_linear,
+        "pad_steer_linear" => s.pad_steer_linear,
+        "arrows_switch_cams" => s.arrows_switch_cams,
         "old_steering" => s.old_steering,
         "red_steer_spd" => s.red_steer_spd,
         "momentary_gears" => s.momentary_gears,
@@ -1102,14 +1626,14 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
                 if app.vr_nav_profile().enabled != on { app.vr_nav_adjust("enabled", 1.0); }
                 return None;
             }
-            if let Some(n) = app.navigator.as_mut() {
+            if let Some(n) = app.menus.navigator.as_mut() {
                 n.enabled = on;
             }
             app.settings.navigator = on;
             Some(("navigator", bit))
         }
         "nav_ai" => {
-            if let Some(n) = app.navigator.as_mut() {
+            if let Some(n) = app.menus.navigator.as_mut() {
                 n.show_ai = on;
             }
             app.settings.nav_ai = on;
@@ -1141,16 +1665,9 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
             Some(("collision_vehicles", bit))
         }
         "mouse" => {
-            app.mouse_drive = on;
-            if !app.mouse_drive {
-                crate::player::keep_wheel(app.player.as_mut());
-            }
-            #[cfg(windows)]
-            if !app.mouse_drive {
-                app.reset_vr_pointer();
-            }
-            app.mouse_steer = (app.player.as_ref().map(|p| p.vehicle.physics.controls.steering).unwrap_or(0.0), 1.0);
-            app.mouse_pedals = app.player.as_ref().map(|p| (p.vehicle.physics.controls.throttle, p.vehicle.physics.controls.brake)).unwrap_or((0.0, 0.0));
+            // (as the O key does it: switched off from the menu, the brake the mouse held
+            // stayed behind and the bus rolled away - #517, #760)
+            app.set_mouse_drive(on);
             None
         }
         "blinker_cancel" => {
@@ -1164,6 +1681,10 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
             app.settings.mouse_right_off = on;
             Some(("mouse_right_off", bit))
         }
+        "mouse_smooth" => {
+            app.settings.mouse_smooth = on;
+            Some(("mouse_smooth", bit))
+        }
         "get_up" => {
             app.settings.get_up = on;
             Some(("get_up", bit))
@@ -1172,7 +1693,7 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
         // clock runs at real time while it is on, at its time speed again after)
         "time_sync" => {
             app.settings.time_sync = on;
-            if let Some(l) = app.lan.as_mut().filter(|l| l.role == omsi_net::Role::Host) {
+            if let Some(l) = app.net.lan.as_mut().filter(|l| l.role == omsi_net::Role::Host) {
                 l.clock_speed = if on { 1.0 } else { app.settings.time_speed.clamp(1.0, 30.0) };
             }
             app.sync_real_time();
@@ -1182,12 +1703,12 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
         // cannot be changed while it is on (the cycle and a hand-made weather end with it)
         "metar_sync" => {
             app.settings.metar_sync = on;
-            app.metar_rx = None;
-            app.metar_once = false;
-            app.metar_next = 0.0;
+            app.session.metar_rx = None;
+            app.session.metar_once = false;
+            app.session.metar_next = 0.0;
             if on {
-                app.weather_cycle = None;
-                app.weather_blend = None;
+                app.session.weather_cycle = None;
+                app.session.weather_blend = None;
             }
             Some(("metar_sync", bit))
         }
@@ -1200,6 +1721,30 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
         "headtrack" => {
             app.settings.head_tracking = on;
             Some(("head_tracking", bit))
+        }
+        "head_tracking_invert_yaw" => {
+            app.settings.head_tracking_invert_yaw = on;
+            Some(("head_tracking_invert_yaw", bit))
+        }
+        "head_tracking_invert_pitch" => {
+            app.settings.head_tracking_invert_pitch = on;
+            Some(("head_tracking_invert_pitch", bit))
+        }
+        "head_tracking_invert_roll" => {
+            app.settings.head_tracking_invert_roll = on;
+            Some(("head_tracking_invert_roll", bit))
+        }
+        "head_tracking_invert_x" => {
+            app.settings.head_tracking_invert_x = on;
+            Some(("head_tracking_invert_x", bit))
+        }
+        "head_tracking_invert_y" => {
+            app.settings.head_tracking_invert_y = on;
+            Some(("head_tracking_invert_y", bit))
+        }
+        "head_tracking_invert_z" => {
+            app.settings.head_tracking_invert_z = on;
+            Some(("head_tracking_invert_z", bit))
         }
         "camcoll" => {
             app.settings.camera_collision = on;
@@ -1229,11 +1774,11 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
             Some(("ff_enabled", bit))
         }
         "timetable_win" => {
-            app.timetable = on;
+            app.menus.timetable = on;
             None
         }
         "info_bar" => {
-            app.info_bar = on;
+            app.set_info_bar(on);
             None
         }
         "nav_arrows" => {
@@ -1264,9 +1809,15 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
             app.settings.clouds = on;
             Some(("clouds", bit))
         }
+        "windy_trees" => {
+            app.settings.windy_trees = on;
+            Some(("windy_trees", bit))
+        }
         "fullscreen" => {
             app.settings.fullscreen = on;
-            if let Some(w) = app.window.as_ref() {
+            if app.gfx.spanned {
+                log::info!("triple screen: the window spans three monitors, fullscreen is left alone");
+            } else if let Some(w) = app.window.as_ref() {
                 w.set_fullscreen(on.then_some(winit::window::Fullscreen::Borderless(None)));
             }
             Some(("fullscreen", bit))
@@ -1287,6 +1838,22 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
             app.settings.alt_view = on;
             Some(("alt_view", bit))
         }
+        "precision_zoom" => {
+            app.settings.precision_zoom = on;
+            Some(("precision_zoom", bit))
+        }
+        "triple_screen" => {
+            app.settings.triple.enabled = on;
+            Some(("triple_screen", bit))
+        }
+        "triple_hud_center" => {
+            app.settings.triple_hud_center = on;
+            Some(("triple_hud_center", bit))
+        }
+        "triple_span" => {
+            app.settings.triple_span = on;
+            Some(("triple_span", bit))
+        }
         "vr" => {
             app.settings.vr = on;
             Some(("vr", bit))
@@ -1303,6 +1870,14 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
             app.settings.steering_linear = on;
             Some(("steering_linear", bit))
         }
+        "pad_steer_linear" => {
+            app.settings.pad_steer_linear = on;
+            Some(("pad_steer_linear", bit))
+        }
+        "arrows_switch_cams" => {
+            app.settings.arrows_switch_cams = on;
+            Some(("arrows_switch_cams", bit))
+        }
         "old_steering" => {
             app.settings.old_steering = on;
             Some(("old_steering", bit))
@@ -1313,6 +1888,10 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
         }
         "momentary_gears" => {
             app.settings.momentary_gears = on;
+            // (the bus being driven read it when it was taken over)
+            if let Some(p) = app.player.as_mut() {
+                p.momentary_gears = on;
+            }
             Some(("momentary_gears", bit))
         }
         "auto_shift" => {
@@ -1359,7 +1938,7 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
 pub(crate) static LIST_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Change the setting `verb` (a switch or a slider) as `mv` says; false when it is neither.
-fn option_do(app: &mut App, verb: &str, arg: &str, mv: Move) -> bool {
+pub(crate) fn option_do(app: &mut App, verb: &str, arg: &str, mv: Move) -> bool {
     // (the weather is the METAR report's while the sync is on)
     if app.metar_locked() && matches!(verb, "visibility" | "rain_amt" | "wet" | "brightness" | "humidity" | "temp" | "wind_speed" | "wind_dir" | "snow_cover" | "snow_road") {
         app.service_msg = Some(("The weather cannot be changed while the METAR sync is on".into(), 3.0));
@@ -1459,16 +2038,17 @@ pub(crate) fn dropdown_for(app: &App, row: usize, id: &str) -> Option<Dropdown> 
             v
         }
         "cloudkind" => {
-            current = app.weather.as_ref().and_then(|w| cloud_index(&w.clouds.0));
+            current = app.session.weather.as_ref().and_then(|w| cloud_index(&w.clouds.0));
             CLOUD_TYPES.iter().enumerate().map(|(i, (_, n))| (tr(*n), format!("cloud {i}"))).collect()
         }
         "precipkind" => {
-            current = app.weather.as_ref().map(|w| (w.precip.first().copied().unwrap_or(0.0).max(0.0) as usize).min(PRECIP_KINDS.len() - 1));
+            current = app.session.weather.as_ref().map(|w| (w.precip.first().copied().unwrap_or(0.0).max(0.0) as usize).min(PRECIP_KINDS.len() - 1));
             PRECIP_KINDS.iter().enumerate().map(|(i, n)| (tr(*n), format!("precip {i}"))).collect()
         }
         "preset" => {
-            current = preset_now(&settings_file());
-            presets().iter().enumerate().map(|(i, p)| (tr(p.0), format!("preset {i}"))).collect()
+            let file = settings_file();
+            current = preset_now(&file);
+            presets(&file).iter().enumerate().map(|(i, p)| (tr(p.0), format!("preset {i}"))).collect()
         }
         "gfxprofile" => omsi_launcher_lib::graphics_profiles().into_keys().map(|n| (n.clone(), format!("gfxprofile {n}"))).collect(),
         "reset" => vec![(tr("Cancel"), "noop".to_string()), (tr("Reset all settings"), "reset_all".to_string())],
@@ -1496,7 +2076,7 @@ pub(crate) fn dropdown_apply(app: &mut App, action: &str) {
     }
     match verb {
         "wx" => {
-            if app.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
+            if app.net.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
                 app.service_msg = Some(("In a LAN session the host sets the weather".into(), 3.0));
             } else {
                 app.change_weather(Some(arg.to_string()), true, 1.0);
@@ -1506,11 +2086,11 @@ pub(crate) fn dropdown_apply(app: &mut App, action: &str) {
             let code: String = arg.trim().chars().filter(|c| c.is_ascii_alphabetic()).take(4).collect::<String>().to_ascii_uppercase();
             app.settings.metar_station = code.clone();
             remember_setting("metar_station", &code);
-            app.metar_rx = None;
-            app.metar_once = false;
+            app.session.metar_rx = None;
+            app.session.metar_once = false;
             // With sync on, the new station is fetched at once. With it off this simply
             // selects the station for "Load current METAR once".
-            app.metar_next = 0.0;
+            app.session.metar_next = 0.0;
         }
         "cloud" => {
             if let Some(i) = arg.trim().parse::<usize>().ok().filter(|i| *i < CLOUD_TYPES.len()) {
@@ -1528,20 +2108,37 @@ pub(crate) fn dropdown_apply(app: &mut App, action: &str) {
             }
         }
         "pick" => {
-            if let Some((key, value)) = arg.split_once(' ') {
-                remember_setting(key, value);
-                reload_settings(app);
+            match arg.split_once(' ') {
+                Some(("aa", "dlss")) => {
+                    if !dlss_on(&settings_file()) {
+                        remember_setting("dlss", "quality");
+                    }
+                    reload_settings(app);
+                }
+                Some(("aa", msaa)) => {
+                    remember_setting("dlss", "off");
+                    remember_setting("msaa", msaa);
+                    reload_settings(app);
+                }
+                Some((key, value)) => {
+                    remember_setting(key, value);
+                    reload_settings(app);
+                }
+                None => {}
             }
         }
         "preset" => {
-            if let Some(p) = arg.trim().parse::<usize>().ok().and_then(|i| presets().into_iter().nth(i)) {
+            if let Some(i) = arg.trim().parse::<usize>().ok().filter(|i| *i < 4) {
                 store_with(app, |v| {
+                    // (the preset of the mode the file has: it keeps the mode)
+                    let Some(p) = presets(v).into_iter().nth(i) else { return };
                     if let Some(o) = p.1.as_object() {
                         for (k, x) in o {
                             v[k.as_str()] = x.clone();
                         }
                     }
                 });
+                app.service_msg = Some((omsi_ui::tr("Takes effect when the game starts the next time").into_owned(), 5.0));
             }
         }
         "gfxprofile" => {
@@ -1568,12 +2165,12 @@ pub(crate) fn dropdown_apply(app: &mut App, action: &str) {
 }
 
 fn weather_name(app: &App) -> String {
-    if app.weather.as_ref().is_some_and(|w| w.name == CUSTOM_WEATHER) {
+    if app.session.weather.as_ref().is_some_and(|w| w.name == CUSTOM_WEATHER) {
         return CUSTOM_WEATHER.to_string();
     }
     // a METAR report's weather
     if app.args.weather.as_deref().is_some_and(|p| p.starts_with(crate::weather_setup::REPORT)) {
-        if let Some(n) = app.weather.as_ref().map(|w| w.name.trim().to_string()).filter(|n| !n.is_empty()) {
+        if let Some(n) = app.session.weather.as_ref().map(|w| w.name.trim().to_string()).filter(|n| !n.is_empty()) {
             return n;
         }
     }
@@ -1584,7 +2181,7 @@ fn weather_name(app: &App) -> String {
             let stem = file.rsplit_once('.').map(|x| x.0).unwrap_or(file);
             stem.trim_start_matches('#').to_string()
         }
-        None => app.weather.as_ref().map(|w| w.name.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| "Map default".to_string()),
+        None => app.session.weather.as_ref().map(|w| w.name.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| "Map default".to_string()),
     }
 }
 
@@ -1619,10 +2216,16 @@ fn same_value(a: &str, b: &str) -> bool {
 
 fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
     match key {
-        "graphics" => vec![("vanilla", "Vanilla (as OMSI 2)"), ("vanilla_plus", "Vanilla+"), ("enhanced", "Enhanced")],
+        "cloud_quality" => vec![("high", "High"), ("low", "Low")],
+        "graphics" => vec![("vanilla", "Vanilla (as OMSI 2)"), ("vanilla_plus", "Vanilla+"), ("enhanced", "Enhanced"), ("enhanced_plus", "Enhanced+")],
         "msaa" => vec![("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA"), ("8", "8x MSAA")],
         "render_scale" => vec![("auto", "Auto"), ("1", "100%"), ("0.85", "85%"), ("0.75", "75%"), ("0.67", "67%"), ("0.5", "50%")],
-        "anisotropy" => vec![("1", "Off"), ("2", "2x"), ("4", "4x"), ("8", "8x")],
+        // anti-aliasing as the launcher's settings have it: MSAA (`msaa`), or NVIDIA DLSS
+        // (`dlss`, Windows: it needs DirectX 12) with its quality in a row of its own
+        "aa" if cfg!(windows) => vec![("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA"), ("8", "8x MSAA"), ("dlss", "DLSS / DLAA")],
+        "aa" => select_options("msaa"),
+        "dlss" if cfg!(windows) => vec![("dlaa", "DLAA (native resolution)"), ("quality", "Quality"), ("balanced", "Balanced"), ("performance", "Performance"), ("ultra_performance", "Ultra performance")],
+        "anisotropy" => vec![("1", "Off"), ("2", "2x"), ("4", "4x"), ("8", "8x"), ("16", "16x")],
         "shadow_size" => vec![("1024", "1024"), ("2048", "2048"), ("4096", "4096")],
         "shadow_casters" => vec![("all", "Every solid mesh"), ("omsi", "[shadow] meshes, as OMSI")],
         "max_fps" => vec![("0", "Screen refresh rate"), ("30", "30 fps"), ("45", "45 fps"), ("60", "60 fps"), ("120", "120 fps"), ("144", "144 fps"), ("1000", "Unlimited")],
@@ -1632,6 +2235,7 @@ fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
         "mirror_size" => vec![("0", "Off"), ("128", "Low (128)"), ("256", "Normal (256)"), ("512", "High (512)"), ("1024", "Very high (1024)")],
         "texture_memory" => vec![("0", "Automatic"), ("500", "500 MB"), ("1000", "1 GB"), ("1500", "1.5 GB"), ("2000", "2 GB"), ("3000", "3 GB"), ("4000", "4 GB"), ("6000", "6 GB")],
         "drive_keys" => vec![("omsi", "Custom controls (Controls page)"), ("simple", "W A S D + arrows"), ("wasd", "W A S D only"), ("arrows", "Arrow keys only")],
+        "resolution" => crate::launcher::pages::RESOLUTIONS.to_vec(),
         "navigator_corner" => vec![("top-left", "Top left"), ("top-right", "Top right"), ("bottom-left", "Bottom left"), ("bottom-right", "Bottom right")],
         "boarding" => vec![("auto", "Pay and take the ticket"), ("pay", "The driver sells the ticket"), ("walk", "Just walk in")],
         "pax_voices" => vec![("all", "Greetings and tickets"), ("tickets", "Only the ticket asked for"), ("off", "Silent")],
@@ -1649,9 +2253,18 @@ fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
 
 fn select_state(file: &serde_json::Value, key: &str) -> (Vec<(&'static str, &'static str)>, Option<usize>, String) {
     let options = select_options(key);
-    let cur = value_text(file.get(key).unwrap_or(&serde_json::Value::Null));
+    let cur = match key {
+        "aa" if dlss_on(file) => "dlss".to_string(),
+        "aa" => value_text(file.get("msaa").unwrap_or(&serde_json::Value::Null)),
+        _ => value_text(file.get(key).unwrap_or(&serde_json::Value::Null)),
+    };
     let at = options.iter().position(|o| same_value(o.0, &cur));
     (options, at, cur)
+}
+
+/// Whether the settings file asks for NVIDIA DLSS (Windows only).
+fn dlss_on(file: &serde_json::Value) -> bool {
+    cfg!(windows) && file.get("dlss").and_then(|v| v.as_str()).is_some_and(|m| m != "off")
 }
 
 fn select_row(file: &serde_json::Value, key: &str, name: &str, desc: &str) -> Option<(String, String)> {
@@ -1663,23 +2276,20 @@ fn select_row(file: &serde_json::Value, key: &str, name: &str, desc: &str) -> Op
     Some((row(name, 'o', &label, desc, None), format!("sel {key}")))
 }
 
-fn presets() -> [(&'static str, serde_json::Value); 4] {
-    [
-        ("Low", serde_json::json!({"msaa": 1, "anisotropy": 2, "shadow_size": 1024, "ssao": false, "shadows": false, "detail_textures": false, "clouds": false, "view_distance": "600", "min_obj_size": 0.03, "max_obj_dist": "500", "mirror_size": 128, "render_scale": "0.75", "texture_memory": 800})),
-        ("Medium", serde_json::json!({"msaa": 2, "anisotropy": 4, "shadow_size": 2048, "ssao": false, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "900", "min_obj_size": 0.02, "max_obj_dist": "750", "mirror_size": 256, "render_scale": "auto", "texture_memory": 1200})),
-        ("High", serde_json::json!({"msaa": 4, "anisotropy": 8, "shadow_size": 2048, "ssao": true, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "auto", "min_obj_size": 0.013, "max_obj_dist": "auto", "mirror_size": 256, "render_scale": "auto", "texture_memory": 0})),
-        ("Ultra", serde_json::json!({"msaa": 4, "anisotropy": 8, "shadow_size": 4096, "ssao": true, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "2000", "min_obj_size": 0.005, "max_obj_dist": "1500", "mirror_size": 512, "render_scale": "auto", "texture_memory": 0})),
-    ]
+/// The quality presets for the graphics mode of `file` (`graphics_presets_for`, as the
+/// launcher's): they keep the mode.
+fn presets(file: &serde_json::Value) -> [(&'static str, serde_json::Value); 4] {
+    omsi_launcher_lib::graphics_presets_for(file.get("graphics").and_then(|v| v.as_str()).unwrap_or("vanilla_plus"))
 }
 
 fn preset_now(file: &serde_json::Value) -> Option<usize> {
-    presets().iter().position(|p| {
+    presets(file).iter().position(|p| {
         p.1.as_object().is_some_and(|o| o.iter().all(|(k, v)| same_value(&value_text(v), &value_text(file.get(k).unwrap_or(&serde_json::Value::Null)))))
     })
 }
 
 fn preset_row(file: &serde_json::Value, name: &str, desc: &str) -> Option<(String, String)> {
-    let label = omsi_ui::tr(preset_now(file).map(|i| presets()[i].0).unwrap_or("Custom")).into_owned();
+    let label = omsi_ui::tr(preset_now(file).map(|i| presets(file)[i].0).unwrap_or("Custom")).into_owned();
     Some((row(name, 'o', &label, desc, None), "preset".to_string()))
 }
 
@@ -1696,20 +2306,26 @@ fn store_with(app: &mut App, change: impl FnOnce(&mut serde_json::Value)) {
 
 fn reload_settings(app: &mut App) {
     flush_settings(true);
+    // (the seat is the bus's, see `bus_seats`: it is read again for the bus)
     app.settings = crate::settings::Settings::load();
+    app.session.seat_bus.clear();
     crate::ui_language(&app.settings.language);
     sync_live(app);
 }
 
 fn sync_live(app: &mut App) {
+    // (another DLSS quality is taken at once; DLSS on or off with the next start)
+    if let Some(r) = app.renderer.as_mut() {
+        r.set_dlss_mode(app.settings.dlss_mode());
+    }
     let s = &app.settings;
     crate::startup::SOUND_AI.store(s.vol_ai.to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::startup::SOUND_SCENERY.store(s.vol_scenery.to_bits(), std::sync::atomic::Ordering::Relaxed);
     omsi_audio::DOPPLER.store(s.doppler, std::sync::atomic::Ordering::Relaxed);
-    if let Some(n) = app.navigator.as_mut() {
+    if let Some(n) = app.menus.navigator.as_mut() {
         n.arrows = s.nav_arrows;
     }
-    if let Some(h) = app.humans.as_mut() {
+    if let Some(h) = app.session.humans.as_mut() {
         h.exact_fare = s.exact_fare;
         h.boarding = s.boarding.clone();
         h.voices = match s.pax_voices.as_str() {
@@ -1727,6 +2343,7 @@ fn options_pages(app: &App) -> Vec<Page> {
     let pct = |v: f32| format!("{:.0} %", v * 100.0);
     let cm = |v: f32| format!("{:+.0} cm", v * 100.0);
     let later = "Takes effect when the game starts the next time";
+    let dlss_on = dlss_on(&file);
     let game: Vec<(String, String)> = vec![
         switch_row(app, "navigator", "Navigator", "Enables/Disables the Minimap"),
         switch_row(app, "nav_ai", "AI vehicles on the map", "Shows/hides the other (AI) vehicles on the Minimap and the city map"),
@@ -1736,8 +2353,8 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "coll_objects", "Collisions with objects", "Enables/disables collisions with objects such as buildings, streetlights, etc."),
         switch_row(app, "coll_vehicles", "Collisions with vehicles", "Enables/Disables Collisions with Other Vehicles"),
         switch_row(app, "collision_pedestrians", "Collisions with people", "Enables/disables knocking down people"),
-        switch_row(app, "timetable_win", "Timetable window", "Displays a list of all stops (only when a tour is active)"),
-        switch_row(app, "info_bar", "Information bar", "Displays information such as the time, speed, and other details at the top of the screen"),
+        switch_row(app, "timetable_win", "Timetable window (Insert)", "Displays a list of all stops (only when a tour is active)"),
+        switch_row(app, "info_bar", "Information bar (Shift+Y)", "Displays information such as the time, speed, and other details at the top of the screen"),
         switch_row(app, "exact_fare", "Passengers pay the exact fare", "No change is given at the cash desk"),
         pick("boarding", "Boarding", "How passengers get their tickets"),
         pick("maintenance", "Maintenance", later),
@@ -1749,26 +2366,101 @@ fn options_pages(app: &App) -> Vec<Page> {
         .flatten()
         .collect();
     let graphics: Vec<(String, String)> = vec![
-        preset_row(&file, "Quality preset", "Sets most of the graphics options at once"),
         pick("graphics", "Graphics", later),
-        pick("msaa", "Anti-aliasing", later),
-        pick("render_scale", "Render scale", later),
+        preset_row(&file, "Quality preset", "Sets most of the graphics options at once"),
+        pick("aa", "Anti-aliasing", later),
+        // (DLSS draws at the size its quality asks for: it takes the render scale's row)
+        if dlss_on { pick("dlss", "DLSS quality", "Changes at once; DLSS on or off takes effect when the game starts the next time") } else { pick("render_scale", "Render scale", later) },
         pick("anisotropy", "Anisotropic", later),
-        switch_row(app, "shadows", "Sun shadows", "Enables/Disabled shadows"),
+        // (Enhanced+ traces its shadows, occlusion and reflections: always on there)
+        switch_row(app, "shadows", "Sun shadows", "Enables/Disabled shadows").filter(|_| !app.settings.ray_tracing()),
         pick("shadow_size", "Shadow map", later),
-        switch_row(app, "ssao", "Ambient occlusion", later),
+        switch_row(app, "ssao", "Ambient occlusion", later).filter(|_| !app.settings.ray_tracing()),
         pick("shadow_casters", "Shadows cast by", later),
         switch_row(app, "detail_textures", "Detail texturing up close", "The ground and large walls get fine grain when close"),
+        slider_row(app, "night_brightness", "Night brightness", "Enhanced graphics: how much brighter the night is shown", &|v| if v < 0.01 { "Off".to_string() } else { format!("+{v:.2}") }),
         slider_row(app, "led_glow", "LED glow", "How strongly the dots of LED destination displays glow", &|v| format!("{}/15", v as i64)),
         slider_row(app, "led_mips", "LED mask mipmaps", "Keep the mip chain of the LED masks (smoother from a distance).", &|v| format!("{v:.2}")),
-        switch_row(app, "reflections", "Reflection maps (paint, chrome, glass)", later),
+        switch_row(app, "reflections", "Reflection maps (paint, chrome, glass)", later).filter(|_| !app.settings.ray_tracing()),
         switch_row(app, "clouds", "Clouds", later),
+        pick("cloud_quality", "Cloud quality", "Enhanced: the volumetric clouds marched in fewer steps - faster, a little grainier")
+            .filter(|_| matches!(crate::settings::graphics_mode(&app.settings.graphics), "enhanced" | "enhanced_plus") && app.settings.clouds),
+        switch_row(app, "windy_trees", "Windy trees", "The trees' leaves bend and sway in the wind and its gusts; with no wind they stand still"),
     ]
         .into_iter()
         .flatten()
         .collect();
-    let display: Vec<(String, String)> = vec![
+    let mut display = vec![
         switch_row(app, "fullscreen", "Fullscreen", "Switches the window between windowed and fullscreen"),
+        pick("resolution", "Window size", later),
+        switch_row(
+            app,
+            "triple_screen",
+            "Triple screen",
+            "Three physical screen projections; OpenXR takes priority",
+        ),
+    ];
+    // (the rig's own settings only while it is on)
+    let triple = vec![
+        switch_row(
+            app,
+            "triple_hud_center",
+            "HUD on centre screen",
+            "Keep the navigator, menus and information on the centre screen",
+        ),
+        switch_row(
+            app,
+            "triple_span",
+            "Span three monitors at startup",
+            "Borderless across three equal monitors in one horizontal row; restart required",
+        ),
+        slider_row(
+            app,
+            "triple_width_mm",
+            "Visible panel width",
+            "Width of one screen without its frame",
+            &|v| format!("{v:.0} mm"),
+        ),
+        slider_row(
+            app,
+            "triple_distance_mm",
+            "Eye distance",
+            "Eye to the centre screen",
+            &|v| format!("{v:.0} mm"),
+        ),
+        slider_row(
+            app,
+            "triple_bezel_mm",
+            "Frame width at each join",
+            "Combined width of both adjacent frames",
+            &|v| format!("{v:.0} mm"),
+        ),
+        slider_row(
+            app,
+            "triple_left_angle_deg",
+            "Left screen angle",
+            "Inward angle from a flat row",
+            &|v| format!("{v:.0}°"),
+        ),
+        slider_row(
+            app,
+            "triple_right_angle_deg",
+            "Right screen angle",
+            "Inward angle from a flat row",
+            &|v| format!("{v:.0}°"),
+        ),
+        slider_row(
+            app,
+            "triple_eye_height_mm",
+            "Eye above screen centre",
+            "Vertical eye offset",
+            &|v| format!("{v:.0} mm"),
+        ),
+    ];
+    if app.settings.triple.enabled {
+        display.extend(triple);
+    }
+    let display: Vec<(String, String)> = display.into_iter().chain([
         switch_row(app, "vsync", "V-sync", "Waits for the screen's refresh"),
         pick("max_fps", "Frame limit", "Frames a second at most"),
         switch_row(app, "fps", "Frame rate", "Show the frames per second in the top right corner"),
@@ -1779,8 +2471,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         pick("texture_memory", "Texture memory", later),
         switch_row(app, "texture_compression", "Compress textures on loading", later),
         (!omsi_launcher_lib::graphics_profiles().is_empty()).then(|| opens("Load graphics profile", "Applies a graphics profile saved in the launcher", "gfxprofile")),
-    ]
-        .into_iter()
+    ])
         .flatten()
         .collect();
     let sound: Vec<(String, String)> = vec![
@@ -1800,15 +2491,32 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "steer_look", "View turns with steering", "Camera turns with the steering wheel (cockpit only)"),
         slider_row(app, "steer_look_angle", "Steering view angle", "How far the view turns at full steering lock", &|v| format!("{v:.0}°")),
         slider_row(app, "steer_look_response", "Steering view response", "How quickly the view follows the steering", &|v| format!("{:.0} ms", v * 1000.0)),
+        slider_row(app, "head_idle", "Head sway at a standstill", "How much the view sways on its own when nothing is done to it - a head at rest is never quite still, most of it seen while the bus waits at a stop", &|v| if v <= 0.0 { "Off".to_string() } else { format!("{:.0}%", v * 100.0) }),
+        slider_row(app, "head_idle_pace", "Sway pace", "How fast that sway moves (100% is the pace it is designed at)", &|v| format!("{:.0}%", v * 100.0)),
         switch_row(app, "hands_in_cab", "Driver's hands in the cab view", "Shows the driver's hand on the steering wheel (Cockpit only)"),
         switch_row(app, "driver", "Driver at the wheel (outside views)", "Shows the driver in the outside views and in the mirrors"),
-        switch_row(app, "headtrack", "Head tracking", &format!("Head tracking with opentrack (UDP port {})", s.head_tracking_port)),
+        switch_row(app, "headtrack", "Head tracking (native TrackIR / OpenTrack)", &format!("Use native TrackIR on Windows, or OpenTrack on UDP port {}", s.head_tracking_port)),
+        slider_row(app, "head_tracking_yaw_sens", "TrackIR yaw sensitivity", "Left / right head movement. 100% is 1:1; the low end is deliberately finer.", &|v| format!("{v:.0}%")),
+        slider_row(app, "head_tracking_pitch_sens", "TrackIR pitch sensitivity", "Up / down head movement. 100% is 1:1; the low end is deliberately finer.", &|v| format!("{v:.0}%")),
+        slider_row(app, "head_tracking_roll_sens", "TrackIR roll sensitivity", "Head tilt. 100% is 1:1; the low end is deliberately finer.", &|v| format!("{v:.0}%")),
+        slider_row(app, "head_tracking_x_sens", "TrackIR X sensitivity", "Move your head left / right. 100% is 1:1; the low end is deliberately finer.", &|v| format!("{v:.0}%")),
+        slider_row(app, "head_tracking_y_sens", "TrackIR Y sensitivity", "Move your head up / down. 100% is 1:1; the low end is deliberately finer.", &|v| format!("{v:.0}%")),
+        slider_row(app, "head_tracking_z_sens", "TrackIR Z sensitivity", "Move your head forward / back. 100% is 1:1; the low end is deliberately finer.", &|v| format!("{v:.0}%")),
+        switch_row(app, "head_tracking_invert_yaw", "Invert TrackIR yaw", "Reverse left / right head rotation"),
+        switch_row(app, "head_tracking_invert_pitch", "Invert TrackIR pitch", "Reverse up / down head rotation"),
+        switch_row(app, "head_tracking_invert_roll", "Invert TrackIR roll", "Reverse head tilt"),
+        switch_row(app, "head_tracking_invert_x", "Invert TrackIR X", "Reverse left / right head movement"),
+        switch_row(app, "head_tracking_invert_y", "Invert TrackIR Y", "Reverse up / down head movement"),
+        switch_row(app, "head_tracking_invert_z", "Invert TrackIR Z", "Reverse forward / back head movement"),
         slider_row(app, "look_sens", "Mouse look sensitivity", "How fast the view turns when looking round with the mouse (100% is OMSI's)", &pct),
+        slider_row(app, "look_smoothing_ms", "Smooth the mouse look", "How long the view takes to come round to where the mouse or the stick turned it (off: at once, as OMSI)", &|v| if v <= 0.0 { "Off".to_string() } else { format!("{v:.0} ms") }),
         switch_row(app, "alt_view", "Right mouse button turns the view", "Shift+right zooms; off: right zooms as in OMSI, the wheel button turns"),
-        slider_row(app, "fov", "Field of view", "The view angle of the views from the vehicle", &|v| if v < 20.0 { "Default".to_string() } else { format!("{v:.0}°") }),
+        switch_row(app, "precision_zoom", "Precision mouse zoom", "The mouse zoom follows the FOV curve instead of OMSI's linear way"),
+        slider_row(app, "fov", "Field of view", "Vertical field of view; in triple screen Default uses physical measurements, an override moves the virtual eye", &|v| if v < 20.0 { "Default".to_string() } else { format!("{v:.0}°") }),
         slider_row(app, "seat 1", "Seat forward and back", "Adjust the driver's seat position forward or backward", &cm),
         slider_row(app, "seat 2", "Seat height", "Adjust the driver's seat height", &cm),
         slider_row(app, "seat 0", "Seat left and right", "Adjust the driver's seat position from side to side", &cm),
+        slider_row(app, "seat_pitch", "Head pitch", "Set the driver's neutral head tilt up or down, independent of the display setup", &|v| format!("{v:+.0}°")),
     ]
         .into_iter()
         .flatten()
@@ -1832,6 +2540,8 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "mouse", "Steering with the mouse", "Steer and control the pedals using the mouse"),
         switch_row(app, "mouse_right", "A right click ends the mouse steering", "As in OMSI; off: the right button only looks round"),
         slider_row(app, "mouse_sens", "Mouse steering sensitivity", "Adjust how much the steering wheel turns based on mouse movement", &pct),
+        slider_row(app, "mouse_pedal_strength", "Mouse pedal strength", "Adjust how much mouse travel is needed to reach full throttle or braking", &|v| if (v - 1.0).abs() < 0.01 { "OMSI".to_string() } else { format!("{:.0}%", v * 100.0) }),
+        switch_row(app, "mouse_smooth", "Smooth mouse steering", "The wheel eases after the cursor; off: it follows at once, as in OMSI"),
         switch_row(app, "steering_linear", "Steering linearity (keys at OMSI's steady pace)", "Keyboard steering at OMSI's steady pace"),
         switch_row(app, "old_steering", "Old Steering (the wheel stays, turn it back yourself)", "The wheel stays where the keys left it"),
         switch_row(app, "red_steer_spd", "Dynamic steering (slower keys at speed, OMSI's redSteerSpd)", "The steering keys act slower at speed"),
@@ -1844,7 +2554,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "blinker_cancel", "Indicators cancel themselves", "The bus's script turns the indicator off after a turn; off: it stays on until you turn it off"),
         switch_row(app, "brake_hold", "Keyboard brake stays on", "Keep the brake applied until the throttle is pressed"),
         switch_row(app, "auto_clutch", "Automatic clutch", "Automatically operate the clutch for you"),
-        switch_row(app, "momentary_gears", "Hold manual gear buttons (release returns to neutral)", later),
+        switch_row(app, "momentary_gears", "H-pattern shifter: return to neutral when the gear is released", "For a manual shifter without a neutral button; releasing a gear selects neutral immediately"),
         switch_row(app, "auto_shift", "Automated manual gearbox", "Shift a manual gearbox's gears for you by the engine speed"),
     ]
         .into_iter()
@@ -1859,6 +2569,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "tooltips", "Name of the button under the mouse", "Shows the name of what the cursor points at"),
         switch_row(app, "notes", "Notes in the top-left corner", "Why the vehicle does not move, the change due, what a service did"),
         switch_row(app, "chat", "Chat in online games", "Shows the chat of a LAN session"),
+        slider_row(app, "chat_size", "Chat size", "The chat's texts on top of the interface size (also Ctrl + the mouse wheel over the chat)", &pct),
         switch_row(app, "name_tags", "Other players' names above their buses", "Shows the names of the other players"),
         Some(opens("Reset all settings...", "Everything but the language, the key bindings and the game folder goes back to how it came", "reset")),
     ]
@@ -1898,14 +2609,14 @@ fn vehicle_pages(app: &App) -> Vec<Page> {
         display.push(opens("Driver", "Change the current driver profile", "driver"));
     }
     let mut fleet: Vec<(String, String)> = Vec::new();
-    if has || !app.placed.is_empty() {
+    if has || !app.session.placed.is_empty() {
         fleet.push(button("Drive the next vehicle", "Switch", "Take the wheel of another vehicle standing in the world", "switch"));
     }
     fleet.push(opens("Place a vehicle", "Place a vehicle of your choice", "place"));
     if has {
         fleet.push(button("Couple", "Couple", "Couple the vehicle to the one in front of or behind it", "couple"));
         fleet.push(button("Uncouple", "Uncouple", "Separate the coupled vehicles", "uncouple"));
-        if app.on_foot.is_none() {
+        if app.session.on_foot.is_none() {
             fleet.push(button("Get up and out", "Get out", "Step out of your car and explore the world", "getout"));
         }
         fleet.push(button("Remove this vehicle", "Remove", "Removes the current vehicle", "remove"));
@@ -1914,7 +2625,7 @@ fn vehicle_pages(app: &App) -> Vec<Page> {
         fleet.push(button("Swap for another vehicle", "Swap", "Put another vehicle in this one's place and drive it", "swap"));
         fleet.push(button("Reload this vehicle", "Reload", "Read the vehicle's files again (.bus, model and sound configuration, scripts) and drive it from here", "reload"));
     }
-    if !app.placed.is_empty() {
+    if !app.session.placed.is_empty() {
         fleet.push(button("Remove the placed vehicles", "Remove", "Removes all vehicles you've placed from the world", "clearplaced"));
     }
     let mut service: Vec<(String, String)> = Vec::new();
@@ -1923,7 +2634,7 @@ fn vehicle_pages(app: &App) -> Vec<Page> {
         service.push(button("Wash", "Wash", "Cleans the current vehicle", "wash"));
         service.push(button("Repair", "Repair", "Repairs the current vehicle", "repair"));
         service.push(button("Put back on its wheels", "Reset", "Return the vehicle to an upright position", "reset"));
-        if !server && app.navigator.is_some() {
+        if !server && app.menus.navigator.is_some() {
             service.push(button("Move on the map", "Pick", "Teleports you to any location on the map", "teleport"));
             service.push(opens("Teleport to a start point", "Teleport to a starting point on the map", "tplist"));
         }
@@ -1932,7 +2643,7 @@ fn vehicle_pages(app: &App) -> Vec<Page> {
 }
 
 fn world_pages(app: &App) -> Vec<Page> {
-    let client = app.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client);
+    let client = app.net.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client);
     let pct = |v: f32| format!("{:.0} %", v * 100.0);
     let mut time: Vec<(String, String)> = Vec::new();
     let mut weather: Vec<(String, String)> = Vec::new();
@@ -1948,7 +2659,7 @@ fn world_pages(app: &App) -> Vec<Page> {
             time.push((row("Date and time", 'i', &text, "Synchronized with the real time", None), "noop".to_string()));
         } else {
             // the exact time: typed as hours, minutes and seconds
-            match app.menu_edit.as_ref() {
+            match app.menus.menu_edit.as_ref() {
                 Some(d) => {
                     let mut c: Vec<char> = d.chars().collect();
                     c.resize(6, '_');
@@ -1965,24 +2676,24 @@ fn world_pages(app: &App) -> Vec<Page> {
             for (name, hm, secs) in [("Morning", "06:00", 6 * 3600), ("Noon", "12:00", 12 * 3600), ("Evening", "18:00", 18 * 3600), ("Night", "23:00", 23 * 3600)] {
                 time.push(button(name, hm, "Jump to this time of day.", &format!("clock_set {secs}")));
             }
-            if let (Some(_), Some(p)) = (app.duty.as_ref(), app.player.as_ref()) {
+            if let (Some(_), Some(p)) = (app.session.duty.as_ref(), app.player.as_ref()) {
                 let d = p.vehicle.host.tt_delay as f64;
                 if d.abs() >= 1.0 {
                     let text = format!("{}{}:{:02}", if d < 0.0 { "−" } else { "+" }, (d.abs() / 60.0) as i64, d.abs() as i64 % 60);
                     time.push(button("On time with the timetable", &text, "Move the clock so that the vehicle is on time", "clock_ontime"));
                 }
             }
-            if app.lan.is_none() {
+            if app.net.lan.is_none() {
                 time.extend(slider_row(app, "speed", "Time speed", "How fast the world's clock runs", &|v| format!("x{v}")));
             }
         }
         weather.extend(switch_row(app, "metar_sync", "METAR sync", "The weather follows the real METAR report"));
         let src = if app.settings.metar_station.is_empty() { format!("{} ({})", app.metar_station(), omsi_ui::tr("automatic")) } else { app.metar_station() };
         weather.push((row("METAR source", 'o', &src, "The airport used for real weather.", None), "metar_src".to_string()));
-        let typed=if app.menu_edit_icao{
-            let mut s=app.menu_edit.clone().unwrap_or_default(); while s.len()<4{s.push('_');} format!("{s}  (typing)")
+        let typed=if app.menus.menu_edit_icao{
+            let mut s=app.menus.menu_edit.clone().unwrap_or_default(); while s.len()<4{s.push('_');} format!("{s}  (typing)")
         }else{app.metar_station()};
-        weather.push((row("ICAO",if app.menu_edit_icao{'E'}else{'e'},&typed,"Enter any 4-letter ICAO station.",None),"metar_icao_edit".to_string()));
+        weather.push((row("ICAO",if app.menus.menu_edit_icao{'E'}else{'e'},&typed,"Enter any 4-letter ICAO station.",None),"metar_icao_edit".to_string()));
         if app.metar_locked() {
             weather.push(button("METAR report", "Refresh now", "Fetch the selected station again without waiting for the next automatic update.", "metar_refresh"));
         } else {
@@ -1992,18 +2703,18 @@ fn world_pages(app: &App) -> Vec<Page> {
         if !app.metar_locked() {
             weather.push(button("Custom weather", "Edit current", "Freeze the weather currently in force and edit it as a custom weather.", "weather_custom"));
         }
-        let cloud = app.weather.as_ref().and_then(|w| cloud_index(&w.clouds.0)).map(|i| CLOUD_TYPES[i].1.to_string()).or_else(|| app.weather.as_ref().map(|w| w.clouds.0.trim().to_string())).unwrap_or_default();
+        let cloud = app.session.weather.as_ref().and_then(|w| cloud_index(&w.clouds.0)).map(|i| CLOUD_TYPES[i].1.to_string()).or_else(|| app.session.weather.as_ref().map(|w| w.clouds.0.trim().to_string())).unwrap_or_default();
         weather.push((row("Clouds", 'o', &cloud, "The kind of clouds in the sky.", None), "cloudkind".to_string()));
         weather.extend(slider_row(app, "visibility", "Visibility", "How far one can see; less is fog.", &|v| if v >= 1000.0 { format!("{:.1} km", v / 1000.0) } else { format!("{} m", v as i64) }));
         weather.extend(slider_row(app,"brightness","Brightness","Brightness of the custom weather lighting.",&|v|format!("{:.0} %",v*100.0)));
-        let kind = app.weather.as_ref().map(|w| (w.precip.first().copied().unwrap_or(0.0).max(0.0) as usize).min(PRECIP_KINDS.len() - 1)).unwrap_or(0);
+        let kind = app.session.weather.as_ref().map(|w| (w.precip.first().copied().unwrap_or(0.0).max(0.0) as usize).min(PRECIP_KINDS.len() - 1)).unwrap_or(0);
         weather.push((row("Precipitation", 'o', PRECIP_KINDS[kind], "Rain or snow.", None), "precipkind".to_string()));
         weather.extend(slider_row(app, "rain_amt", "Precipitation strength", "How hard it rains or snows.", &pct));
         weather.extend(slider_row(app, "wet", "Wet roads", "How wet the roads are now (they dry in the sun, wet in the rain).", &pct));
         weather.extend(switch_row(app,"snow_cover","Snow cover","Snow lying on the world and ground."));
         weather.extend(switch_row(app,"snow_road","Snow on road","Treat the road surface as snow-covered."));
         climate.extend(slider_row(app, "temp", "Temperature", "The air temperature.", &|v| format!("{} °C", v as i64)));
-        let dew_temp=app.weather.as_ref().map(|w|w.temp.0).unwrap_or(15.0);
+        let dew_temp=app.session.weather.as_ref().map(|w|w.temp.0).unwrap_or(15.0);
         climate.extend(slider_row(app,"humidity","Humidity","Relative humidity of the air.",&|v|format!("{:.0} % · dew {:.0} °C",v,crate::weather_setup::dew_point_c(dew_temp,v))));
         climate.extend(slider_row(app, "wind_speed", "Wind speed", "How fast the wind blows; it drives the clouds.", &|v| format!("{} m/s", v as i64)));
         climate.extend(slider_row(app, "wind_dir", "Wind direction", "The direction of the wind in degrees (0 is north).", &|v| format!("{}°", v as i64)));
@@ -2016,6 +2727,9 @@ fn world_pages(app: &App) -> Vec<Page> {
     }
     let mut people: Vec<(String, String)> = Vec::new();
     people.extend(slider_row(app, "traffic", "Traffic", "How many vehicles drive around the map.", &|v| format!("{} vehicles", v as i64)));
+    if !client && app.session.traffic.is_some() {
+        people.push(button("Clear AI traffic", "Clear", "Remove the current AI cars from the road; random traffic will return automatically.", "traffic_clear"));
+    }
     people.extend(slider_row(app, "pax", "Passengers", "How many passengers wait at the stops and ride.", &pct));
     vec![("Time", time), ("Weather", weather), ("Temperature and wind", climate), ("Traffic and people", people), ("Tools", tools)]
 }
@@ -2026,11 +2740,19 @@ fn pages_of(app: &App, kind: &ListKind) -> Option<(Vec<Page>, usize)> {
         ListKind::Options(t) => (options_pages(app), *t),
         ListKind::Vehicle(t) => (vehicle_pages(app), *t),
         ListKind::World(t) => (world_pages(app), *t),
+        ListKind::Controls => (vec![("Controls", items(app, kind))], 0),
+        ListKind::Keyboard(tab) => (keyboard_pages(app), *tab),
+        ListKind::ControllerDevices(_) | ListKind::Controller(..) | ListKind::ControllerAxis(..) | ListKind::ControllerButtonSettings(..) => crate::game_controller_menu::pages(app, kind)?,
         _ => return None,
     };
     let pages: Vec<Page> = pages.into_iter().filter(|p| !p.1.is_empty()).collect();
     let tab = tab.min(pages.len().saturating_sub(1));
     Some((pages, tab))
+}
+
+/// Which tab of the Options window is the one titled `title` (the first if none is).
+pub(crate) fn options_tab(app: &App, title: &str) -> usize {
+    pages_of(app, &ListKind::Options(0)).and_then(|(pages, _)| pages.iter().position(|p| p.0 == title)).unwrap_or(0)
 }
 
 type TitlesCache = Option<(ListKind, bool, std::time::Instant, (Vec<String>, usize))>;
@@ -2127,6 +2849,24 @@ static SETTINGS_CACHE: std::sync::Mutex<Option<serde_json::Value>> = std::sync::
 
 /// Write one key of `~/.openomsi/settings.cfg` (the launcher's file; the other lines
 /// stay as they are). The write is delayed a moment and joined with the ones that follow.
+/// The key the seat of the player's bus is kept under (`settings::bus_seats`): its `.bus`
+/// file, relative to the installation where it lies in it.
+pub(crate) fn seat_key(p: &crate::player::Player) -> String {
+    // (from its `Vehicles` folder on, so that a copy of the installation finds it)
+    let path = p.vehicle.ty.def.path.to_string_lossy().replace('\\', "/");
+    match path.to_ascii_lowercase().rfind("/vehicles/") {
+        Some(i) => path[i + 1..].to_string(),
+        None => path,
+    }
+}
+
+/// The seat as the menu has it now, kept for the player's bus.
+fn remember_bus_seat(app: &App) {
+    if let Some(p) = app.player.as_ref() {
+        crate::settings::bus_seats::remember(&seat_key(p), app.settings.seat, app.settings.seat_pitch_deg);
+    }
+}
+
 pub(crate) fn remember_setting(key: &str, value: &str) {
     {
         let mut p = PENDING_SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2191,16 +2931,16 @@ fn driver_names(app: &App) -> Vec<String> {
 /// Go on with another driver: this run so far into the old personnel file, the rest into
 /// the new one.
 fn switch_driver(app: &mut App, name: &str) {
-    if app.career.path.is_some() {
-        if let Err(e) = app.career.save() {
+    if app.session.career.path.is_some() {
+        if let Err(e) = app.session.career.save() {
             log::warn!("writing the personnel file: {e}");
         }
     }
     let rel = format!("Drivers/{name}.odr");
     let mut next = crate::career::Career::load(&app.args.root, &rel);
     // (the distance and the clock of the run go on; the counters start with the new file)
-    next.seconds = app.career.seconds;
-    app.career = next;
+    next.seconds = app.session.career.seconds;
+    app.session.career = next;
     app.args.driver = Some(rel);
     app.service_msg = Some((format!("Driver: {name}"), 3.0));
 }
@@ -2220,28 +2960,18 @@ fn fleet_numbers(v: &omsi_sim::VehicleInstance) -> Vec<(String, String)> {
 /// Take on line `line`, tour `tour` from now: the duty, and the IBIS typed for it.
 /// The tour on row `k` of the open list of tours: (line, tour).
 pub(crate) fn tour_at(app: &App, k: usize) -> Option<(String, String)> {
-    let action = app.admin_list.as_ref()?.get(k)?.1.strip_prefix("tour ")?;
+    let action = app.menus.admin_list.as_ref()?.get(k)?.1.strip_prefix("tour ")?;
     let (line, tour) = action.split_once('\u{1}')?;
     Some((line.to_string(), tour.to_string()))
-}
-
-/// The time (seconds of the day) tour `tour` of line `line` starts.
-pub(crate) fn tour_start_of(app: &App, line: &str, tour: &str) -> f64 {
-    app.schedule
-        .as_ref()
-        .and_then(|s| s.data.lines.iter().find(|l| l.name == line))
-        .and_then(|l| l.tours.iter().find(|t| t.number == tour))
-        .and_then(tour_start)
-        .unwrap_or(0.0)
 }
 
 /// For the tour on row `k`: how many stops its chosen trip has, the stop chosen to start
 /// from, the trip chosen and how many trips the tour has.
 pub(crate) fn tour_choice(app: &App, k: usize) -> Option<(usize, usize, usize, usize)> {
     let (line, tour) = tour_at(app, k)?;
-    let sch = app.schedule.as_ref()?;
+    let sch = app.session.schedule.as_ref()?;
     let trips = sch.tour_trip_count(&line, &tour);
-    let (stop, trip) = match app.list_kind.as_ref() {
+    let (stop, trip) = match app.menus.list_kind.as_ref() {
         Some(ListKind::Tours(_, Some(p))) if p.0 == tour => (p.1, p.2),
         _ => (0, sch.tour_trip_now(&line, &tour, app.clock.time)),
     };
@@ -2254,12 +2984,13 @@ pub(crate) fn tour_choice(app: &App, k: usize) -> Option<(usize, usize, usize, u
 /// by its time): the duty goes on from that stop, the bus stays where it is.
 pub(crate) fn start_duty_at(app: &mut App, line: &str, tour: &str, trip: usize, chosen: usize) {
     let now = app.clock.time;
-    let at = tour_start_of(app, line, tour);
-    let Some((k, j)) = app.schedule.as_ref().and_then(|s| s.tour_trip_stops(line, tour, trip).get(chosen).map(|x| (x.0, x.1))) else {
+    let Some((k, j)) = app.session.schedule.as_ref().and_then(|s| s.tour_trip_stops(line, tour, trip).get(chosen).map(|x| (x.0, x.1))) else {
         return start_duty(app, line, tour);
     };
-    let (Some(w), Some(sch)) = (app.world.clone(), app.schedule.as_mut()) else { return };
-    let mut d = match sch.player_duty(&w, line, tour, at, None, false) {
+    let (Some(w), Some(sch)) = (app.world.clone(), app.session.schedule.as_mut()) else { return };
+    // (the duty is made at the time it is now, as `start_duty` does: a night tour picked
+    // after midnight is then yesterday's, under way, not tonight's)
+    let mut d = match sch.player_duty(&w, line, tour, now, None, false) {
         Ok(d) => d,
         Err(e) => {
             app.service_msg = Some((format!("No duty: {e}"), 8.0));
@@ -2281,12 +3012,12 @@ pub(crate) fn start_duty_at(app: &mut App, line: &str, tour: &str, trip: usize, 
     }
     app.args.line = Some(line.to_string());
     app.args.tour = Some(tour.to_string());
-    app.duty = Some(d);
+    app.session.duty = Some(d);
     app.service_msg = Some((format!("Line {line}, tour {}", tour.trim()), 4.0));
 }
 
 fn start_duty(app: &mut App, line: &str, tour: &str) {
-    let (Some(w), Some(sch)) = (app.world.clone(), app.schedule.as_mut()) else { return };
+    let (Some(w), Some(sch)) = (app.world.clone(), app.session.schedule.as_mut()) else { return };
     let now = app.clock.time;
     match sch.player_duty(&w, line, tour, now, None, false) {
         Ok(mut d) => {
@@ -2305,7 +3036,7 @@ fn start_duty(app: &mut App, line: &str, tour: &str) {
             }
             app.args.line = Some(line.to_string());
             app.args.tour = Some(tour.to_string());
-            app.duty = Some(d);
+            app.session.duty = Some(d);
             app.service_msg = Some((format!("Line {line}, tour {}", tour.trim()), 4.0));
         }
         Err(e) => app.service_msg = Some((format!("No duty: {e}"), 8.0)),
@@ -2315,6 +3046,90 @@ fn start_duty(app: &mut App, line: &str, tour: &str) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn searches_model_and_hof_names_and_paths_without_losing_their_actions() {
+        assert!(super::search_matches("Volvo BRT", "bus Vehicles/Pack/biarticulado.bus", "VOLVO biarticulado"));
+        assert!(super::search_matches("Curitiba", "hof Vehicles/Bus/curitiba.hof", "curitiba .hof"));
+        assert!(!super::search_matches("Curitiba", "hof curitiba.hof", "recife"));
+        assert!(super::search_matches("Anything", "bus x.bus", "  "));
+    }
+
+    /// The options page names the preset a file holds after the launcher saved it, in every
+    /// graphics mode, and "Custom" once one of its values is changed.
+    #[test]
+    fn the_preset_is_recognised_in_every_mode() {
+        for mode in ["vanilla", "vanilla_plus", "enhanced", "enhanced_plus"] {
+            for (i, (_, preset)) in omsi_launcher_lib::graphics_presets_for(mode).into_iter().enumerate() {
+                let mut file = omsi_launcher_lib::settings_from_text(None);
+                omsi_launcher_lib::apply_graphics_profile(&preset, &mut file);
+                let mut file = omsi_launcher_lib::settings_from_text(Some(&omsi_launcher_lib::settings_to_text(&file, None)));
+                assert_eq!(super::preset_now(&file), Some(i), "{mode}: {i}");
+                file["mirror_size"] = serde_json::json!(1024);
+                assert_eq!(super::preset_now(&file), None);
+            }
+        }
+    }
+
+    /// A destination picked from the list keeps the route number the bus shows, its letter
+    /// too (92E, IBIS 92 and suffix 10).
+    #[test]
+    fn a_destination_picked_from_the_list_keeps_the_lines_letter() {
+        let mut v = crate::schedule::tests::script_test_vehicle("{frame}\n{end}\n", "IBIS_LinieKurs\nIBIS_Linie_Suffix\nIBIS_Linie_Complex\nIBIS_TerminusCode\n", "Matrix_Nr\nSetLineTo\n");
+        let set_str = |v: &mut omsi_sim::VehicleInstance, name: &str, s: &str| {
+            let i = v.ty.program.str_var(name).unwrap();
+            v.state.str_vars[i as usize] = s.to_string();
+        };
+        v.set_var("IBIS_LinieKurs", 92.0);
+        v.set_var("IBIS_Linie_Suffix", 10.0);
+        v.set_var("IBIS_Linie_Complex", 9210.0);
+        set_str(&mut v, "Matrix_Nr", "92E");
+        assert_eq!(super::destination_line(&v), "92E");
+        let hof = omsi_vehicle::Hof { termini: vec![omsi_vehicle::hof::Terminus { code: 211, texture_id: "U Rathaus Spandau".into(), strings: vec!["RATHAUS SPANDAU".into()], ..Default::default() }], ..Default::default() };
+        let line = super::destination_line(&v);
+        crate::schedule::set_player_destination_at(&mut v, &hof, &line, 0, &[]);
+        assert_eq!((v.var("IBIS_LinieKurs"), v.var("IBIS_Linie_Suffix"), v.var("IBIS_Linie_Complex"), v.var("IBIS_TerminusCode")), (Some(92.0), Some(10.0), Some(9210.0), Some(211.0)));
+        // a route number the IBIS cannot take is left to the display: the IBIS keeps its own
+        set_str(&mut v, "Matrix_Nr", "-10");
+        assert_eq!(super::destination_line(&v), "92");
+        // nothing shown: the IBIS's number
+        set_str(&mut v, "Matrix_Nr", "   ");
+        set_str(&mut v, "SetLineTo", "");
+        assert_eq!(super::destination_line(&v), "92");
+        // no matrix line, the line of an earlier pick left in SetLineTo and another typed on
+        // the IBIS since: the IBIS's (only a roller blind shows SetLineTo)
+        set_str(&mut v, "Matrix_Nr", "");
+        set_str(&mut v, "SetLineTo", "5");
+        v.set_var("IBIS_LinieKurs", 145.0);
+        assert_eq!(super::destination_line(&v), "145");
+        let mut blind = crate::schedule::tests::script_test_vehicle("{trigger:rollband_sync}\n{end}\n", "IBIS_LinieKurs\n", "SetLineTo\n");
+        set_str(&mut blind, "SetLineTo", "  5");
+        blind.set_var("IBIS_LinieKurs", 145.0);
+        assert_eq!(super::destination_line(&blind), "5");
+    }
+
+    #[test]
+    fn escape_fov_updates_the_active_projection_and_can_restore_geometry() {
+        let mut settings = crate::settings::Settings::default();
+        assert_eq!(super::set_camera_fov(&mut settings, 50.0).0, "fov");
+        settings.triple.enabled = true;
+        assert_eq!(
+            super::set_camera_fov(&mut settings, 75.0).0,
+            "triple_fov_deg"
+        );
+        assert_eq!(settings.fov, 50.0);
+        assert_eq!(settings.triple.fov_deg, 75.0);
+        super::set_camera_fov(&mut settings, 0.0);
+        assert_eq!(settings.triple.fov_deg, 0.0);
+    }
+    /// The game menu offers the 16x anisotropic filtering the launcher does (#669): set
+    /// there, it showed as a bare "16" here and could not be chosen again.
+    #[test]
+    fn sixteen_x_anisotropy_can_be_chosen_in_the_game_menu() {
+        let file = serde_json::json!({ "anisotropy": 16 });
+        let (options, at, _) = super::select_state(&file, "anisotropy");
+        assert_eq!(at.map(|i| options[i]), Some(("16", "16x")));
+    }
+
+    #[test]
     fn steps_wrap_round() {
         assert_eq!(super::next_step(&super::SPEEDS, 1.0), 2.0);
         assert_eq!(super::next_step(&super::SPEEDS, 15.0), 1.0);
@@ -2322,9 +3137,27 @@ mod tests {
     }
 
     #[test]
+    fn mouse_pedal_strength_steps_include_percentage_range_and_omsi_default() {
+        let steps = super::steps_of("mouse_pedal_strength").unwrap();
+        assert_eq!(steps.first(), Some(&0.5));
+        assert_eq!(steps.last(), Some(&2.0));
+        assert!(steps.contains(&1.0));
+    }
+
+    #[test]
     fn lines_sort_as_numbers() {
         let mut v = vec!["13N", "5", "137", "N30", "92"];
         v.sort_by(|a, b| super::natural(a, b));
         assert_eq!(v, vec!["5", "13N", "92", "137", "N30"]);
+    }
+
+    #[test]
+    fn symbols_are_not_forced_through_numeric_ibis_lines() {
+        assert!(super::numeric_ibis_line("10"));
+        assert!(super::numeric_ibis_line("10E"));
+        assert!(super::numeric_ibis_line("X10"));
+        assert!(!super::numeric_ibis_line("-10"));
+        assert!(!super::numeric_ibis_line("10-"));
+        assert!(!super::numeric_ibis_line("EXP"));
     }
 }

@@ -36,7 +36,7 @@ pub(crate) fn is_omsi_root(p: &Path) -> bool {
 pub(crate) fn fatal_dialog(title: &str, text: &str) {
     log::error!("{title}: {text}");
     // started from a terminal (the message is right there) or by a test harness
-    if std::io::IsTerminal::is_terminal(&std::io::stderr()) || omsi_cfg::env::var_os("OMSI_BACKGROUND").is_some() {
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) || omsi_cfg::flags::OMSI_BACKGROUND.is_set() {
         return;
     }
     #[cfg(target_os = "macos")]
@@ -100,7 +100,7 @@ pub(crate) fn own_bindings(root: &Path, modifier: i32) -> std::collections::Hash
 }
 
 pub(crate) fn content_dir() -> Option<PathBuf> {
-    if let Some(d) = omsi_cfg::env::var_os("OMSI_CONTENT") {
+    if let Some(d) = omsi_cfg::flags::OMSI_CONTENT.os() {
         return Some(PathBuf::from(d));
     }
     let exe = std::env::current_exe().ok()?;
@@ -112,7 +112,7 @@ pub(crate) fn content_dir() -> Option<PathBuf> {
         dir
     };
     let cand = omsi_cfg::content_folder_of(&dir);
-    if (cand.exists() || std::fs::create_dir_all(&cand).is_ok()) && omsi_cfg::is_writable(&cand) {
+    if !omsi_cfg::is_programs_folder(&cand) && (cand.exists() || std::fs::create_dir_all(&cand).is_ok()) && omsi_cfg::is_writable(&cand) {
         Some(cand)
     } else {
         let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
@@ -120,6 +120,15 @@ pub(crate) fn content_dir() -> Option<PathBuf> {
         let _ = omsi_cfg::ensure_content_layout(&fallback);
         Some(fallback)
     }
+}
+
+/// Where a save goes when the content folder takes none (`~/.openomsi/content`): a game
+/// unpacked into Program Files, or a folder Windows' controlled folder access guards, said
+/// "Could not save: access is denied (os error 5)" (#1673). The launcher lists the saves
+/// there as well.
+pub(crate) fn save_fallback_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".openomsi").join("content"))
 }
 
 /// Where the last working installation was remembered.
@@ -131,7 +140,7 @@ pub(crate) fn root_memo() -> Option<PathBuf> {
 /// Find the OMSI 2 installation without being told where it is.
 pub(crate) fn find_root() -> Option<PathBuf> {
     let mut first: Vec<PathBuf> = Vec::new();
-    if let Some(p) = omsi_cfg::env::var_os("OMSI_ROOT").map(PathBuf::from) {
+    if let Some(p) = omsi_cfg::flags::OMSI_ROOT.os().map(PathBuf::from) {
         first.push(p);
     }
     if let Some(memo) = root_memo() {
@@ -159,55 +168,136 @@ pub(crate) fn graphics_instance() -> wgpu::Instance {
         descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
         return wgpu::Instance::new(descriptor);
     }
-    let mut last = None;
+    descriptor.backend_options.gl.context_lock_timeout = Some(GL_CONTEXT_LOCK_TIMEOUT);
+    // (an interface whose only adapter is a software renderer - DirectX 12's "Microsoft
+    // Basic Render Driver" on a chip without a DirectX 12 driver - comes after the others)
+    let (mut software, mut last) = (None, None);
     for b in backend_order() {
         let instance = backend_instance(b);
-        let adapters = pollster::block_on(instance.enumerate_adapters(b));
-        if !adapters.is_empty() {
+        let adapters = pollster::block_on(instance.enumerate_adapters(b.backends()));
+        if adapters.iter().any(|a| !is_software(&a.get_info())) {
             log::info!("graphics: {:?} ({})", b, adapters.iter().map(|a| a.get_info().name).collect::<Vec<_>>().join(", "));
             return instance;
         }
-        log::info!("graphics: no {b:?} adapter here");
-        last = Some(instance);
+        if adapters.is_empty() {
+            log::info!("graphics: no {b:?} adapter here");
+            last = Some(instance);
+        } else {
+            log::info!("graphics: {b:?} has only a software renderer ({})", adapters.iter().map(|a| a.get_info().name).collect::<Vec<_>>().join(", "));
+            software.get_or_insert(instance);
+        }
     }
-    last.unwrap_or_else(|| wgpu::Instance::new(descriptor))
+    software.or(last).unwrap_or_else(|| wgpu::Instance::new(descriptor))
+}
+
+/// How long a thread waits for the shared OpenGL context before wgpu gives up on it (its own
+/// default is a second with WGL, six with EGL): one waiting for the GPU no longer holds the
+/// context, but a long upload or shader compile on another thread still can.
+const GL_CONTEXT_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A graphics interface to try: one of wgpu's backends, or its OpenGL ES backend on ANGLE.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GraphicsApi {
+    Native(wgpu::Backends),
+    /// OpenGL ES on ANGLE's Direct3D 11 renderer (Windows only), for a chip whose OpenGL,
+    /// Vulkan and DirectX 12 drivers are missing or broken (Intel HD Graphics 2000-4000, AMD
+    /// Radeon HD 5000/6000): its DirectX 11 driver draws
+    Angle,
+}
+
+impl GraphicsApi {
+    /// wgpu's backend it draws on (ANGLE: the OpenGL one)
+    fn backends(self) -> wgpu::Backends {
+        match self {
+            GraphicsApi::Native(b) => b,
+            GraphicsApi::Angle => wgpu::Backends::GL,
+        }
+    }
+}
+
+// (the logs name a backend as before: `Backends(DX12)`)
+impl std::fmt::Debug for GraphicsApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphicsApi::Native(b) => b.fmt(f),
+            GraphicsApi::Angle => f.write_str("ANGLE (DirectX 11)"),
+        }
+    }
+}
+
+/// Is ANGLE there to be tried: on Windows, with Google's `libEGL.dll` and `libGLESv2.dll`
+/// next to the game (the package brings them; without them it is left out, with a line in
+/// the log once).
+fn angle_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if !cfg!(windows) {
+            return false;
+        }
+        let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else { return false };
+        let missing: Vec<&str> = ["libEGL.dll", "libGLESv2.dll"].into_iter().filter(|f| !dir.join(f).is_file()).collect();
+        if !missing.is_empty() {
+            log::info!("graphics: ANGLE (DirectX 11) is not tried: no {} next to the game", missing.join(" or "));
+        }
+        missing.is_empty()
+    })
 }
 
 /// The graphics interfaces in the order they are tried: Metal on a Mac; on Windows DirectX
 /// 12 first (the Windows drivers' best-kept path: on Vulkan they reset the device -
 /// "the graphics device was lost" - far more often), then Vulkan, then OpenGL for a card
-/// without either (a GeForce GT 530); elsewhere Vulkan, then OpenGL. Settings → Graphics API
-/// (`graphics_api`) or OMSI_BACKEND=vulkan|dx12|gl puts one first: a driver whose Vulkan
-/// misbehaves is got round.
-pub(crate) fn backend_order() -> Vec<wgpu::Backends> {
+/// without either (a GeForce GT 530), then OpenGL ES on ANGLE over DirectX 11 when its DLLs
+/// are there; elsewhere Vulkan, then OpenGL. Settings → Graphics API (`graphics_api`) or
+/// OMSI_BACKEND=vulkan|dx12|gl|angle puts one first: a driver whose Vulkan misbehaves is
+/// got round.
+pub(crate) fn backend_order() -> Vec<GraphicsApi> {
     if cfg!(target_os = "macos") {
-        return vec![wgpu::Backends::METAL];
+        return vec![GraphicsApi::Native(wgpu::Backends::METAL)];
     }
     let settings = crate::settings::Settings::load();
     // (the headset and DLSS need DirectX 12: Streamline and OpenXR take wgpu's D3D12 device)
     let wanted = if settings.vr_requested() || (cfg!(windows) && settings.dlss_mode().is_on()) {
         "dx12".to_owned()
     } else {
-        omsi_cfg::env::var("OMSI_BACKEND").ok().unwrap_or(settings.graphics_api)
+        omsi_cfg::flags::OMSI_BACKEND.var().map(str::to_string).unwrap_or(settings.graphics_api)
     };
-    let all: Vec<wgpu::Backends> = if cfg!(windows) {
+    let native = if cfg!(windows) {
         vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN, wgpu::Backends::GL]
     } else {
         vec![wgpu::Backends::VULKAN, wgpu::Backends::GL]
     };
+    let mut all: Vec<GraphicsApi> = native.into_iter().map(GraphicsApi::Native).collect();
+    if cfg!(windows) && angle_available() {
+        all.push(GraphicsApi::Angle);
+    }
     let first = match wanted.trim().to_ascii_lowercase().as_str() {
-        "vulkan" => Some(wgpu::Backends::VULKAN),
-        "dx12" | "directx" | "d3d12" if cfg!(windows) => Some(wgpu::Backends::DX12),
-        "gl" | "opengl" | "gles" => Some(wgpu::Backends::GL),
+        "vulkan" => Some(GraphicsApi::Native(wgpu::Backends::VULKAN)),
+        "dx12" | "directx" | "d3d12" if cfg!(windows) => Some(GraphicsApi::Native(wgpu::Backends::DX12)),
+        "gl" | "opengl" | "gles" => Some(GraphicsApi::Native(wgpu::Backends::GL)),
+        "angle" | "dx11" | "d3d11" if all.contains(&GraphicsApi::Angle) => Some(GraphicsApi::Angle),
         _ => None,
     };
     // (the one asked for first, the others after it: a machine without it still starts)
     first.into_iter().chain(all.into_iter().filter(|b| Some(*b) != first)).collect()
 }
 
-fn backend_instance(b: wgpu::Backends) -> wgpu::Instance {
+/// A renderer in software on the processor (wgpu calls it a CPU adapter: WARP, llvmpipe,
+/// SwiftShader).
+fn is_software(info: &wgpu::AdapterInfo) -> bool {
+    software_adapter(&info.name, info.device_type)
+}
+
+fn software_adapter(name: &str, device_type: wgpu::DeviceType) -> bool {
+    device_type == wgpu::DeviceType::Cpu || name.contains("Microsoft Basic Render Driver") || name.contains("llvmpipe")
+}
+
+fn backend_instance(api: GraphicsApi) -> wgpu::Instance {
     let mut d = wgpu::InstanceDescriptor::new_without_display_handle();
-    d.backends = b;
+    d.backend_options.gl.context_lock_timeout = Some(GL_CONTEXT_LOCK_TIMEOUT);
+    d.backends = api.backends();
+    if api == GraphicsApi::Angle {
+        d.backend_options.gl.platform = wgpu::GlPlatform::Angle;
+    }
     wgpu::Instance::new(d)
 }
 
@@ -224,41 +314,69 @@ pub(crate) fn window_renderer(
     options: omsi_render::RenderOptions,
 ) -> Result<Renderer> {
     let mut failures: Vec<String> = Vec::new();
-    // the instance made for the settings' interface first, then every interface in turn
-    let mut candidates: Vec<(Option<wgpu::Backends>, wgpu::Instance)> = vec![(None, instance.clone())];
-    for b in backend_order() {
-        candidates.push((Some(b), backend_instance(b)));
-    }
-    for (b, inst) in candidates {
-        let surface = match inst.create_surface(window.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                failures.push(format!("{}: no surface ({e})", b.map(|b| format!("{b:?}")).unwrap_or_else(|| "first choice".into())));
+    // The instance made for the settings' interface first, then every interface in turn -
+    // each made only when the ones before it could not draw. Made all at once, a Windows
+    // machine drawing on DirectX 12 loaded the Vulkan loader and its layers (Optimus,
+    // overlays) and made an OpenGL context for nothing, and when those were dropped right
+    // after the renderer was made, the game and the launcher went down ("[Vulkan Loader]
+    // vkDestroyFramebuffer: Invalid device", #1058, #1044) or hung (#746).
+    // A software renderer (DirectX 12's "Microsoft Basic Render Driver", llvmpipe) only
+    // when no graphics chip opens on any interface: an Intel HD 2500 has no DirectX 12
+    // driver, DirectX 12 listed that renderer alone, and the game "started" on it at a
+    // frame every few seconds instead of on the chip's OpenGL (#770).
+    let mut made: Vec<(Option<GraphicsApi>, wgpu::Instance)> = vec![(None, instance.clone())];
+    let mut order = backend_order().into_iter();
+    let mut no_surface: Vec<usize> = Vec::new();
+    for software_round in [false, true] {
+        let mut k = 0;
+        loop {
+            if k == made.len() {
+                let Some(b) = order.next() else { break };
+                log::info!("graphics: trying {b:?}");
+                made.push((Some(b), backend_instance(b)));
+            }
+            let (b, inst) = made[k].clone();
+            k += 1;
+            if no_surface.contains(&(k - 1)) {
                 continue;
             }
-        };
-        for adapter in Renderer::adapters_for(&inst, &surface) {
-            let info = adapter.get_info();
-            let what = format!("{} ({:?})", info.name, info.backend);
-            if failures.iter().any(|f| f.starts_with(&what)) {
-                continue;
-            }
-            match omsi_render::catch(|| pollster::block_on(Renderer::new_on(adapter, Some(&surface), None, options))) {
-                Some(Ok(r)) => {
-                    if !failures.is_empty() {
-                        log::warn!("graphics: drawing on {what}; before it {}", failures.join("; "));
+            let surface = match inst.create_surface(window.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    failures.push(format!("{}: no surface ({e})", b.map(|b| format!("{b:?}")).unwrap_or_else(|| "first choice".into())));
+                    no_surface.push(k - 1);
+                    continue;
+                }
+            };
+            for adapter in Renderer::adapters_for(&inst, &surface) {
+                let info = adapter.get_info();
+                if is_software(&info) != software_round {
+                    continue;
+                }
+                let what = format!("{} ({:?})", info.name, info.backend);
+                if failures.iter().any(|f| f.starts_with(&what)) {
+                    continue;
+                }
+                if software_round {
+                    log::warn!("graphics: no graphics chip could be opened; trying the software renderer {what} (a few frames a second at best)");
+                }
+                match omsi_render::catch(|| pollster::block_on(Renderer::new_on(adapter, Some(&surface), None, options))) {
+                    Some(Ok(r)) => {
+                        if !failures.is_empty() {
+                            log::warn!("graphics: drawing on {what}; before it {}", failures.join("; "));
+                        }
+                        drop(surface);
+                        *instance = inst;
+                        return Ok(r);
                     }
-                    drop(surface);
-                    *instance = inst;
-                    return Ok(r);
-                }
-                Some(Err(e)) => {
-                    log::warn!("graphics: {what} could not be opened: {e:#}");
-                    failures.push(format!("{what}: {e:#}"));
-                }
-                None => {
-                    log::warn!("graphics: {what} failed while being opened");
-                    failures.push(format!("{what}: failed while being opened"));
+                    Some(Err(e)) => {
+                        log::warn!("graphics: {what} could not be opened: {e:#}");
+                        failures.push(format!("{what}: {e:#}"));
+                    }
+                    None => {
+                        log::warn!("graphics: {what} failed while being opened");
+                        failures.push(format!("{what}: failed while being opened"));
+                    }
                 }
             }
         }
@@ -294,6 +412,12 @@ pub const VERSION: &str = env!("OPENOMSI_VERSION");
 /// middle: 1600 x 900 points at 125 % are 2000 x 1125 pixels, wider than a 1920 screen, and
 /// the window opened partly off it (#771). Where the system tells no screen (Wayland), the
 /// size as asked and no place.
+/// The game runs inside gamescope (a Steam Deck's Gaming Mode, a Steam Machine): one
+/// window, shown over the whole screen.
+pub(crate) fn under_gamescope() -> bool {
+    std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some() || std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.to_ascii_lowercase().contains("gamescope"))
+}
+
 pub(crate) fn fit_window(event_loop: &winit::event_loop::ActiveEventLoop, w: f64, h: f64) -> (winit::dpi::LogicalSize<f64>, Option<winit::dpi::PhysicalPosition<i32>>) {
     let Some(m) = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next()) else {
         return (winit::dpi::LogicalSize::new(w, h), None);
@@ -327,6 +451,9 @@ pub(crate) fn window_icon() -> Option<winit::window::Icon> {
 
 /// Enhanced graphics wanted (from the settings, `--enhanced`, or OMSI_ENHANCED=1).
 pub(crate) static ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Enhanced+ (ray tracing) asked for by `--enhanced-plus` or OMSI_ENHANCED_PLUS=1 whatever
+/// the settings say (see `Settings::render_options`).
+pub(crate) static ENHANCED_PLUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Vanilla graphics: the picture as OMSI 2 draws it (no Vanilla+ extras, see
 /// `omsi_render::Lighting::classic`).
 pub(crate) static CLASSIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -354,7 +481,7 @@ pub(crate) static CLOUDS: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 pub(crate) fn restart_with_allocator_settings() {
     use std::os::unix::process::CommandExt;
     if std::env::var_os("MallocLargeCache").is_some()
-        || omsi_cfg::env::var_os("OMSI_KEEP_ALLOCATOR").is_some()
+        || omsi_cfg::flags::OMSI_KEEP_ALLOCATOR.is_set()
     {
         return;
     }
@@ -400,6 +527,19 @@ mod own_key_tests {
 
 #[cfg(test)]
 mod window_tests {
+    use super::software_adapter;
+
+    /// The software renderers come after every graphics chip (#770).
+    #[test]
+    fn software_renderers_are_told_from_chips() {
+        use wgpu::DeviceType::*;
+        assert!(software_adapter("Microsoft Basic Render Driver", Cpu));
+        assert!(software_adapter("Microsoft Basic Render Driver", Other));
+        assert!(software_adapter("llvmpipe (LLVM 15.0.7, 256 bits)", Cpu));
+        assert!(!software_adapter("Intel(R) HD Graphics 2500", IntegratedGpu));
+        assert!(!software_adapter("NVIDIA GeForce RTX 3050 Laptop GPU", DiscreteGpu));
+    }
+
     #[test]
     fn the_window_fits_a_small_screen_and_sits_in_its_middle() {
         // 1920 x 1200 at 125 %: 1600 x 900 points would be 2000 px wide

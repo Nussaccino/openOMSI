@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 
 pub mod codepage;
+pub mod flags;
 mod keywords;
 pub mod number;
 pub mod vfs;
@@ -888,11 +889,12 @@ pub fn missing_original_essentials(root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The folders an OMSI 2 installation has (as the original spells them). A content
-/// folder of openOMSI is laid out the same way, so a mod is installed by putting its
-/// folders here - and the game finds them exactly as the original would.
+/// The top-level content folders openOMSI recognises. Most use OMSI 2's original spelling;
+/// `HOFs` is an openOMSI extension for depot files shared by every vehicle. A content
+/// folder is laid out with these names, so the mod installer and mounted archives can merge
+/// them into the same virtual installation.
 pub const CONTENT_FOLDERS: &[&str] = &[
-    "Vehicles", "maps", "Sceneryobjects", "Splines", "Texture", "Fonts", "Plugins", "TicketPacks", "Drivers", "Weather", "Announcements", "Humans", "Money", "Scripts", "Trains", "Situations", "Inputs", "Sound",
+    "Vehicles", "HOFs", "maps", "Sceneryobjects", "Splines", "Texture", "Fonts", "Plugins", "TicketPacks", "Drivers", "Weather", "Announcements", "Humans", "Money", "Scripts", "Trains", "Situations", "Inputs", "Sounds",
 ];
 
 /// Marker file of an openOMSI content folder (so it is never mistaken for the OMSI 2
@@ -946,6 +948,33 @@ pub fn content_folder_of(dir: &Path) -> PathBuf {
     }
 }
 
+/// A folder of programs - macOS's `/Applications` or `~/Applications`, where an
+/// openOMSI.app is usually copied to - is no place for the content folder: the game laid
+/// OMSI's folders (Vehicles, maps, Mods ...) out among the user's applications (#1043). The
+/// content folder then lives in the user's data folder instead - unless content was already
+/// installed there by an older version, which then stays where the player put it.
+pub fn is_programs_folder(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("Applications")) && !holds_content(dir)
+}
+
+/// Whether `dir` holds installed OMSI content: a vehicle or scenery folder with something in
+/// it, a map (a folder with its global.cfg - the game itself leaves only a `laststn.osn`
+/// there), or a mod beside the `Mods` folder's own README.
+fn holds_content(dir: &Path) -> bool {
+    let map = resolve_existing(dir, &["maps"]).and_then(|d| std::fs::read_dir(d).ok()).is_some_and(|mut it| {
+        it.any(|e| e.is_ok_and(|e| resolve_existing(&e.path(), &["global.cfg"]).is_some()))
+    });
+    let filled = |name: &str, skip: &[&str]| {
+        resolve_existing(dir, &[name]).and_then(|d| std::fs::read_dir(d).ok()).is_some_and(|mut it| {
+            it.any(|e| e.is_ok_and(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                !n.starts_with('.') && !skip.iter().any(|s| n.eq_ignore_ascii_case(s))
+            }))
+        })
+    };
+    map || ["Vehicles", "Sceneryobjects", "Splines"].iter().any(|n| filled(n, &[])) || filled("Mods", &["README.txt"])
+}
+
 /// Check if a directory is writable by attempting to create and remove a probe file.
 pub fn is_writable(dir: &Path) -> bool {
     let probe = dir.join(".openomsi-write-test");
@@ -957,6 +986,13 @@ pub fn is_writable(dir: &Path) -> bool {
 /// Create the content folder layout at `dir` (idempotent).
 pub fn ensure_content_layout(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
+    // (versions up to 0.2.9 made it `Sound`; OMSI 2's folder is `Sounds`)
+    let (old, new) = (dir.join("Sound"), dir.join("Sounds"));
+    if old.is_dir() && !new.exists() {
+        let _ = std::fs::rename(&old, &new);
+    } else if old.is_dir() {
+        let _ = std::fs::remove_dir(&old); // only when empty
+    }
     for f in CONTENT_FOLDERS {
         std::fs::create_dir_all(dir.join(f))?;
     }
@@ -982,6 +1018,23 @@ mod tests {
         assert!(is_writable(&tmp));
         let nonexistent = tmp.join("nonexistent_subfolder_xyz_123");
         assert!(!is_writable(&nonexistent));
+    }
+
+    #[test]
+    fn applications_folder_is_no_content_folder() {
+        assert!(is_programs_folder(Path::new("/Users/x/Applications")));
+        assert!(!is_programs_folder(Path::new("/Users/x/Games/openOMSI")));
+        // content an older version installed there stays in use
+        let dir = std::env::temp_dir().join(format!("omsi-apps-{}", std::process::id())).join("Applications");
+        std::fs::create_dir_all(dir.join("Mods")).unwrap();
+        std::fs::create_dir_all(dir.join("Vehicles")).unwrap();
+        std::fs::create_dir_all(dir.join("maps").join("Grundorf")).unwrap();
+        std::fs::write(dir.join("Mods").join("README.txt"), b"x").unwrap();
+        std::fs::write(dir.join("maps").join("Grundorf").join("laststn.osn"), b"x").unwrap();
+        assert!(is_programs_folder(&dir));
+        std::fs::create_dir_all(dir.join("Vehicles").join("MAN_SD200")).unwrap();
+        assert!(!is_programs_folder(&dir));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -1128,7 +1181,38 @@ pub mod env {
         C.get_or_init(Default::default)
     }
 
+    #[derive(Default)]
+    struct Fnv(u64);
+
+    impl std::hash::Hasher for Fnv {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            let mut h = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
+            for b in bytes {
+                h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+            self.0 = h;
+        }
+    }
+
+    type Local = std::cell::RefCell<HashMap<String, Option<OsString>, std::hash::BuildHasherDefault<Fnv>>>;
+
+    thread_local! {
+        static LOCAL: Local = Default::default();
+    }
+
     pub fn var_os(name: &str) -> Option<OsString> {
+        if let Some(v) = LOCAL.with(|l| l.borrow().get(name).cloned()) {
+            return v;
+        }
+        let v = shared(name);
+        LOCAL.with(|l| l.borrow_mut().insert(name.to_string(), v.clone()));
+        v
+    }
+
+    fn shared(name: &str) -> Option<OsString> {
         if let Some(v) = cache().read().ok().and_then(|c| c.get(name).cloned()) {
             return v;
         }

@@ -89,7 +89,47 @@ pub struct MaterialDef {
     /// `lightmap` is the last of them.
     pub lightmaps: Vec<(String, String)>,
     pub nightmap: Option<String>,
+    /// `[matl_glow] <texture> <value>`: the material is its own light. The named texture is a
+    /// **greyscale mask** of where and how much it shines (white full, black none) and the
+    /// light is the material's own colour; `value` is its strength on the LED panels' scale
+    /// (the `Led glow` setting's 16 levels: the shader's strength is `value * 0.25`, so 6 is
+    /// as bright as that setting's default and 20 brighter than its top). The mask takes the
+    /// light map's slot: a slot with a `[matl_lightmap]` keeps that and has no glow. An
+    /// openOMSI extension: Omsi.exe does not know the keyword, and the classic picture draws
+    /// the material as if it were not there.
+    pub glow: Option<(String, f32)>,
     pub allcolor: Option<[f32; 14]>,
+}
+
+impl MaterialDef {
+    /// Take what this block leaves unset from `base` (a `[matl_item]` over its slot's plain
+    /// `[matl]`).
+    pub fn inherit(&mut self, base: &MaterialDef) {
+        if !self.alpha_set && base.alpha_set {
+            self.alpha = base.alpha;
+            self.alpha_set = true;
+        }
+        self.no_z_write |= base.no_z_write;
+        self.no_z_check |= base.no_z_check;
+        if self.z_bias == 0 {
+            self.z_bias = base.z_bias;
+        }
+        macro_rules! opt {
+            ($($f:ident),*) => { $( if self.$f.is_none() { self.$f = base.$f.clone(); } )* };
+        }
+        opt!(envmap, envmap_mask, bumpmap, transmap, raindropmap, texcoord_trans_x, texcoord_trans_y, use_script_texture, use_text_texture, alphascale, freetex, nightmap, glow, allcolor);
+        self.envmap_realtime |= base.envmap_realtime;
+        if self.tex_address == TexAddress::Wrap {
+            self.tex_address = base.tex_address;
+            if self.border_color == [0.0; 4] {
+                self.border_color = base.border_color;
+            }
+        }
+        if self.lightmaps.is_empty() && !base.lightmaps.is_empty() {
+            self.lightmaps = base.lightmaps.clone();
+            self.lightmap = base.lightmap.clone();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -192,6 +232,16 @@ pub struct Spotlight {
     pub values: [f32; 12],
 }
 
+/// `[spotlight_2]` (openOMSI): a `[spotlight]`'s twelve numbers, then the variable that
+/// switches it (0 off, 1 full, a constant too) and a flag: 0 (or none) puts a twin lamp on
+/// the other side of the vehicle, mirrored across its axis, 1 keeps the one lamp.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Spotlight2 {
+    pub values: [f32; 12],
+    pub variable: String,
+    pub mirrored: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct InteriorLight {
     pub variable: String,
@@ -283,7 +333,11 @@ pub struct ParticleSystemDef {
 
 impl ParticleSystemDef {
     /// `[smoke]`: position, direction, then speed, its spread, frequency, lifetime, brake
-    /// factor, gravity, start size, growth, initial and final alpha, red, green, blue.
+    /// factor, gravity, start size, growth, initial alpha, a line Omsi.exe skips, red,
+    /// green, blue (the reader at 0x5f5e58: two lines on after the alpha, 0x5f654c). The
+    /// final alpha is not read: it stays 0, as Omsi.exe sets it before the lines
+    /// (0x5f5ec1) - a puff fades out over its life. (Taken from the skipped line, the
+    /// stock buses' `10`, every exhaust puff went opaque within a few tenths of a second.)
     pub fn from_smoke(p: &[String]) -> ParticleSystemDef {
         let f = |i: usize| p.get(i).map(|s| omsi_cfg::parse_f32(s)).unwrap_or(0.0);
         let v = |i: usize| p.get(i).map(|s| PsValue::parse(s)).unwrap_or_default();
@@ -299,7 +353,7 @@ impl ParticleSystemDef {
             size_start: c(12),
             size_grow: c(13),
             alpha_initial: c(14),
-            alpha_final: c(15),
+            alpha_final: (PsValue::Const(0.0), PsValue::Const(0.0)),
             rgb: [c(16), c(17), c(18)],
             calc_dist: 500.0,
             ..Default::default()
@@ -387,6 +441,7 @@ pub struct Model {
     pub smokes: Vec<Smoke>,
     pub particle_emitters: Vec<ParticleEmitter>,
     pub spotlights: Vec<Spotlight>,
+    pub spotlights_2: Vec<Spotlight2>,
     pub interior_lights: Vec<InteriorLight>,
     /// `[light]` legacy lights (raw).
     pub lights: Vec<Vec<String>>,
@@ -735,6 +790,20 @@ impl Model {
                 }
             }
             "spotlight" => self.spotlights.push(Spotlight { values: r.f32s::<12>() }),
+            "spotlight_2" => {
+                let values = r.f32s::<12>();
+                let variable = r.str().to_string();
+                // (the flag may be left out: a keyword next is not it)
+                let mut ahead = r.clone();
+                let flag = ahead.line();
+                let mirrored = if omsi_cfg::keyword_of(flag).is_some() {
+                    true
+                } else {
+                    *r = ahead;
+                    omsi_cfg::parse_f32(flag) < 0.5
+                };
+                self.spotlights_2.push(Spotlight2 { values, variable, mirrored });
+            }
             "interiorlight" => {
                 let variable = r.str().to_string();
                 let range = r.f32();
@@ -781,8 +850,15 @@ impl Model {
                             .rev()
                             .find(|m| !m.item && m.change.is_none() && m.texture.eq_ignore_ascii_case(&change.texture) && m.index == change.index)
                             .cloned();
-                        let mut item = base.unwrap_or_else(|| MaterialDef { texture: change.texture.clone(), index: change.index, ..Default::default() });
-                        item.change = change.change.clone();
+                        // ... and what the [matl_change] (or the item before) set on top: Omsi.exe
+                        // copies the whole material record into the new item (0x5efae8 ->
+                        // 0x40a058), its free texture, scrolling and border with it. Copied from
+                        // the plain [matl] alone, the SD77's lit roller blind (`lights_stand`)
+                        // lost its destination text and scrolling with the lights on (#1419).
+                        let mut item = change.clone();
+                        if let Some(base) = base {
+                            item.inherit(&base);
+                        }
                         item.item = true;
                         mesh.materials.push(item);
                     }
@@ -875,6 +951,17 @@ impl Model {
                 let t = r.str().to_string();
                 if let Some(m) = self.cur_matl() {
                     m.nightmap = Some(t);
+                }
+            }
+            "matl_glow" => {
+                // [matl_glow] <texture> <value>: the material is its own light. The picture is
+                // a greyscale mask of how much shines where, the light is the material's own
+                // colour (see `MaterialDef::glow`). A slot that also names a [matl_lightmap]
+                // keeps that, and the classic picture is left as if the keyword were absent.
+                let t = r.str().to_string();
+                let v = r.f32();
+                if let Some(m) = self.cur_matl() {
+                    m.glow = Some((t, v));
                 }
             }
             "matl_allcolor" => {
@@ -1051,6 +1138,44 @@ pub fn load_texchanges(base: &Path, files: &[String]) -> Vec<TexChangeMaster> {
 mod tests {
 
     #[test]
+    fn compatibility_fixture_preserves_material_slots_and_variant_inheritance() {
+        let file = omsi_cfg::CfgFile::from_str(
+            "synthetic-material.cfg",
+            include_str!("../tests/fixtures/material-compatibility.cfg"),
+        );
+        // OMSI's known keywords require their original spelling. A typo in a
+        // synthetic fixture must not masquerade as missing material support.
+        for line in file.lines.iter().filter(|l| l.starts_with('[')) {
+            assert!(omsi_cfg::keyword_of(line).is_some(), "invalid fixture keyword: {line}");
+        }
+        let model = super::Model::parse(&file);
+        let materials = &model.meshes[0].materials;
+        assert_eq!(materials.len(), 4);
+        let base = &materials[0];
+        assert_eq!((base.alpha, base.alpha_set), (2, true));
+        assert!(base.no_z_write && base.no_z_check);
+        assert_eq!(base.z_bias, 1);
+        assert_eq!(base.alphascale.as_deref(), Some("display_alpha"));
+        assert_eq!(base.freetex, Some(("display.dds".into(), "display_texture".into())));
+        assert_eq!(base.lightmaps, vec![("bright.dds".into(), "bright".into()), ("dim.dds".into(), "dim".into())]);
+        assert_eq!(base.lightmap, base.lightmaps.last().cloned());
+        let other = &materials[1];
+        assert_eq!((other.texture.as_str(), other.index), ("display.dds", 1));
+        assert!(!other.alpha_set && other.lightmaps.is_empty());
+        let variant = &materials[3];
+        assert!(variant.item);
+        assert_eq!(variant.change, Some(("DISPLAY.dds".into(), 0, "display_mode".into())));
+        assert_eq!(variant.alpha, base.alpha);
+        assert_eq!((variant.no_z_write, variant.no_z_check, variant.z_bias),
+            (base.no_z_write, base.no_z_check, base.z_bias));
+        assert_eq!(variant.alphascale, base.alphascale);
+        assert_eq!(variant.freetex, base.freetex);
+        assert_eq!(variant.lightmaps, base.lightmaps);
+        assert_eq!(variant.transmap.as_deref(), Some("mask.dds"));
+        assert!(base.transmap.is_none(), "variant changes must not mutate the base slot");
+    }
+
+    #[test]
     fn terrain_hole_meshes_are_independent_of_render_meshes() {
         let mut model = super::Model::parse(&omsi_cfg::CfgFile::from_str(
             "cutters.cfg",
@@ -1076,6 +1201,23 @@ mod tests {
         assert_eq!(model.terrain_hole_meshes().collect::<Vec<_>>(), ["first.o3d", "second.o3d", "third.o3d", "legacy.o3d"]);
     }
 
+    /// `[spotlight_2]`: the spot's numbers, its variable and whether it has a mirrored twin
+    /// (yes unless the flag says 1, also when the flag is left out).
+    #[test]
+    fn a_spotlight_2_reads_its_variable_and_mirror_flag() {
+        let spot = "0\n5.95\n0.652\n0\n1\n-0.3\n255\n255\n233\n200\n30\n80\n";
+        let text = format!("[spotlight]\n{spot}\n[spotlight_2]\n{spot}lights_fern\n0\n\n[spotlight_2]\n{spot}door_light\n1\n[spotlight_2]\n{spot}lights_nebel\n[mesh]\nbody.o3d\n");
+        let m = super::Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", &text));
+        assert_eq!(m.spotlights.len(), 1);
+        let s = &m.spotlights_2;
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0].values, m.spotlights[0].values);
+        assert_eq!((s[0].variable.as_str(), s[0].mirrored), ("lights_fern", true));
+        assert_eq!((s[1].variable.as_str(), s[1].mirrored), ("door_light", false));
+        assert_eq!((s[2].variable.as_str(), s[2].mirrored), ("lights_nebel", true));
+        assert_eq!(m.meshes.len(), 1);
+    }
+
     /// Two [matl] blocks of one material are one material (Absperrung_grau.sco).
     #[test]
     fn a_second_matl_block_goes_on_with_the_same_material() {
@@ -1086,6 +1228,29 @@ mod tests {
         let a = mats.iter().find(|d| d.texture == "Absperr_gr.dds").unwrap();
         assert_eq!(a.alpha, 1);
         assert!(a.envmap.is_some());
+    }
+
+    /// `[matl_glow] <texture> <value>`: the material is its own light - the picture and the
+    /// strength are kept. Additive: a slot that also has a `[matl_lightmap]` keeps it.
+    #[test]
+    fn a_matl_glow_reads_its_picture_and_strength() {
+        let text = "[mesh]\nled.o3d\n\n[matl]\nled.dds\n0\n[matl_glow]\nled.png\n20\n";
+        let m = Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", text));
+        let (tex, v) = m.meshes[0].materials[0].glow.clone().expect("a [matl_glow]");
+        assert_eq!(tex, "led.png");
+        assert_eq!(v, 20.0);
+        // the slot after it still reads as itself (an old .cfg that wrote a third number
+        // there leaves a line the material manager has no use for, and nothing else)
+        let text = "[mesh]\nled.o3d\n\n[matl]\nled.dds\n0\n[matl_glow]\nled.png\n5\n[matl_alpha]\n1\n";
+        let m = Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", text));
+        let (_, v) = m.meshes[0].materials[0].glow.clone().expect("a [matl_glow]");
+        assert_eq!(v, 5.0);
+        assert_eq!(m.meshes[0].materials[0].alpha, 1, "the keyword after it still counts");
+        let both = "[mesh]\nled.o3d\n\n[matl]\nled.dds\n0\n[matl_lightmap]\nl.bmp\nlights\n[matl_glow]\nled.png\n5\n";
+        let m = Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", both));
+        let d = &m.meshes[0].materials[0];
+        assert!(d.lightmap.is_some(), "{d:?}");
+        assert_eq!(d.glow.as_ref().map(|g| g.1), Some(5.0));
     }
 
     /// A mesh before the first [LOD] belongs to that level (the WH UK AI cars' shadow).
@@ -1102,6 +1267,24 @@ mod tests {
 
     use super::*;
 
+    /// The SD202's exhaust `[smoke]` read as Omsi.exe reads it: its 16th line (`10`) is
+    /// skipped, the colour is the three after it and a puff fades out to nothing.
+    #[test]
+    fn a_smoke_skips_the_line_after_its_alpha_and_fades_out() {
+        let text = "[smoke]\n-1.100\n-5.334\n0.406\n-1\n-0.7\n0\nauspuff_vel\n0.2\nauspuff_freq\nauspuff_leben\n0.95\n-0.2\n0.5\n3\nauspuff_alpha\n10\n0.66\n0.66\n0.8\n";
+        let m = Model::parse(&CfgFile::from_str("model.cfg", text));
+        let d = &m.particle_systems()[0];
+        assert_eq!(d.pos, [-1.1, -5.334, 0.406]);
+        assert_eq!(d.velocity, (PsValue::Var("auspuff_vel".into()), PsValue::Const(0.2)));
+        assert_eq!(d.freq.0, PsValue::Var("auspuff_freq".into()));
+        assert_eq!(d.life.0, PsValue::Var("auspuff_leben".into()));
+        assert_eq!((d.brake.0.clone(), d.gravity.0.clone()), (PsValue::Const(0.95), PsValue::Const(-0.2)));
+        assert_eq!((d.size_start.0.clone(), d.size_grow.0.clone()), (PsValue::Const(0.5), PsValue::Const(3.0)));
+        assert_eq!(d.alpha_initial.0, PsValue::Var("auspuff_alpha".into()));
+        assert_eq!(d.alpha_final.0, PsValue::Const(0.0));
+        assert_eq!(d.rgb.clone().map(|c| c.0), [PsValue::Const(0.66), PsValue::Const(0.66), PsValue::Const(0.8)]);
+    }
+
     /// `[setvar]` belongs to the `[item]` before it (a paint scheme in the model.cfg), as
     /// Omsi.exe files it; one before any item sets nothing.
     #[test]
@@ -1113,6 +1296,21 @@ mod tests {
         assert!(m.items[1].set_vars.is_empty());
         assert_eq!((m.items[1].name.as_str(), m.items[1].ctc.as_str(), m.items[1].texture.as_str()), ("HVL", "body", "hvl.dds"));
         assert_eq!(m.set_vars, vec![("lost".to_string(), 1.0)]);
+    }
+
+    /// A `[matl_item]` is a copy of the material before it: the SD77's lit roller blind
+    /// keeps its free texture, scrolling and border (#1419).
+    #[test]
+    fn a_material_item_copies_the_change_before_it() {
+        let text = "[mesh]\nrollo.o3d\n[matl_change]\nzielband1.bmp\n0\nlights_stand\n[matl_freetex]\nzielband1.bmp\nRollband_Tex_V\n[texcoordtransY]\nrlbnd_ziel_trans\n[matl_texadress_border]\n255\n255\n255\n0\n[matl_alpha]\n1\n[matl_item]\n[matl_lightmap]\nzielbeleuchtung.bmp\n";
+        let m = Model::parse(&CfgFile::from_str("model.cfg", text));
+        let item = m.meshes[0].materials.iter().find(|x| x.item).expect("the item");
+        assert_eq!(item.freetex.as_ref().map(|f| f.1.as_str()), Some("Rollband_Tex_V"));
+        assert_eq!(item.texcoord_trans_y.as_deref(), Some("rlbnd_ziel_trans"));
+        assert_eq!((item.alpha, item.tex_address), (1, TexAddress::Border));
+        assert_eq!(item.lightmap.as_ref().map(|l| l.0.as_str()), Some("zielbeleuchtung.bmp"));
+        let base = m.meshes[0].materials.iter().find(|x| !x.item).unwrap();
+        assert!(base.lightmap.is_none(), "the lit map is the item's only");
     }
 
     #[test]
