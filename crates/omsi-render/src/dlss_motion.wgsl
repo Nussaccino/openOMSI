@@ -102,8 +102,10 @@ fn fs_motion_transmap(in: MotionFsIn) -> @location(0) vec4<f32> {
     return motion_pixels(in.cur, in.prev);
 }
 
-// How much of the pixel a pane's drops cover, as the colour pass works it out
-// (`shade_vanilla`: the pane's water from its wiper mask, `window_wetness`).
+// How much of the pixel a pane's water covers, as the colour pass draws it (`shade_vanilla`:
+// the pane's water from its wiper mask, `window_wetness`; the opacity `rain_light` gives the
+// drops and the fine droplets between them - the droplets alone left a veil over the pane
+// that DLSS took for the street behind it and dragged along in streaks).
 fn motion_rain_cover(in: MotionFsIn) -> f32 {
     var f: FsIn;
     f.clip = in.clip;
@@ -114,7 +116,9 @@ fn motion_rain_cover(in: MotionFsIn) -> f32 {
     f.params2 = in.params2;
     f.wipe_uv = in.wipe_uv;
     let in_cab = inside_vehicle(camera.cam_pos.xyz) * near_player_vehicle(in.world) > 0.5;
-    return rain_glass(in.world, in.uv - in.params.zw, in.normal, window_wetness(f), camera.post.y, in_cab, in.wipe_uv).cover;
+    let g = rain_glass(in.world, in.uv - in.params.zw, in.normal, window_wetness(f), camera.post.y, in_cab, in.wipe_uv);
+    let a_drop = g.cover * 0.94;
+    return a_drop + g.mist * (1.0 - a_drop);
 }
 
 // A pane's film of water (`rain_glass`, as the colour pass draws it): where a drop covers
@@ -125,7 +129,7 @@ fn motion_rain_cover(in: MotionFsIn) -> f32 {
 fn fs_motion_rain(in: MotionFsIn) -> @location(0) vec4<f32> {
     // (fading out with the distance, as the colour pass does)
     let near = 1.0 - smoothstep(5.0, 15.0, distance(in.world, camera.cam_pos.xyz));
-    if (motion_rain_cover(in) * near < 0.35) {
+    if (motion_rain_cover(in) * near < 0.25) {
         discard;
     }
     return motion_pixels(in.cur, in.prev);
@@ -138,7 +142,7 @@ fn fs_motion_rain(in: MotionFsIn) -> @location(0) vec4<f32> {
 @fragment
 fn fs_bias_rain(in: MotionFsIn) -> @location(1) f32 {
     let near = 1.0 - smoothstep(5.0, 15.0, distance(in.world, camera.cam_pos.xyz));
-    let bias = smoothstep(0.05, 0.5, motion_rain_cover(in) * near);
+    let bias = smoothstep(0.02, 0.35, motion_rain_cover(in) * near);
     if (bias <= 0.0) {
         discard;
     }
