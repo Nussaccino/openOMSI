@@ -1,0 +1,97 @@
+# The Windows build of this branch (DLSS, and the ReShade workaround of
+# scripts/build-windows-reshade.ps1), on every push to it and by hand. It packs what the
+# project's release packs for Windows x64 and keeps the zip as the run's artifact - nothing is
+# published as a release.
+name: DLSS + ReShade build
+
+on:
+  push:
+    branches: [dlss-reshade]
+  workflow_dispatch:
+
+concurrency:
+  group: dlss-reshade-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # (the whole history: the version counts the commits since VERSION changed)
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dlss-reshade
+      - name: Version
+        shell: bash
+        run: |
+          v="$(sh scripts/version.sh)-dlss"
+          echo "OPENOMSI_VERSION=$v" >> "$GITHUB_ENV"
+          echo "### openOMSI $v (DLSS + ReShade)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Tests (renderer, settings, launcher)
+        run: cargo test --locked -p omsi-render -p omsi-cfg -p omsi-launcher-core -p omsi-app --no-fail-fast
+      - name: Build with the ReShade workaround
+        shell: pwsh
+        run: ./scripts/build-windows-reshade.ps1
+      # (the three steps below as the project's release.yml has them for x64)
+      - name: DirectX shader compiler
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R microsoft/DirectXShaderCompiler --pattern "dxc_*.zip" -D dxc
+          $zip = Get-ChildItem dxc/*.zip | Where-Object { $_.Name -notmatch "linux|pdb" } | Select-Object -First 1
+          Expand-Archive $zip.FullName -DestinationPath dxc/x
+          Copy-Item "dxc/x/bin/x64/dxcompiler.dll", "dxc/x/bin/x64/dxil.dll" dist/windows/
+      - name: ANGLE (DirectX 11)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANGLE_TAG: angle-8091-36b74e4dd4
+          ANGLE_SHA256: 1c0086155a17445110dd97400018ca6e72ea245ef178989b457720ee1fba3af5
+        run: |
+          gh release download $env:ANGLE_TAG -R openOMSI-Project/angle-openomsi --pattern "*-windows-x64.zip" -D angle
+          $zip = Get-ChildItem angle/*.zip | Select-Object -First 1
+          $have = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower()
+          if ($have -ne $env:ANGLE_SHA256) { throw "ANGLE zip: SHA-256 $have, expected $env:ANGLE_SHA256" }
+          Expand-Archive $zip.FullName -DestinationPath angle/x
+          $dir = Get-ChildItem angle/x -Directory | Select-Object -First 1
+          foreach ($line in Get-Content (Join-Path $dir.FullName "SHA256SUMS")) {
+            $want, $name = $line -split '\s+\*?', 2
+            $got = (Get-FileHash (Join-Path $dir.FullName $name) -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $want.ToLower()) { throw "ANGLE ${name}: SHA-256 $got, expected $want" }
+          }
+          Copy-Item (Join-Path $dir.FullName "libEGL.dll"), (Join-Path $dir.FullName "libGLESv2.dll"), (Join-Path $dir.FullName "LICENSE-ANGLE.txt") dist/windows/
+      - name: Visual C++ runtime
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1
+          $dir = if ($crt) { $crt.FullName } else { "$env:SystemRoot\System32" }
+          foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
+            Copy-Item (Join-Path $dir $dll) dist/windows/
+          }
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item README.md, LICENSE dist/windows/
+          Get-ChildItem dist/windows
+          Compress-Archive -Path dist/windows/* -DestinationPath "out/openOMSI-$env:OPENOMSI_VERSION-windows-x64.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          retention-days: 14
+          name: openOMSI-${{ env.OPENOMSI_VERSION }}-windows-x64
+          path: out/*.zip

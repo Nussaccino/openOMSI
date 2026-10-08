@@ -355,6 +355,18 @@ frame's model matrices). The drops of the rain on the windscreen get their pane'
 DLSS's bias mask (the current picture before the history), so they neither streak nor show
 twice; at Ultra performance they flicker a little, drawn from a ninth of the pixels.
 
+DLSS Neural Rendering (DLSS 5) is not built into openOMSI - NVIDIA has not published its
+interface - but it can be put in from outside, as in other games that use DLSS: switch DLSS
+on in the launcher, install [ReShade](https://reshade.me) for `openomsi.exe` (DirectX 12, as
+`dxgi.dll` beside it) and put RenoDX's DLSS addon (`renodx-dlss.addon64`) beside it too. The
+neural rendering DLLs (NVIDIA's `nvngx_dlssnr.dll`, or one built with
+[OpenNR](https://github.com/clshortfuse/openNR)) come from the player, as Streamline's do;
+openOMSI ships none of them. ReShade needs a build of this branch made by
+`scripts\build-windows-reshade.ps1` (or the "DLSS + ReShade build" workflow's artifact): an
+ordinary build goes down in `dxgi.dll` at the start under ReShade 6.8, because wgpu asks the
+legacy `CreateDXGIFactory1` for an `IDXGIFactoryMedia`, which ReShade wraps as a plain DXGI
+factory. The script builds without that factory (openOMSI never needs it); see its header.
+
 `drive_keys` is a control preset: `simple` (W/S/A/D and the arrow keys drive; the default),
 `wasd`, `arrows`, or `omsi` ("Custom controls") - only the layout of `Inputs/keyboard.cfg`
 (OMSI's Shift + numpad, or what the Controls page made of it), nothing added. **T** sells the ticket a passenger asks for on a bus without a
